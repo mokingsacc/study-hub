@@ -10,7 +10,7 @@ Short answer: yes, for one student, with three things to watch. Limits are from 
 | Cron triggers | 5 an account | 1 | Fine |
 | D1 (database) | 5 GB in all, 500 MB a database, 5 million rows read and 100,000 written a day | A year of study is well under 100 MB; a day reads tens of thousands of rows | Fine |
 | R2 (files) | 10 GB, 1 million writes and 10 million reads a month | Notes, past papers and photos: a few GB at most | Fine |
-| Vectorize (meaning search) | 5 million stored dimensions, 30 million queried a month | About 6,500 passages at 768 dimensions: roughly 10 ordinary PDFs or 2 big textbooks | Watch: past that, search by words still works; meaning search covers what fits |
+| Vectorize (meaning search) | 5 million stored dimensions, 30 million queried a month | About 13,000 passages at 384 dimensions (bge-small): roughly 20 ordinary PDFs or 4 big textbooks | Watch: past that, search by words still works; meaning search covers what fits |
 | Workers AI | 10,000 neurons a day | Whisper (Record my thinking): 41 neurons a minute, so about 4 hours of recording a day; topic ideas or a screenshot about 150 neurons each | Fine |
 | Durable Objects (live updates) | SQLite-backed classes are on the free plan | One (MapLive, new_sqlite_classes) | Fine |
 | Workers Builds (deploy on push) | 3,000 build minutes a month | About 2 minutes a deploy | Fine |

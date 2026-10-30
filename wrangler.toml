@@ -14,16 +14,16 @@ not_found_handling = "none"
 
 [[d1_databases]]
 binding = "DB"
-database_name = "study-hub"
+database_name = "my-study-hub"
 migrations_dir = "worker/migrations"
 
 [[r2_buckets]]
 binding = "LIBRARY"
-bucket_name = "study-hub-library"
+bucket_name = "my-study-hub-files"
 
 [[vectorize]]
 binding = "LIBRARY_VEC"
-index_name = "study-hub-library"
+index_name = "my-study-hub-search"
 
 [ai]
 binding = "AI"

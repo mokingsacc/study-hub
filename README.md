@@ -14,6 +14,11 @@ Claude (on your Claude plan) teaches you, tests you and changes the hub when you
 3. On the deploy page, fill in the two secrets:
    - **SETUP_CODE**: a phrase only you know (12 or more characters). You type it once, in step 5.
    - **PLATFORM_SECRET**: 32 or more random characters. Any long random string works.
+   - Check the **deploy command** says `npm run deploy` (it sets up the database, then deploys). If it says
+     `npx wrangler deploy`, change it.
+   - Keep the suggested names for the database, file store and search index (they start with my-study-hub).
+   - If it asks about the search index (Vectorize): **dimensions 384**, **metric cosine**. They must match the
+     model the hub searches your notes with, and cannot be changed later.
 4. Wait for the deploy to finish, then open your new address (it ends in `.workers.dev`).
 5. The page asks for your setup code, your name, what you study for, and a password. That makes your account; it
    is the only one, and nobody else can make one after it.
