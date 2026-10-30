@@ -1,0 +1,19 @@
+{
+  "name": "Study Hub",
+  "short_name": "Study Hub",
+  "description": "Your private study hub: subjects, weak topics, flashcards, results and library.",
+  "lang": "en-GB",
+  "id": "/platform.html",
+  "start_url": "/platform.html#today",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#f5f5f7",
+  "theme_color": "#f5f5f7",
+  "icons": [
+    { "src": "/icons/platform-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/platform-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/platform-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" },
+    { "src": "/icons/platform-180.png", "sizes": "180x180", "type": "image/png" }
+  ]
+}

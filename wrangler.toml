@@ -1,0 +1,59 @@
+# Your Study Hub on your own Cloudflare account. The Deploy to Cloudflare button makes the database, file store,
+# search index and AI binding below for you (names can be changed on the deploy page).
+name = "study-hub"
+main = "worker/src/index.js"
+compatibility_date = "2026-10-01"
+workers_dev = true
+
+[assets]
+directory = "public"
+binding = "ASSETS"
+run_worker_first = true
+html_handling = "none"
+not_found_handling = "none"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "study-hub"
+migrations_dir = "worker/migrations"
+
+[[r2_buckets]]
+binding = "LIBRARY"
+bucket_name = "study-hub-library"
+
+[[vectorize]]
+binding = "LIBRARY_VEC"
+index_name = "study-hub-library"
+
+[ai]
+binding = "AI"
+
+[version_metadata]
+binding = "CF_VERSION_METADATA"
+
+[triggers]
+crons = ["* * * * *"]
+
+[[rules]]
+type = "Text"
+globs = ["**/*.md"]
+fallthrough = true
+
+[[durable_objects.bindings]]
+name = "MAP_LIVE"
+class_name = "MapLive"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["MapLive"]
+
+[vars]
+PLATFORM = "1"
+HUB_OFF = "1"
+D1_QUERY_BUDGET = "45"
+ANKI_LINK = "1"
+
+# Secrets (set on the deploy page, or later: npx wrangler secret put NAME):
+#   SETUP_CODE       a phrase only you know (12+ characters): the first-time setup asks for it once
+#   PLATFORM_SECRET  32+ random characters: locks any AI keys you save (openssl rand -hex 32)
+#   HUB_KEY          optional: lets you add family members' accounts (see README)
