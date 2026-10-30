@@ -105,13 +105,21 @@ export async function createAccount(env, admin, { name, email, profile, profile_
 
 // ------------------------------------------------------------------ owner mode (their own copy)
 
-export const ownerMode = env => !!env && typeof env.SETUP_CODE === 'string' && env.SETUP_CODE.trim().length >= 12;
+export const PLACEHOLDER = /phrase only you know|random characters|change[-_ ]?me/i;
+export const ownerMode = env => !!env && typeof env.SETUP_CODE === 'string' && env.SETUP_CODE.trim().length >= 12 && !PLACEHOLDER.test(env.SETUP_CODE);
+
+// Every account, whoever's: the question is whether anyone has one.
+const nobodyYet = async env => !((await env.DB.prepare('SELECT COUNT(user_id) AS n FROM credentials').first()) || {}).n;
 
 export async function claimOpen(env) {
-  if (!ownerMode(env)) return false;
-  // Every account, whoever's: the question is whether anyone has one.
-  const r = await env.DB.prepare('SELECT COUNT(user_id) AS n FROM credentials').first();
-  return !(r && r.n);
+  return ownerMode(env) && nobodyYet(env);
+}
+
+// For the page: open, or (a copy whose SETUP_CODE is missing, too short or still the example) what to fix.
+export async function claimStatus(env) {
+  if (ownerMode(env)) return { open: await nobodyYet(env) };
+  const copy = !!env && typeof env.SETUP_CODE === 'string';
+  return { open: false, setup_needed: copy && (await nobodyYet(env)) };
 }
 
 // id: keep the login name of a Study Hub they are moving from (their export's `user`), so their data moves as is.

@@ -11,8 +11,8 @@ Claude (on your Claude plan) teaches you, tests you and changes the hub when you
 
    [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/mokingsacc/study-hub)
 
-3. On the deploy page, fill in the two secrets:
-   - **SETUP_CODE**: a phrase only you know (12 or more characters). You type it once, in step 5.
+3. On the deploy page, replace CHANGE-ME in the two secret boxes:
+   - **SETUP_CODE**: a phrase only you know (12 or more characters). Write it down: you type it once, in step 5.
    - **PLATFORM_SECRET**: 32 or more random characters. Any long random string works.
    - Check the **deploy command** says `npm run deploy` (it sets up the database, then deploys). If it says
      `npx wrangler deploy`, change it.

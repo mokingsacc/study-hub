@@ -14,12 +14,25 @@ test('claim: shut on a hub without a SETUP_CODE (Mo\'s shared hub) or with a sho
   for (const over of [{}, { SETUP_CODE: 'short' }]) {
     const { d, env } = platformEnv(over);
     const c = client(env);
-    assert.deepEqual((await c.call('GET', '/api/auth/claim')).data, { open: false });
+    assert.equal((await c.call('GET', '/api/auth/claim')).data.open, false);
     const r = await claim(c, { setup_code: over.SETUP_CODE || '' });
     assert.equal(r.status, 404);
     assert.equal((await env.DB.prepare('SELECT COUNT(*) AS n FROM credentials').first()).n, 0);
     d.close();
   }
+});
+
+test('claim: the template\'s example values never open it; the page is told what to set', async () => {
+  for (const code of ['a phrase only you know, 12 or more characters', 'CHANGE-ME', 'change me please now ok']) {
+    const { d, env } = platformEnv({ SETUP_CODE: code });
+    const c = client(env);
+    assert.deepEqual((await c.call('GET', '/api/auth/claim')).data, { open: false, setup_needed: true }, code);
+    assert.equal((await claim(c, { setup_code: code })).status, 404, code);
+    d.close();
+  }
+  const { d, env } = platformEnv();
+  assert.deepEqual((await client(env).call('GET', '/api/auth/claim')).data, { open: false, setup_needed: false });
+  d.close();
 });
 
 test('claim: the right code makes the only account and signs in; then the door is shut', async () => {
@@ -38,7 +51,9 @@ test('claim: the right code makes the only account and signs in; then the door i
   assert.equal(me.status, 200);
   assert.equal(me.data.user, r.data.user);
   assert.equal(me.data.must_change, false);
-  assert.equal((await c.call('GET', '/api/p/me')).status, 200);
+  const meNow = await c.call('GET', '/api/p/me');
+  assert.equal(meNow.status, 200);
+  assert.equal(meNow.data.own_copy, true, 'Settings offers bringing data in');
   // shut for good: the same code, a fresh browser
   const other = client(env);
   assert.deepEqual((await other.call('GET', '/api/auth/claim')).data, { open: false });
@@ -96,6 +111,7 @@ test('move in: the export from the shared hub lands in their own copy under the 
   const data = JSON.parse(await raw.text());
   assert.ok(data.tables.mnemonics.length >= 1, 'mnemonics are in the export now');
 
+  assert.equal((await A.c.call('GET', '/api/p/me')).data.own_copy, undefined, 'not on the shared hub');
   // moving in is only for their own copy
   assert.equal((await A.c.call('POST', '/api/p/me/import', { table: 'cards', rows: [] })).status, 404);
 

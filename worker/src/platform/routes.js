@@ -44,7 +44,7 @@ async function acceptInvite(request, env) {
 }
 
 // Owner mode (their own copy): is the setup screen open, and claiming it (auth.claimOwner).
-const claimGet = async (request, env) => okJson({ open: await auth.claimOpen(env) });
+const claimGet = async (request, env) => okJson(await auth.claimStatus(env));
 async function claimPost(request, env) {
   const body = await readJson(request, 20_000);
   const r = await auth.claimOwner(env, request, body);

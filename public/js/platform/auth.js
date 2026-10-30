@@ -136,7 +136,15 @@ function renderLogin(root, { app }, notice) {
       h('p', { class: 'small muted' }, 'If you added an email in Settings, you can get a link by email:'),
       email, send, mailMsg));
   frame(root, 'Study Hub', notice || 'Sign in to carry on.', form, forgot);
-  get('/api/auth/claim').then(r => { if (r && r.open && location.hash === '#login') { root.replaceChildren(); renderClaim(root, { app }); } }).catch(() => {});
+  get('/api/auth/claim').then(r => {
+    if (!r || location.hash !== '#login') return;
+    if (r.open) { root.replaceChildren(); renderClaim(root, { app }); }
+    else if (r.setup_needed) {
+      root.replaceChildren();
+      frame(root, 'Almost there', 'This Study Hub needs its setup code before anyone can make an account.', h('div', { class: 'card form' },
+        h('p', null, 'In Cloudflare, open Workers & Pages, then this Study Hub, then Settings, then Variables and Secrets. Set SETUP_CODE to a phrase only you know (12 or more characters), and PLATFORM_SECRET to 32 or more random characters. Save, then reload this page.')));
+    }
+  }).catch(() => {});
   if (!notice) get('/api/auth/me').then(me => { if (me && !me.must_change && location.hash === '#login') signedIn(app, me, '#today'); }).catch(() => {});
 }
 
@@ -147,7 +155,7 @@ const LEVELS = [{ value: 'primary', label: 'Primary school (SATs)' }, { value: '
 const NOT_MOVED = new Set(['library_docs', 'study_pictures', 'ai_settings', 'ai_usage']);
 
 // Their export, a table at a time in parts of at most 500 rows and about 1.5 MB (POST /api/p/me/import).
-async function moveIn(data, say) {
+export async function moveIn(data, say) {
   let added = 0;
   const names = Object.keys(data.tables || {}).filter(n => !NOT_MOVED.has(n) && Array.isArray(data.tables[n]) && data.tables[n].length);
   for (const [i, n] of names.entries()) {

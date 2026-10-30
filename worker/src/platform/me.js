@@ -52,6 +52,7 @@ function shape(user, row, env) {
     exam_date: examDate, email_set: !!row.email_set,
     claude: { links: Number(row.claude_links) || 0, last_used_at: row.claude_used || null },
     modules: moduleList(known ? profile : row.profile, isObj(prefs) ? prefs : {}, env),
+    ...(auth.ownerMode(env) ? { own_copy: true } : {}),   // their own copy: Settings offers bringing data in
   };
 }
 

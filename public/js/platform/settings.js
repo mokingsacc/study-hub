@@ -18,13 +18,14 @@ export function render(root, { app }) {
     root.replaceChildren(pageHead('Settings', { kicker: me.track_label, how: 'mine' }), ...Object.values(parts), privacy);
     import('./custom.js').then(m => parts.mine.replaceChildren(m.settingsPanel(app, (msg, bad) => toast(bad ? msg : `Changed: ${msg}`)))).catch(() => {});
     account(parts.account, me, app);
-    sharing(parts.sharing, share instanceof Error ? null : share, privacy);
+    if (me.own_copy) privacy.textContent = 'Your study data lives only in your own Cloudflare account. Nobody else can see it.';
+    else sharing(parts.sharing, share instanceof Error ? null : share, privacy);
     if (ai instanceof Error) parts.ai.replaceChildren(card('AI', errorState(ai))); else aiSection(parts.ai, ai);
     if (me.modules.find(m => m.id === 'connector' && m.on)) connector(parts.connector, conn instanceof Error ? { links: [] } : conn);
     if (me.modules.find(m => m.id === 'anki_link' && m.on)) anki(parts.anki);
     modules(parts.modules, me, app);
     selfCheck(parts.check);
-    data(parts.data, app);
+    data(parts.data, app, me);
   }).catch(e => root.replaceChildren(pageHead('Settings'), errorState(e, () => app.route())));
 }
 
@@ -276,7 +277,30 @@ function selfCheck(box) {
 }
 
 // ------------------------------------------------------------------ data and sign out
-function data(box, app) {
+// Their own copy: the file from Export on another Study Hub, brought in a table at a time (auth.js moveIn). Rows
+// already here stay as they are; nothing is replaced.
+function bringIn(app) {
+  const file = h('input', { type: 'file', accept: 'application/json,.json', class: 'input' });
+  const say = h('p', { class: 'foot', 'aria-live': 'polite' });
+  const go = btn('Bring it in', null, 'primary');
+  const s = sheet({ title: 'Bring in your data', sub: 'Choose the file from Export on your other Study Hub. Subjects, topics, cards, results, papers, lessons, notes and mnemonics come in; library files and photos do not, so upload those again. Nothing already here is changed.',
+    body: h('div', { class: 'form' }, file, say), actions: [btn('Cancel', () => s.close(), 'gray'), go] });
+  go.addEventListener('click', () => busy(go, async () => {
+    const f = file.files && file.files[0];
+    if (!f) { say.textContent = 'Choose the file first.'; return; }
+    let d;
+    try { d = JSON.parse(await f.text()); if (!d || !d.tables) throw new Error(); } catch { say.textContent = 'That file is not a Study Hub export.'; return; }
+    try {
+      const { moveIn } = await import('./auth.js');
+      const n = await moveIn(d, t => { say.textContent = t; });
+      s.close();
+      toast(`Brought in ${n} things`);
+      app.route();
+    } catch (e) { say.textContent = e.message; }
+  }));
+}
+
+function data(box, app, me = {}) {
   const exp = btn('Export', null, 'tinted', 'download', { cls: 'btn-sm' });
   exp.addEventListener('click', () => busy(exp, async () => {
     try {
@@ -294,6 +318,7 @@ function data(box, app) {
   }, 'gray', 'logout', { cls: 'btn-sm' });
   box.replaceChildren(card('Your data',
     row('Export my data', 'Everything you added, as a file', exp),
+    me.own_copy ? row('Bring in data', 'From Export on another Study Hub', btn('Choose file', () => bringIn(app), 'tinted', 'upload', { cls: 'btn-sm' })) : null,
     row('Delete my account', 'Closes it and deletes your data within 24 hours', btn('Delete', () => deleteSheet(app), 'danger', null, { cls: 'btn-sm' })),
     row('Sign out', DEMO ? 'Demo: sign in again with any name' : null, out)));
 }

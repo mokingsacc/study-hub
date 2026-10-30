@@ -37,6 +37,7 @@ test('secret box: round trip, never plaintext at rest, bound to its owner and pu
   assert.equal(await open(SECRET, `v1.${parts[1]}.${flipped}`, 'sara-k7m2|ai_key|anthropic'), null, 'tampering is detected');
   assert.equal(await open(SECRET, 'nonsense', 'x'), null);
   await assert.rejects(seal('short', key, 'a'), /PLATFORM_SECRET/);
+  await assert.rejects(seal('32 or more random characters (openssl rand -hex 32)', key, 'a'), /PLATFORM_SECRET/, "the template's example value is refused");
   assert.equal(keyHint(key), '…abcd');
   assert.equal(keyHint('short'), '…');
 });

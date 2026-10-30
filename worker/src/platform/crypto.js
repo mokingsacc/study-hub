@@ -96,7 +96,7 @@ export const generateCode = () => generatePassword(2, 4).toUpperCase();
 
 const boxKeys = new Map();
 async function boxKey(secret) {
-  if (!secret || String(secret).length < 32) throw new Error('PLATFORM_SECRET is not set (32+ characters).');
+  if (!secret || String(secret).length < 32 || /random characters|change[-_ ]?me/i.test(secret)) throw new Error('PLATFORM_SECRET is not set (32+ random characters).');
   if (boxKeys.has(secret)) return boxKeys.get(secret);
   const ikm = await crypto.subtle.importKey('raw', enc.encode(String(secret)), 'HKDF', false, ['deriveKey']);
   const key = await crypto.subtle.deriveKey({ name: 'HKDF', hash: 'SHA-256', salt: enc.encode('practice-hub-platform'), info: enc.encode('secret-box-v1') },

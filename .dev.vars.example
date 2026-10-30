@@ -1,3 +1,4 @@
-# Secrets the deploy page asks for. Never commit real values.
-SETUP_CODE="a phrase only you know, 12 or more characters"
-PLATFORM_SECRET="32 or more random characters (openssl rand -hex 32)"
+# Secrets the deploy page asks for: replace CHANGE-ME in each box there. Never commit real values.
+# SETUP_CODE: a phrase only you know, 12 or more characters. PLATFORM_SECRET: 32 or more random characters.
+SETUP_CODE="CHANGE-ME"
+PLATFORM_SECRET="CHANGE-ME"
