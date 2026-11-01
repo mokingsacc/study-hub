@@ -3,6 +3,7 @@
 import * as topic from '../topic.js';
 import * as sources from '../sources.js';
 import * as mehlmanSummary from '../mehlman-summary.js';
+import * as selfRating from '../self-rating.js';
 import { HttpError } from '../../util.js';
 
 const codeOnly = (a, p, c) => (c && c.actor === 'code' ? 'free' : 'refused');
@@ -12,6 +13,10 @@ export const CHANGE_KINDS = {
     tier: 'free', kind: 'card.unlinked', undoable: true,
     evidence: { remove: ['cardstate:', 'cardlapses:', 'card:'], repoint: false },
     plan: (...a) => sources.planCardUnlink(...a), apply: (...a) => sources.applyCardUnlink(...a),
+  },
+  'self.rate': {
+    tier: (...a) => selfRating.selfRateTier(...a), reason: 'Only Mo rates how sure he is, on the topic panel.', kind: 'self.rated', undoable: true, page_only: true,
+    evidence: { remove: ['self:'], repoint: false }, plan: (...a) => selfRating.planSelfRate(...a),
   },
   'resources.seed': { tier: codeOnly, reason: 'That is done by the hub itself.', kind: 'map.resync', undoable: false, plan: (...a) => sources.planResourcesSeed(...a) },
 };
@@ -23,6 +28,9 @@ export const ROUTES = [
   ['GET', '/api/map/topic/:id/mehlman', (...a) => mehlmanSummary.mehlmanRoute(...a)],
   ['POST', '/api/map/topic/:id/mehlman/summary', (...a) => mehlmanSummary.summaryRoute(...a)],
   ['GET', '/api/map/card/:card_id', (...a) => topic.cardRoute(...a)],
+  ['POST', '/api/map/topic/:id/rating', (...a) => selfRating.rateRoute(...a)],
+  ['POST', '/api/map/topic/:id/viva', async (...a) => (await import('../viva-panel.js')).vivaUploadRoute(...a)],
+  ['GET', '/api/map/topic/:id/viva/:viva_id', async (...a) => (await import('../viva-panel.js')).vivaStatusRoute(...a)],
   ['POST', '/api/map/seed/resources', (...a) => sources.seedResourcesRoute(...a)],
 ];
 

@@ -27,11 +27,11 @@ const T = 't', I = 'i';
 export const EXPORT = {
   library_docs: {
     cols: ['user_id', 'id', 'title', 'file_name', 'collection', 'source', 'sha256', 'bytes', 'page_count', 'r2_key', 'upload_id', 'parts_json', 'status', 'status_note',
-      'extractor', 'pages_in', 'n_pages_text', 'n_ocr', 'n_passages', 'n_embedded', 'n_linked', 'chunker_version', 'embed_model', 'created_at', 'updated_at', 'indexed_at'],
+      'extractor', 'pages_in', 'n_pages_text', 'n_ocr', 'n_passages', 'n_embedded', 'n_linked', 'chunker_version', 'embed_model', 'created_at', 'updated_at', 'indexed_at', 'folder'],
     required: ['user_id', 'id', 'title', 'source', 'status', 'created_at', 'updated_at'],
     types: { user_id: T, id: T, title: T, file_name: T, collection: T, source: ['upload', 'import'], sha256: T, bytes: I, page_count: I, r2_key: T, upload_id: T,
       parts_json: 'ja', status: ['uploading', 'uploaded', 'extracting', 'indexing', 'ready', 'refused', 'failed'], status_note: T, extractor: T, pages_in: I,
-      n_pages_text: I, n_ocr: I, n_passages: I, n_embedded: I, n_linked: I, chunker_version: I, embed_model: T, created_at: I, updated_at: I, indexed_at: I },
+      n_pages_text: I, n_ocr: I, n_passages: I, n_embedded: I, n_linked: I, chunker_version: I, embed_model: T, created_at: I, updated_at: I, indexed_at: I, folder: T },
   },
 };
 

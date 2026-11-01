@@ -2,6 +2,8 @@
 // frame), a glow sprite per bucket (drawImage, never shadowBlur), and the --map-* tokens read from the page.
 // The hex values come only from scale.js (weakness's), through the payload's meta stops.
 import { lutFromStops, STOPS_DARK, STOPS_LIGHT, EDGES_LIGHT, UNSEEN, GLOW, SELECTION, hexToOklab, oklabToHex, oklabToLinear } from './scale.js';
+import { EVIDENCE } from '../shared/evidence.js';
+import { TOPIC_FLAGS } from './marks.js';
 
 export const BUCKETS = 32;
 export const ALPHA_LEVELS = 7;
@@ -114,6 +116,17 @@ export function skyNeutral(choice = skyChoice(), theme = 'night') {
 }
 const rgbOf = hex => [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16));
 
+/**
+ * A thin topic's colour (wave 2 C.4, shared/evidence.js): the same lightness and hue at EVIDENCE.pale_chroma of the
+ * chroma, so a guess never glows like knowledge. Both renderers draw it with an outline in the full colour.
+ */
+export function paleOf(hex) {
+  const [L, a, b] = hexToOklab(hex);
+  return oklabToHex([L, a * EVIDENCE.pale_chroma, b * EVIDENCE.pale_chroma]);
+}
+/** Is topic i drawn pale (thin evidence)? The map payload's flag bit (map/flags.js). */
+export const isPale = (model, i) => !!(model.flags && (model.flags[i] & TOPIC_FLAGS.thin));
+
 /** The bucket (0..31) of a t1000 (0..1000). */
 export const bucketOf = t => Math.max(0, Math.min(BUCKETS - 1, Math.floor((Math.max(0, Math.min(1000, t)) / 1000) * BUCKETS)));
 const bucketMid = b => ((b + 0.5) / BUCKETS) * 1000;
@@ -184,16 +197,17 @@ export function palette(theme = 'night', { stops = null, stopsLight = null, edge
   const light = theme === 'light';
   const lut = lutFromStops(light ? (stopsLight || STOPS_LIGHT) : (stops || STOPS_DARK));
   const edgeLut = light ? lutFromStops(edgesLight || EDGES_LIGHT) : null;
-  const fills = [], edges = [], glows = [];
+  const fills = [], edges = [], glows = [], pales = [];
   for (let b = 0; b < BUCKETS; b++) {
     const k = Math.round((bucketMid(b) / 1000) * 255);
     fills.push(lut[k]);
+    pales.push(paleOf(lut[k]));
     edges.push(edgeLut ? edgeLut[k] : lut[k]);
     glows.push(sprites ? sprite(lut[k], Math.round(SPRITE_PX * Math.min(2, Math.max(1, dpr)))) : null);
   }
   const ring = unseen || (light ? UNSEEN.light : UNSEEN.dark);
   return {
-    theme: light ? 'light' : 'night', fills, edges, glows, lut,
+    theme: light ? 'light' : 'night', fills, edges, glows, lut, pales,
     unseen: ring, unseenWidth: UNSEEN.width, unseenScale: UNSEEN.radiusScale,
     select: light ? SELECTION.light : SELECTION.dark, colourOf: t => (t < 0 ? ring : lut[Math.round((Math.min(1000, Math.max(0, t)) / 1000) * 255)]),
   };

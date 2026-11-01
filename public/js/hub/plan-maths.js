@@ -2,20 +2,21 @@
 export const CMS_QUESTIONS = 50;
 export const UWORLD_BLOCK = 20;
 export const PLAN_DEFAULTS = {
-  plan_start: '2027-04-29', uworld_finish_date: '2027-05-29', phase2_end: '2027-06-25', exam_date: '2027-06-30',
+  plan_start: '2027-04-29', uworld_finish_date: '2027-06-08', phase2_end: '2027-06-25',
   cms_early_by: '2027-05-15',
-  uworld_total_left: 2000, uworld_as_of: '2027-04-29', target_score: 250,
+  uworld_total_left: 2000, uworld_as_of: '2027-05-10', target_score: 250,
   rest_days: ['2027-06-28', '2027-06-29'], light_days: ['2027-06-26', '2027-06-27'],
   off_weekdays: [6, 0], // 6 Saturday: practice exam; 0 Sunday: day off
   cms_weak_pct: 75,
-  plan_daily: { uworld: 100, cms: 37, incorrects: 40 },
+  plan_daily: { uworld: 80, cms: 37, incorrects: 40 },
 };
 const DEFAULT_OFF = PLAN_DEFAULTS.off_weekdays;
 export const DECISIONS = [
   { date: '2027-05-15', text: 'is the last free day to move the exam. Move now only if NBME 10 and 11 are both under about 215; otherwise the real call is Sat 21 Nov.' },
   { date: '2027-05-30', text: 'is the real decision on the exam date, after NBME 14. Keep exam day unless your predicted score is under your target and still rising. Moving costs $35 until then, $100 after.' },
 ];
-export const EXAM_WEEK = '2027-06-23';
+// The exam-day travel note shows this many days before the exam (from the exam_date setting).
+export const EXAM_WEEK_DAYS = 7;
 export const MIDWEEK_EXAMS = [{ date: '2027-06-24', line: 'NBME 16 today, your last practice test. Review it in the afternoon; Anki at 16:00.' }];
 
 // The plan card's fixed lines (revised plan, 20 Oct 2026).
@@ -27,7 +28,7 @@ export const TEXT = {
   day2: 'Wake 06:30, start 07:30, with a 5-minute break between doing and reviewing. Anki at 16:00.',
   light: 'Light: Anki and 1-2 timed blocks.',
   rest: 'Rest. Keep your 06:30 wake time.',
-  examDay: 'Exam day exam day: leave by 07:15 with a backup route, aim to arrive by 08:00 (after 08:30 you may be turned away). Time the trip once before then, and check your passport name matches your scheduling permit. On the day: 2-3 minute breaks between most blocks, about 15 minutes mid-day.',
+  examDay: 'Exam day: leave by 07:15 with a backup route, aim to arrive by 08:00 (after 08:30 you may be turned away). Time the trip once before then, and check your passport name matches your scheduling permit. On the day: 2-3 minute breaks between most blocks, about 15 minutes mid-day.',
   incorrects: 'redo all UWorld incorrects once (confident misses and weak systems first)',
 };
 
@@ -71,7 +72,8 @@ export function nextStudyDay(iso, off = [], offWeekdays = DEFAULT_OFF) {
 }
 
 // ---------- phases ----------
-/** The plan's dates from the settings (missing ones take the defaults). */
+const ISO = /^\d{4}-\d{2}-\d{2}$/;
+/** The plan's dates from the settings (missing ones take the defaults; the exam date only from exam_date, null when unset). */
 export function planDates(settings = {}) {
   const s = { ...PLAN_DEFAULTS, ...Object.fromEntries(Object.entries(settings).filter(([, v]) => v != null && v !== '')) };
   const daily = { ...PLAN_DEFAULTS.plan_daily, ...(settings.plan_daily || {}) };
@@ -81,7 +83,7 @@ export function planDates(settings = {}) {
   const offWeekdays = list(s.off_weekdays).map(Number).filter(n => Number.isInteger(n) && n >= 0 && n <= 6);
   return {
     start: s.plan_start, uworldFinish: s.uworld_finish_date, phase2Start: nextStudyDay(addDays(s.uworld_finish_date, 1), off, offWeekdays), phase2End: s.phase2_end,
-    exam: s.exam_date, decisions: DECISIONS, cmsEarlyBy: s.cms_early_by, weakPct: Number(s.cms_weak_pct),
+    exam: ISO.test(String(settings.exam_date || '')) ? settings.exam_date : null, decisions: DECISIONS, cmsEarlyBy: s.cms_early_by, weakPct: Number(s.cms_weak_pct),
     rest, light, off, offWeekdays, daily, midweek: MIDWEEK_EXAMS,
     totalLeft: Number(s.uworld_total_left), asOf: s.uworld_as_of, target: Number(s.target_score),
   };
@@ -196,7 +198,7 @@ export function phaseNotes(today, d) {
   if ((ph === 1 || ph === 2) && isStudyDay(today, off, d.offWeekdays || DEFAULT_OFF)) out.push(ph === 1 ? TEXT.day : TEXT.day2);
   if (!off.includes(today) && weekday(today) === 6 && (d.offWeekdays || DEFAULT_OFF).includes(6)) out.push(TEXT.saturday);
   for (const c of d.decisions || []) if (today <= c.date && today >= addDays(c.date, -6)) out.push(`${today === c.date ? 'Today' : when(c.date)} ${c.text}`);
-  if (d.exam && today >= EXAM_WEEK && today <= d.exam) out.push(TEXT.examDay);
+  if (d.exam && today >= addDays(d.exam, -EXAM_WEEK_DAYS) && today <= d.exam) out.push(TEXT.examDay);
   return out;
 }
 
@@ -274,6 +276,11 @@ export function weekExams(sittings = [], today) {
 export const isFullDay = (s, sittings = []) => !!s.scheduled_date && sittings.filter(x => x.scheduled_date === s.scheduled_date).length >= 2;
 
 // ---------- score ----------
+export function forecastPoint(f, examDate = null) {
+  if (!f || f.error || f.mid == null || f.low == null || f.high == null) return null;
+  return { mid: Math.round(f.mid), low: Math.round(f.low), high: Math.round(f.high), at: f.exam_day || examDate };
+}
+
 /** The prediction against the target: {gap, text} (gap = target - predicted mid; + = still to gain). */
 export function scoreGap(p, target = 260) {
   if (!p || p.mid == null) return { gap: null, text: `No prediction yet. Your target is ${target}.` };

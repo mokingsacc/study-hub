@@ -97,6 +97,7 @@ export function applyAll(c, app) {
 /** Called once after sign-in: fetch, apply, and re-apply when light or dark changes. */
 let beating = 0;
 export async function boot(app) {
+  import('./report.js').then(m => m.listen(app)).catch(() => {});
   // The daily tracker (progress.js): a beat a minute while the page is open and in front of them.
   if (!beating) beating = setInterval(() => { if (app.me && !document.hidden) post('/api/p/activity', { seconds: 60 }).catch(() => {}); }, 6e4);
   try {

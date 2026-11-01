@@ -6,7 +6,7 @@
 //
 // view: {k (camera scale), list (indices to draw, culled), dim (Uint8Array or null: filtered out), tOf(i) (shown
 //        t, tweened), grow(i) (radius factor), glows (bool), hiddenSet (Set of nodes the hover layer redraws)}
-import { bucketOf, BUCKETS, ALPHA_LEVELS, glowOf, CORE, SKY_GLOW, CASING } from './colour.js';
+import { bucketOf, BUCKETS, ALPHA_LEVELS, glowOf, isPale, CORE, SKY_GLOW, CASING } from './colour.js';
 import { MARK_GEOM, marksOf } from './marks.js';
 import { TIER } from './data.js';
 
@@ -21,17 +21,29 @@ export function drawnRadius(model, i, k, grow = 1) {
   return Math.max(model.r[i] * grow, MIN_PX / k);
 }
 
-// Visible, undimmed nodes grouped by colour bucket ([] per bucket), unseen ones apart.
+// Visible, undimmed nodes grouped by colour bucket ([] per bucket), thin ones (pale, wave 2 C.4) in their own buckets,
+// unseen ones apart. The pale lists are filled only when a thin node is seen, so a map with none costs nothing more.
 function groups(model, view) {
   const by = Array.from({ length: BUCKETS }, () => []);
+  let pale = null;
   const unseen = [], dimmed = [];
   for (const i of view.list) {
     if (view.skip && view.skip.has(i)) continue;
     const t = view.tOf(i);
     if (view.dim && view.dim[i]) { dimmed.push(i); continue; }
-    if (t < 0) unseen.push(i); else by[bucketOf(t)].push(i);
+    if (t < 0) unseen.push(i);
+    else if (isPale(model, i)) (pale || (pale = Array.from({ length: BUCKETS }, () => [])))[bucketOf(t)].push(i);
+    else by[bucketOf(t)].push(i);
   }
-  return { by, unseen, dimmed };
+  return { by, pale, unseen, dimmed };
+}
+
+// A thin star on the night sky (wave 2 C.4): its pale fill inside an outline in the full colour, and no hot core, so a
+// colour that rests on one answer never reads as a bright star. One path: the outline stroke, then the fill.
+export const PALE_EDGE_PX = 1.3;
+function paleEdge(ctx, colour, k, fill) {
+  ctx.strokeStyle = colour; ctx.lineWidth = (2 * PALE_EDGE_PX) / k; ctx.stroke();
+  fill();
 }
 
 export const LETTER = Object.freeze({ minPx: 8, fullPx: 12, share: 1.0, shareTwo: 0.78, minFont: 8, maxFont: 20,
@@ -117,7 +129,7 @@ export function drawGlows(ctx, model, view, pal) {
   for (const i of view.list) {
     if ((view.dim && view.dim[i]) || (view.skip && view.skip.has(i))) continue;
     const t = view.tOf(i);
-    if (t < 0) continue;
+    if (t < 0 || isPale(model, i)) continue;   // a thin topic has no glow: a guess must not look like knowledge
     const g = glowOf(model.cert[i]);
     if (!g) continue;
     levels[g.level][bucketOf(t)].push(i);
@@ -190,10 +202,10 @@ function nightEdge(ctx, k, fill) {
  * Returns how many nodes it drew.
  */
 export function drawNodes(ctx, model, view, pal) {
-  const { by, unseen, dimmed } = groups(model, view);
+  const { by, pale, unseen, dimmed } = groups(model, view);
   const k = view.k;
   ctx.save();
-  const lit = [];
+  const lit = [], paleLit = [];
   by.forEach((list, b) => {
     if (!list.length) return;
     ctx.fillStyle = pal.fills[b];
@@ -201,11 +213,19 @@ export function drawNodes(ctx, model, view, pal) {
     if (pal.theme === 'light') lightEdge(ctx, pal.edges[b], k, () => ctx.fill()); else nightEdge(ctx, k, () => ctx.fill());
     for (const i of list) lit.push(i);
   });
+  if (pale) pale.forEach((list, b) => {
+    if (!list.length) return;
+    ctx.fillStyle = (pal.pales || pal.fills)[b];
+    discs(ctx, model, view, list);
+    if (pal.theme === 'light') lightEdge(ctx, pal.edges[b], k, () => ctx.fill()); else paleEdge(ctx, pal.fills[b], k, () => ctx.fill());
+    for (const i of list) paleLit.push(i);
+  });
   if (lit.length && pal.theme !== 'light') {
     ctx.fillStyle = `rgba(255,255,255,${CORE.alpha})`;
     cores(ctx, model, view, lit);
     ctx.fill();
   }
+  if (paleLit.length) for (const i of paleLit) lit.push(i);
   if (unseen.length) {
     ctx.strokeStyle = pal.unseen;
     ctx.lineWidth = pal.unseenWidth / k;
@@ -237,6 +257,12 @@ export function drawOne(ctx, model, i, view, pal, grow = 1) {
     ctx.strokeStyle = pal.unseen;
     ctx.lineWidth = (pal.unseenWidth * (grow > 1 ? 1.3 : 1)) / view.k;
     ctx.stroke();
+  } else if (isPale(model, i)) {
+    // a thin topic alone: pale, with its outline in the full colour (a light map: the usual edge)
+    const b = bucketOf(t);
+    ctx.arc(model.x[i], model.y[i], r, 0, TAU);
+    ctx.fillStyle = (pal.pales || pal.fills)[b];
+    if (pal.theme === 'light') lightEdge(ctx, pal.edges[b], view.k, () => ctx.fill()); else paleEdge(ctx, pal.fills[b], view.k, () => ctx.fill());
   } else {
     ctx.arc(model.x[i], model.y[i], r, 0, TAU);
     ctx.fillStyle = pal.colourOf(t);

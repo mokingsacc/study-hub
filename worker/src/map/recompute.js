@@ -7,9 +7,11 @@
 //   - scoreStatements: for 20 topics or fewer, weakness's recomputeTopics in the change's own batch, guarded by
 //     compare-and-set on topic_scores.ev_rev (a lost race sends the topic to topic_dirty); more topics, or no
 //     scorer, go straight to topic_dirty;
-//   - drainDirty: up to 20 dirty topics per call (the feed and the minute cron);
-//   - hourlyRefresh: the hourly hook into weakness's refreshScores.
+//   - drainDirty: up to 20 dirty topics per call (the feed and the minute cron), their parts after (instant.js);
+//   - hourlyRefresh: the hook into weakness's refreshScores (since 1 Nov 2026 once a night: the fade is read live,
+//     live.js, so the stored rows only catch up for the readers that read them directly).
 import { chunks, ident, sqlValue, summaryOf, rand, eventRow, eventStatements, notifyLive } from './events.js';
+import { FACETS_READY_SQL, readyFrom, readStatements, afterScores, isDeferred } from './instant.js';
 
 export const SAME_BATCH_MAX = 20;   // topics recomputed inside the change's own batch
 export const DRAIN_DEFAULT = 20;
@@ -162,12 +164,13 @@ async function readTouched(env, user, ops, topics) {
         AND (e.obs_key IN (SELECT value FROM json_each(?2)) OR (e.topic_id IS NULL AND e.queue_id IN (SELECT value FROM json_each(?4))))))`)
     .bind(...evArgs, JSON.stringify(named));
   try {
-    const res = await env.DB.batch(anyEvidence ? [evRead(), revRead] : [revRead]);
-    return { rows: anyEvidence ? res[0].results || [] : [], revs: revMap(res[res.length - 1].results) };
+    // + whether topic_facets exists, so the write batch can carry the parts' reads (instant.js) at no query of their own.
+    const res = await env.DB.batch(anyEvidence ? [evRead(), revRead, env.DB.prepare(FACETS_READY_SQL)] : [revRead, env.DB.prepare(FACETS_READY_SQL)]);
+    return { rows: anyEvidence ? res[0].results || [] : [], revs: revMap(res[res.length - 2].results), facetsReady: readyFrom(res[res.length - 1]) };
   } catch (e) {
     if (!noTable(e, 'topic_scores')) throw e;
     // Before weakness's table exists: the rows still come, and the topics go to topic_dirty.
-    return { rows: anyEvidence ? (await evRead().all()).results || [] : [], revs: null };
+    return { rows: anyEvidence ? (await evRead().all()).results || [] : [], revs: null, facetsReady: false };
   }
 }
 const revMap = rows => new Map((rows || []).map(r => [r.topic_id, Number(r.ev_rev) || 0]));
@@ -253,7 +256,7 @@ export async function planEvidence(env, user, evidence, { now = Date.now(), undo
   return {
     statements: any ? evidenceStatements(env.DB, user, ops, now) : [],
     events: undoable ? evidenceEvents(changes) : [],
-    topics, revs: read.revs, pending, removed, changes,
+    topics, revs: read.revs, pending, removed, changes, facetsReady: !!read.facetsReady,
   };
 }
 
@@ -324,6 +327,7 @@ export async function drainDirty(env, user, { limit = DRAIN_DEFAULT, now = Date.
       env.DB.prepare("SELECT cursor FROM sync_state WHERE user_id = ? AND source = 'rebuild:scores'").bind(user),
       env.DB.prepare(`SELECT topic_id, ev_rev FROM topic_scores WHERE user_id = ?1 AND topic_id IN
           (SELECT topic_id FROM topic_dirty WHERE user_id = ?1 ORDER BY at, topic_id LIMIT ?2)`).bind(user, n),
+      env.DB.prepare(FACETS_READY_SQL),
     ]);
   } catch (e) {
     if (noTable(e)) return { n: 0, left: 0, seq: null, error: 'not_ready' };
@@ -364,8 +368,13 @@ export async function drainDirty(env, user, { limit = DRAIN_DEFAULT, now = Date.
   ];
   stmts.push(...eventStatements(env.DB, events));
   if (rebuilding && left <= 0) stmts.push(...resync());
-  const seq = seqOf(await env.DB.batch(stmts));
+  // Their parts too (instant.js): the reads ride at the end of this batch; the minute cron collects them and writes once.
+  const partReads = await readStatements(env, user, topics, { ready: readyFrom(res[4]) });
+  const out = await env.DB.batch([...stmts, ...partReads]);
+  const seq = seqOf(partReads.length ? out.slice(0, out.length - partReads.length) : out);
   if (seq != null) await notifyLive(env, user, seq);
+  if (partReads.length) await afterScores(env, user, topics, { now, reads: out.slice(out.length - partReads.length) });
+  else if (isDeferred(env)) await afterScores(env, user, topics, { now });
   return { n: topics.length, left: Math.max(0, left), seq };
 }
 

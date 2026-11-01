@@ -11,11 +11,15 @@
 // Topic tuple positions in the full payload (worker/src/map/payload.js).
 // ONC and DISC (taxonomy v2): 1 for a cancer, and the discipline bits of meta.disciplines ([[key, word, bit]]).
 // TREND (weakness model v2): 1 improving, 0 steady, -1 slipping, null with under two reviews (model.trend: TREND_NONE).
+// FD and FM (wave 3, facets.js): the topic's Diagnose and Manage parts as t1000, null while their evidence is thin.
+
 export const TI = { I: 0, ID: 1, NAME: 2, SHORT: 3, CAT: 4, UNIT: 5, X: 6, Y: 7, YIELD: 8, T: 9, CERT: 10, BAND: 11, MISSES: 12, CARDS: 13, LAST: 14, FLAGS: 15,
-  ONC: 16, DISC: 17, TREND: 18 };
-// The same fields in a ?ids row: [id, name, short, cat_id, unit_id, x, y, yield100, t1000, cert100, band_i, misses, cards, last, flags, onc, disc, trend].
+  ONC: 16, DISC: 17, TREND: 18, FD: 19, FM: 20 };
+// The same fields in a ?ids row: [id, name, short, cat_id, unit_id, x, y, yield100, t1000, cert100, band_i, misses, cards, last, flags, onc, disc, trend, fd, fm].
 export const PI = { ID: 0, NAME: 1, SHORT: 2, CAT: 3, UNIT: 4, X: 5, Y: 6, YIELD: 7, T: 8, CERT: 9, BAND: 10, MISSES: 11, CARDS: 12, LAST: 13, FLAGS: 14,
-  ONC: 15, DISC: 16, TREND: 17 };
+  ONC: 15, DISC: 16, TREND: 17, FD: 18, FM: 19 };
+// The map's "Colour by" lens (wave 3): Overall (the stored colour), Diagnose or Manage (the topic's part; grey while thin).
+export const LENSES = ['all', 'diagnose', 'manage'];
 export const TREND_NONE = 2;
 /** The stored trend (-1, 0, 1 or null) as model.trend holds it (Int8: TREND_NONE for none). */
 export const trendCode = v => (v === 1 || v === 0 || v === -1 ? v : v != null && [1, 0, -1].includes(Number(v)) ? Number(v) : TREND_NONE);
@@ -73,6 +77,7 @@ function emptyModel(meta, seq) {
     yield100: new Uint8Array(0), t: new Int16Array(0), cert: new Uint8Array(0), band: new Uint8Array(0), misses: new Uint16Array(0),
     cards: new Uint16Array(0), lastMiss: new Float64Array(0), flags: new Uint16Array(0), placed: new Uint8Array(0),
     onc: new Uint8Array(0), disc: new Uint8Array(0), trend: new Int8Array(0), lane: new Uint8Array(0), tier: new Uint8Array(0), aPlus: new Set(),
+    tAll: new Int16Array(0), bandAll: new Uint8Array(0), fd: new Int16Array(0), fm: new Int16Array(0), lens: 'all',
     cats: [], catIndex: new Map(), units: [], unitIndex: new Map(), links: [], adjOff: new Uint32Array(1), adj: new Uint32Array(0),
   };
 }
@@ -91,6 +96,7 @@ function fill(model, recs) {
     yield100: new Uint8Array(n), t: new Int16Array(n), cert: new Uint8Array(n), band: new Uint8Array(n), misses: new Uint16Array(n),
     cards: new Uint16Array(n), lastMiss: new Float64Array(n), flags: new Uint16Array(n), placed: new Uint8Array(n),
     onc: new Uint8Array(n), disc: new Uint8Array(n), trend: new Int8Array(n), lane: new Uint8Array(n), tier: new Uint8Array(n),
+    tAll: new Int16Array(n), bandAll: new Uint8Array(n), fd: new Int16Array(n), fm: new Int16Array(n),
   });
   recs.forEach((t, i) => {
     model.id[i] = t.id; model.name[i] = t.name || t.id; model.short[i] = t.short || null;
@@ -110,6 +116,12 @@ function setFields(model, i, t) {
   model.t[i] = t.t == null ? UNSEEN_T : Math.max(0, Math.min(1000, Math.round(t.t)));
   model.cert[i] = Math.max(0, Math.min(100, Math.round(Number(t.cert) || 0)));
   model.band[i] = Number(t.band) || 0;
+  if (model.fd) {
+    const t1000 = v => (v == null || !Number.isFinite(Number(v)) ? UNSEEN_T : Math.max(0, Math.min(1000, Math.round(Number(v)))));
+    model.tAll[i] = model.t[i]; model.bandAll[i] = model.band[i];
+    model.fd[i] = t1000(t.fd); model.fm[i] = t1000(t.fm);
+    if (model.lens && model.lens !== 'all') lensField(model, i);
+  }
   model.misses[i] = Math.min(65535, Number(t.misses) || 0);
   model.cards[i] = Math.min(65535, Number(t.cards) || 0);
   model.lastMiss[i] = Number(t.last) || 0;
@@ -118,6 +130,36 @@ function setFields(model, i, t) {
   model.disc[i] = Math.max(0, Math.min(255, Number(t.disc) || 0));
   if (model.trend) model.trend[i] = trendCode(t.trend);
   setTier(model, i);
+}
+
+// The band index of a t1000 on the lens (scale.js order: strong 0 … very weak 4, unseen 5).
+const lensBand = t => (t < 0 ? 5 : Math.min(4, Math.floor(t / 200)));
+function lensField(model, i) {
+  const src = model.lens === 'diagnose' ? model.fd : model.lens === 'manage' ? model.fm : null;
+  if (!src) { model.t[i] = model.tAll[i]; model.band[i] = model.bandAll[i]; return; }
+  model.t[i] = src[i]; model.band[i] = lensBand(src[i]);
+}
+/**
+ * The "Colour by" lens (wave 3): 'all' puts back the stored colours; 'diagnose' or 'manage' colours each topic by that
+ * part (grey, as not seen, while its evidence is thin). Returns the indices whose colour moved, with old and new t.
+ */
+export function setLens(model, lens) {
+  const L = LENSES.includes(lens) ? lens : 'all';
+  const moved = [];
+  if (!model.fd || model.fd.length !== model.n) { model.lens = 'all'; return moved; }
+  model.lens = L;
+  for (let i = 0; i < model.n; i++) {
+    const prev = model.t[i];
+    lensField(model, i);
+    if (model.t[i] !== prev) moved.push({ i, prevT: prev < 0 ? null : prev, t: model.t[i] < 0 ? null : model.t[i] });
+  }
+  return moved;
+}
+/** A stored score arriving live (main.js applyScores): kept as the overall colour, shown only under the Overall lens. */
+export function setOverall(model, i, t, band) {
+  if (model.tAll && model.tAll.length === model.n) { model.tAll[i] = t; model.bandAll[i] = band; }
+  if (!model.lens || model.lens === 'all') { model.t[i] = t; model.band[i] = band; return true; }
+  return false;
 }
 
 // The CSR adjacency: for node i, links adj[adjOff[i] .. adjOff[i+1]) (indices into model.links).
@@ -160,7 +202,7 @@ export function decode(p) {
     id: r[TI.ID], name: r[TI.NAME], short: r[TI.SHORT], cat: r[TI.CAT] == null ? null : catByOld.get(r[TI.CAT]) ?? null,
     unit: r[TI.UNIT] == null ? null : unitByOld.get(r[TI.UNIT]) ?? null, x: num(r[TI.X]), y: num(r[TI.Y]), yield100: r[TI.YIELD], t: num(r[TI.T]),
     cert: r[TI.CERT], band: r[TI.BAND], misses: r[TI.MISSES], cards: r[TI.CARDS], last: r[TI.LAST], flags: r[TI.FLAGS], onc: r[TI.ONC], disc: r[TI.DISC],
-    trend: r[TI.TREND],
+    trend: r[TI.TREND], fd: r[TI.FD], fm: r[TI.FM],
   })));
   m.links = (p.links || []).filter(l => byOld.has(l[0]) && byOld.has(l[1]) && l[0] !== l[1])
     .map(l => [byOld.get(l[0]), byOld.get(l[1]), Number(l[2]) || 0, Number(l[3]) || 0, Number(l[4]) || 0, Number(l[5]) || 0]);
@@ -172,7 +214,9 @@ function recordOf(m, i) {
   return { id: m.id[i], name: m.name[i], short: m.short[i], cat: m.cat[i] < 0 ? null : m.cat[i], unit: m.unit[i] < 0 ? null : m.unit[i],
     x: m.placed[i] ? m.x[i] : null, y: m.placed[i] ? m.y[i] : null, yield100: m.yield100[i], t: m.t[i] < 0 ? null : m.t[i], cert: m.cert[i],
     band: m.band[i], misses: m.misses[i], cards: m.cards[i], last: m.lastMiss[i], flags: m.flags[i], onc: m.onc[i], disc: m.disc[i],
-    trend: m.trend && m.trend[i] !== TREND_NONE ? m.trend[i] : null };
+    trend: m.trend && m.trend[i] !== TREND_NONE ? m.trend[i] : null,
+    // The stored colour (not the lens's) and the two parts, so a rebuilt model keeps both.
+    ...(m.tAll && m.tAll.length === m.n ? { t: m.tAll[i] < 0 ? null : m.tAll[i], band: m.bandAll[i], fd: m.fd[i] < 0 ? null : m.fd[i], fm: m.fm[i] < 0 ? null : m.fm[i] } : {}) };
 }
 
 /**
@@ -198,7 +242,7 @@ export function applyPartial(model, p, askedIds = []) {
   }
   const recOf = r => ({ id: r[PI.ID], name: r[PI.NAME], short: r[PI.SHORT], cat: m.catIndex.get(r[PI.CAT]) ?? null, unit: r[PI.UNIT] == null ? null : m.unitIndex.get(r[PI.UNIT]) ?? null,
     x: num(r[PI.X]), y: num(r[PI.Y]), yield100: r[PI.YIELD], t: num(r[PI.T]), cert: r[PI.CERT], band: r[PI.BAND], misses: r[PI.MISSES], cards: r[PI.CARDS],
-    last: r[PI.LAST], flags: r[PI.FLAGS], onc: r[PI.ONC], disc: r[PI.DISC], trend: r[PI.TREND] });
+    last: r[PI.LAST], flags: r[PI.FLAGS], onc: r[PI.ONC], disc: r[PI.DISC], trend: r[PI.TREND], fd: r[PI.FD], fm: r[PI.FM] });
   const incoming = (p.topics || []).map(recOf);
   const gone = new Set((p.gone || []).filter(id => m.index.has(id)));
   const added = incoming.filter(r => !m.index.has(r.id)).map(r => r.id);
@@ -224,7 +268,8 @@ export function applyPartial(model, p, askedIds = []) {
       const prevT = m.t[i] < 0 ? null : m.t[i];
       setFields(m, i, r);
       m.name[i] = r.name || r.id; m.short[i] = r.short || null;
-      if (prevT !== r.t) changed.push({ id: r.id, prevT, t: r.t });
+      const nowT = m.t[i] < 0 ? null : m.t[i];   // the colour shown (under a part lens, that part's)
+      if (prevT !== nowT) changed.push({ id: r.id, prevT, t: nowT });
     }
   }
   const linkRows = keepLinks.concat((p.links || []).map(l => [...l]));

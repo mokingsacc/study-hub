@@ -1,15 +1,28 @@
+import { rootCausesLine } from './concepts.js';
+import { clustersOverviewLine } from './clusters.js';
+import { overnightBrief } from './snapshots.js';
 import { json, londonDay } from '../util.js';
+import { noteJob } from '../job-log.js';
 import { leaks } from '../checks.js';
 import { leakIndexFor, gapSafe, stemSafe, questionSafe } from './guard.js';
-import { rankTopicsFor, whyLine, daysLeft, phaseFor, EXAM_DAY, laneOf, yieldOf, NO_LESSON_ERRORS, addDays } from './teach-priority.js';
+import { nextUpFor, nextUp, itemName, whyLine, daysLeft, phaseFor, laneOf, yieldOf, NO_LESSON_ERRORS, addDays, LIVE_CAND_SQL } from './teach-priority.js';
+import { examDayOf, EXAM_DATE_SQL } from '../exam-day.js';
+import { liveMap, liveSummaries, weakestCategories, loadLive } from './live.js';
 import { pullNewIfStale } from './sync.js';
 import { topPairs } from './links-store.js';
 import { lookAlikeHead } from './links.js';
 import { UNIT_SUMMARY_SQL, summaryFromSql } from './weakness.js';
 import { londonStamp } from '../mcp/reply.js';
-import { DUE_COUNT_SQL, UNLOGGED_SQL, unloggedWords, RETEST_DECK } from './retests.js';
+import { UNLOGGED_SQL, unloggedWords, MY_DECK } from './retests.js';
 import { overconfident } from './calibration.js';
-import { newPatternLine, profileShort, habitTopics, HABIT_BOOST } from './habits.js';
+import { honestyLineStored } from './honesty.js';
+import { auditSummary } from './viva.js';
+import { integrityLineStored } from './integrity.js';
+import { storedProfile, profileLines } from './facets.js';
+import { newPatternLine, profileShort, habitTopics } from './habits.js';
+import { forecastStored } from '../forecast/data.js';
+import { planFactor } from '../forecast/teach-factor.js';
+import { CARDS } from '../forecast/constants.js';
 
 const DAY_MS = 86_400_000, HOUR_MS = 3_600_000;
 export const SEEN_WINDOW_MS = 30 * 60_000;
@@ -69,29 +82,32 @@ export function sinceLines(groups) {
   return out;
 }
 
-/** The voice line: days left, what changed, then the tap or the next pick (at most 250 characters). */
+/** The voice line: days left (none with no exam ahead), what changed, then the tap or the next pick (at most 250 characters). */
 export function overviewSay({ days_left, lines, requested, next_up, gaps, unlogged }) {
-  const bits = [`${days_left} days to go.`];
+  const bits = days_left > 0 ? [`${days_left} days to go.`] : days_left === 0 ? ['Exam day.'] : [];
+  const head = bits.length;
   if (lines && lines.length) bits.push(`Since last time: ${lines.slice(0, 2).join('; ')}.`);
   if (gaps && gaps.length) bits.push(`You logged ${plural(gaps.length, 'gap')}${gaps[0].topic ? `, the latest on ${gaps[0].topic}` : ''}.`);
   if (unlogged && unlogged.length) bits.push(`Finish review not run for ${unlogged[0].sitting}.`);
   if (requested && requested.length) bits.push(`You tapped Teach me on ${requested[0].topic}; want that first?`);
-  else if (next_up && next_up.length) bits.push(`Next up: ${next_up[0].name}.`);
+  else if (next_up && next_up.length) bits.push(`Next up: ${next_up[0].kind === 'pair_test' ? `a pair test, ${next_up[0].name} against ${next_up[0].pair_with}` : next_up[0].name}.`);
   let say = bits.join(' ');
-  while (say.length > SAY_MAX && bits.length > 2) { bits.splice(1, 1); say = bits.join(' '); }
+  while (say.length > SAY_MAX && bits.length > head + 1) { bits.splice(head, 1); say = bits.join(' '); }
   return cap(say, SAY_MAX);
 }
 
 // ---------------------------------------------------------------- map_overview
 
-export async function overview(env, user, { voice = false, now = Date.now(), ctx = null, touch = true } = {}) {
+export async function overview(env, user, { voice = false, now = Date.now(), ctx = null, touch = true, note = null } = {}) {
   const today = londonDay(now);
+  const noted = note != null ? await noteNightly(env, user, note, now) : null;
   const pull = await pullNewIfStale(env, user, { maxMs: 1500, ctx }).catch(e => ({ ran: false, ok: false, error: e && e.message }));
   const key = seenKey(user);
   const q = (sql, ...a) => env.DB.prepare(sql).bind(...a);
   const markerSeq = `coalesce((SELECT CAST(json_extract(value, '$.seq') AS INTEGER) FROM settings WHERE key = ?), 0)`;
   const [rank, rows] = await Promise.all([
-    rankTopicsFor(env, user, { now, today }).catch(e => { console.error('overview ranking failed', e && e.message); return { ok: false }; }),
+    // One list of what to do next (1 Nov 2026): next_up is nextUp's, the same as Home, teach_next and the forecast sheet.
+    nextUpFor(env, user, { now, today, limit: OVERVIEW_LISTS.next_up }).then(r => r.data).catch(e => { console.error('overview ranking failed', e && e.message); return { ok: false }; }),
     batchSoft(env, [
       q('SELECT coalesce(max(seq), 0) AS seq FROM map_events WHERE user_id = ?', user),
       q('SELECT value FROM settings WHERE key = ?', key),
@@ -111,11 +127,10 @@ export async function overview(env, user, { voice = false, now = Date.now(), ctx
              AND coalesce(o.pair_topic_id, '') = coalesce(l.pair_topic_id, '') AND o.status IN ('in_progress', 'done') AND o.started_at > l.requested_at)
          ORDER BY l.requested_at LIMIT ?`, user, now - 24 * HOUR_MS, OVERVIEW_LISTS.requested),
       // Re-tests from the hub's own table (0036): misses' and lessons'.
-      q(DUE_COUNT_SQL, user, today),
       q(`SELECT coalesce(t.name, l.topic_name) AS topic, l.day, l.kind, l.outcome, l.minutes, l.card_action FROM lessons l
            LEFT JOIN topics t ON t.user_id = l.user_id AND t.id = l.topic_id
          WHERE l.user_id = ? AND l.status = 'done' ORDER BY l.ended_at DESC LIMIT 1`, user),
-      q(`SELECT kind, count(*) AS n FROM topic_queue WHERE user_id = ? AND status = 'open' GROUP BY kind`, user),
+      q(`SELECT kind, count(*) AS n FROM topic_queue WHERE user_id = ? AND status = 'open' AND kind != 'card_fix' GROUP BY kind`, user),   // cards to fix are the nightly session's, not places
       q(`SELECT count(*) AS topics, coalesce(sum(s.seen), 0) AS seen, coalesce(sum(s.band = 'very_weak'), 0) AS very_weak, coalesce(sum(s.band = 'weak'), 0) AS weak
          FROM topics t LEFT JOIN topic_scores s ON s.user_id = t.user_id AND s.topic_id = t.id WHERE t.user_id = ? AND t.status IN ('proposed', 'confirmed')`, user),
       q(`SELECT c.name, avg(s.t) AS t FROM topic_scores s JOIN categories c ON c.user_id = s.user_id AND c.id = s.category_id
@@ -125,18 +140,26 @@ export async function overview(env, user, { voice = false, now = Date.now(), ctx
       q(`SELECT trap, status, n, topics_n, last_seen, examples_json, systems_json, note, active_at FROM habits WHERE user_id = ? AND status = 'active'
          ORDER BY active_at DESC LIMIT 1`, user),
       q('SELECT text, facts_json FROM learner_profile WHERE user_id = ?', user),
+      // The colours as of now (live.js, 1 Nov 2026): the weak counts and the weakest systems read the fade on the spot.
+      q(LIVE_CAND_SQL, user),
+      q('SELECT id, name FROM categories WHERE user_id = ?', user),
+      // The exam date (exam-day.js): the setting, or the profile's when there is no row; cleared means no exam.
+      q(EXAM_DATE_SQL),
     ]),
   ]);
-  const [[seqRow], [markerRow], groups, gaps, requested, [retests], [lastLesson], queueRows, [totals], weakCats, [sync], unlogged, [newHabit], [profile]] = rows;
+  const [[seqRow], [markerRow], groups, gaps, requested, [lastLesson], queueRows, [totals0], weakCats0, [sync], unlogged, [newHabit], [profile], liveRows, catRows, examRows] = rows;
+  const live = liveMap(liveRows, now);
+  const totals = liveRows.length ? { ...(totals0 || {}), ...bandCounts(live) } : totals0;
+  const catName = new Map(catRows.map(c => [c.id, c.name]));
+  const weakCats = liveRows.length ? weakestCategories(live).map(c => ({ name: catName.get(c.category_id) || c.category_id, t: c.t })) : weakCats0;
   const seq = (seqRow && seqRow.seq) || 0;
   const marker = markerRow ? parse(markerRow.value, null) : null;
-  const d = daysLeft(today);
+  const examDay = examDayOf(examRows && examRows[0] ? examRows[0].value : undefined);
+  const d = daysLeft(today, examDay);
   const phase = phaseFor(d);
   const lines = sinceLines(groups.filter(g => !QUIET_KINDS.includes(g.kind)));
   const events = groups.reduce((a, g) => a + (QUIET_KINDS.includes(g.kind) ? 0 : g.n), 0);
-  const next_up = rank && rank.ok ? rank.ranked.slice(0, OVERVIEW_LISTS.next_up).map(r => ({
-    id: r.topic_id, name: r.name, lane: r.lane, band: r.band || 'unseen', t1000: r.seen ? t1000Of(r.t) : null, why: cap(whyLine(r, 'pick'), LINE_MAX),
-  })) : [];
+  const next_up = rank && rank.ok ? nextUp(rank, { limit: OVERVIEW_LISTS.next_up }).map(nextRow) : [];
   const by_kind = Object.fromEntries(queueRows.map(r => [r.kind, r.n]));
   const open = Object.values(by_kind).reduce((a, b) => a + b, 0);
   // Stored text is checked on the way out too (a cue saved before the guard, a said that reads like question text).
@@ -146,13 +169,12 @@ export async function overview(env, user, { voice = false, now = Date.now(), ctx
     as_of_seq: seq, as_of: londonStamp(now),
     fresh: { anki_pulled_s_ago: sync && sync.last_ok_at ? Math.max(0, Math.round((now - sync.last_ok_at) / 1000)) : null, anki_ok: !(sync && sync.fails > 0) && !(pull && pull.ran && !pull.ok),
       ...(sync && sync.fails > 0 && sync.last_error ? { anki_error: cap(sync.last_error, 160) } : {}) },
-    exam: { date: EXAM_DAY, days_left: d, phase: phase ? phase.name : null },
+    // No exam set, or past it: no countdown (days_left null), and the open phase (teach-priority.js OPEN_PHASE).
+    exam: { date: examDay, days_left: d != null && d >= 0 ? d : null, phase: phase ? phase.name : null, ...(examDay ? (d < 0 ? { passed: true } : {}) : { none: 'No exam set: hub_settings exam_date sets one.' }) },
     since_last: { last_seen: marker && marker.at ? londonStamp(marker.at) : null, events, lines },
     gaps_stated: gapsOut,
     requested: requestedOut,
     next_up,
-    // cards: how many of them are already cards in Anki's re-test deck (each card's rating records the result).
-    due: { retests: (retests && retests.n) || 0, oldest: (retests && retests.oldest) || null, ...(retests && retests.cards ? { cards: retests.cards, deck: RETEST_DECK } : {}) },
     ...(unlogged && unlogged.length ? { finish_review_not_run: unloggedWords(unlogged) } : {}),
     last_lesson: lastLesson ? { topic: lastLesson.topic, day: lastLesson.day, kind: lastLesson.kind, outcome: lastLesson.outcome, minutes: lastLesson.minutes,
       card: lastLesson.card_action || null } : null,
@@ -162,9 +184,29 @@ export async function overview(env, user, { voice = false, now = Date.now(), ctx
   };
   const over = await overconfident(env, user, { today }).catch(e => { console.error('overconfident failed', e && e.message); return null; });
   if (over) out.map.overconfident = over;
+  const honest = await honestyLineStored(env, user).catch(e => { console.error('honesty line failed', e && e.message); return null; });
+  if (honest) out.map.honesty = honest;
+  const fcast = await forecastStored(env, user).catch(e => { console.error('forecast line failed', e && e.message); return null; });
+  if (fcast) out.forecast = fcast;
+  // The map auditing itself (viva.js, wave 4): this week's vivas against what the colours predicted.
+  const audit = await auditSummary(env, user, { now }).catch(e => { console.error('viva audit line failed', e && e.message); return null; });
+  if (audit) out.map.audit = audit.line;
+  // The nightly data checks beside it (integrity.js): whether the rows under the colours keep their rules.
+  const sound = await integrityLineStored(env, user).catch(e => { console.error('integrity line failed', e && e.message); return null; });
+  if (sound) out.map.integrity = sound;
+  // Diagnose / Manage (wave 3, facets.js): the overall split and the systems with a clear weaker part, from the hourly run.
+  const parts = await facetLines(env, user).catch(e => { console.error('facet lines failed', e && e.message); return []; });
+  if (parts.length) out.map.parts = parts;
+  const roots = await rootCausesLine(env, user).catch(e => { console.error('root causes line failed', e && e.message); return null; });
+  if (roots) out.map.root_causes = roots;
+  const clusterLine = await clustersOverviewLine(env, user).catch(e => { console.error('clusters line failed', e && e.message); return null; });
+  if (clusterLine) out.map.clusters = clusterLine;
   const fresh = newPatternLine(newHabit, { since: marker && marker.at, now });
   if (fresh) out.new_pattern = fresh;
   if (profile && profile.text) out.profile = profile.text;
+  // What changed overnight and why (snapshots.js, wave 2): the map re-weighed by cause, while it is fresh.
+  const night = await overnightBrief(env, user, now);
+  if (night) out.overnight = night;
   if (!(rank && rank.ok) && !out.map.topics) out.next_step = 'The map is not set up yet: use list_gaps and the Anki connector as before.';
   if (voice) {
     delete out.map; delete out.fresh;
@@ -172,8 +214,40 @@ export async function overview(env, user, { voice = false, now = Date.now(), ctx
     if (out.profile) { const short = profileShort(parse(profile.facts_json, {})); if (short) out.profile = short; else delete out.profile; }
     out.say = overviewSay({ days_left: d, lines, requested: requestedOut, next_up, gaps: gapsOut, unlogged: out.finish_review_not_run });
   }
+  if (noted != null) out.note_posted = noted;   // the nightly session's line reached Recent activity
   if (touch) await touchSeen(env, user, seq, now, ctx);
   return out;
+}
+
+/** Weak and very weak topics among live rows as of now (pure; live.js). */
+export function bandCounts(live) {
+  let weak = 0, very_weak = 0;
+  for (const r of live.values()) { if (r.band === 'weak') weak++; else if (r.band === 'very_weak') very_weak++; }
+  return { weak, very_weak };
+}
+
+/** The Diagnose / Manage profile lines (facets.js), with the systems' names: [] before the first hourly run. */
+export async function facetLines(env, user, { max = 3 } = {}) {
+  const stored = await storedProfile(env, user);
+  if (!stored) return [];
+  const rows = (await env.DB.prepare('SELECT id, name FROM categories WHERE user_id = ?1').bind(user).all()).results || [];
+  return profileLines(stored, new Map(rows.map(r => [r.id, r.name])), { max });
+}
+
+/** The nightly scheduled session's short summary to Recent activity (job nightly_session, one line a London day,
+ * the latest note replacing the earlier). Plain words only: arrows and symbols go. Returns true when posted. */
+export async function noteNightly(env, user, note, now = Date.now()) {
+  const text = String(note || '').replace(/[→←↑↓]|->|<-|=>/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!text) return false;
+  // The nightly fact check's morning line (1 Nov 2026, map_rules fact_check): a note starting "Fact check:" is its own
+  // Recent activity line (job fact_check), so the review's summary note never replaces it.
+  const fact = /^fact check\s*:\s*/i.exec(text);
+  if (fact) {
+    const rest = text.slice(fact[0].length).trim();
+    if (!rest) return false;
+    return noteJob(env, { job: 'fact_check', user, key: londonDay(now), ref: 'claude', state: 'ok', at: now, detail: rest, counts: { chars: rest.length } });
+  }
+  return noteJob(env, { job: 'nightly_session', user, key: londonDay(now), ref: 'claude', state: 'ok', at: now, detail: text, counts: { chars: text.length } });
 }
 
 // mcp_seen {seq, at}: stored unless it was stored in the last 30 minutes (teach_next keeps the same rule).
@@ -235,7 +309,16 @@ export async function changesByBatch(env, user, { since_seq = null, actor = null
 
 // ---------------------------------------------------------------- map_weakest
 
-export const PURPOSES = ['lesson', 'cards', 'retest', 'pairs', 'review'];
+/** One nextUp item as map_overview and map_weakest {purpose: lesson} show it (a pair test names its look-alike). */
+export function nextRow(it) {
+  const r = it.row;
+  return { id: it.topic_id, name: it.name, kind: it.kind === 'pair' ? 'pair_test' : 'lesson', ...(it.partner_id ? { pair_with: it.partner_name, pair_id: it.partner_id } : {}),
+    lane: r.lane, band: r.band || 'unseen', t1000: r.seen ? t1000Of(r.t) : null, why: cap(whyLine(r, 'pick'), LINE_MAX) };
+}
+
+export const PURPOSES = ['lesson', 'weakest', 'cards', 'miss_cards', 'pairs', 'review'];
+export const WEAKEST_LABEL = 'Weakest by colour, for browsing. Not what to do next: purpose lesson is that list.';
+export const LESSON_LABEL = 'What to do next: the planner\'s order, the same list as Home, teach me and the forecast sheet.';
 const isDay = s => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
 const laneFor = row => (row.topic_id ? laneOf(yieldOf({ yield: row.yield })) : 'off');
 const keepLane = (lane, want) => !want || lane === want;
@@ -249,9 +332,37 @@ export function rankCardRows(rows) {
     || ((b.slow || 0) - (a.slow || 0)) || (b.at - a.at));
 }
 
+export function rankByMarks(rows, plan) {
+  if (!plan || !plan.topics || !(Number(plan.unit) > 0)) return { rows, skipped: [], ranked_by: 'lane' };
+  const scored = rows.map((r, i) => {
+    const f = r.topic_id ? planFactor(plan, r.topic_id, { pairOff: true }) : null;
+    return { ...r, marks: f && f.planned ? Math.round(f.lesson * 100) / 100 : null, _i: i };
+  });
+  const val = r => (r.marks == null ? CARDS.unknown : r.marks);
+  scored.sort((a, b) => val(b) - val(a) || a._i - b._i);
+  const clean = ({ _i, ...r }) => r;
+  return { rows: scored.filter(r => r.marks == null || r.marks >= CARDS.marks_min).map(clean),
+    skipped: scored.filter(r => r.marks != null && r.marks < CARDS.marks_min).map(clean), ranked_by: 'marks' };
+}
+export const MARKS_LINE = 'Ranked by marks at stake: marks is the planner\'s value of the topic (exam weight times how weak he is times the share of his misses a fix targets), 1 being a typical lesson.';
+
+export function judgedOf(teachJson) {
+  const t = parse(teachJson, null);
+  if (!t || typeof t !== 'object') return {};
+  const j = { clue: cap(t.decision_point, 200), look_alike: cap(t.look_alike, 80), separator: cap(t.separator, 240), fell_for: cap(t.fell_for, 200), trap: cap(t.trap, 60) };
+  const kept = Object.fromEntries(Object.entries(j).filter(([, v]) => v));
+  return Object.keys(kept).length ? { judged: kept } : {};
+}
+export function gapCardRow(r) {
+  return { gap_id: r.id, kind: 'gap', day: r.day, source: r.source, topic: r.topic || r.topic_raw || null, topic_id: r.topic_id || null, lane: r.lane,
+    yield: r.topic_id && r.yield != null ? Math.round(Number(r.yield) * 100) / 100 : null, mehlman_rank: r.mehlman_rank ?? null, repeats: r.topic_misses || 0,
+    gap: cap(r.gap, 200), ...(r.said ? { said: cap(r.said, 160) } : {}), ...(r.mixed_with ? { mixed_with: cap(r.mixed_with, 80) } : {}),
+    ...(r.step ? { step: r.step } : {}), ...(r.confidence ? { confidence: r.confidence } : {}) };
+}
+
 /** map_weakest, by purpose. Returns {purpose, rows, ...}; rows never carry a misread or test-taking slip for cards and re-tests. */
 export async function weakest(env, user, args = {}) {
-  const purpose = args.purpose || 'lesson';
+  const purpose = args.purpose === 'retest' ? 'miss_cards' : args.purpose || 'lesson';
   if (!PURPOSES.includes(purpose)) return { refused: true, reason: `purpose is one of ${PURPOSES.join(', ')}.` };
   const limit = Math.max(1, Math.min(15, Number(args.limit) || (purpose === 'cards' ? 15 : 10)));
   const now = args.now || Date.now();
@@ -261,71 +372,100 @@ export async function weakest(env, user, args = {}) {
   const q = (sql, ...a) => env.DB.prepare(sql).bind(...a);
 
   if (purpose === 'lesson') {
-    const data = await rankTopicsFor(env, user, { now, today });
+    const { data } = await nextUpFor(env, user, { now, today, limit: 1 });
     if (!data.ok) return { purpose, rows: [], next_step: 'The map is not set up yet.' };
-    // A topic where an active reasoning habit recurs (the pattern review) is lifted by HABIT_BOOST: a nudge between
-    // close topics, never a change to the evidence or the scores.
     const habitAt = await habitTopics(env, user, { now }).catch(() => new Map());
-    const lifted = r => r.gain * (habitAt.has(r.topic_id) ? HABIT_BOOST : 1);
-    const rows = data.ranked.filter(r => (!cat || r.category_id === cat) && keepLane(r.lane, lane))
-      .map((r, i) => ({ r, i, g: lifted(r) })).sort((a, b) => (habitAt.size ? b.g - a.g : 0) || a.i - b.i).slice(0, limit).map(({ r }) => ({
-        id: r.topic_id, name: r.name, category: r.category || r.category_id, lane: r.lane, band: r.band || 'unseen', t1000: r.seen ? t1000Of(r.t) : null,
-        seen: !!r.seen, gain: Math.round(r.gain * 1000) / 1000, why: cap(whyLine(r, 'pick'), LINE_MAX),
-        ...(habitAt.has(r.topic_id) ? { habit: habitAt.get(r.topic_id) } : {}),
-      }));
-    return { purpose, phase: data.phase && data.phase.name, rows, ...(args.voice ? { say: cap(rows.length ? `Weakest for teaching: ${rows.slice(0, 3).map(r => r.name).join(', ')}.` : 'Nothing needs a lesson right now.', SAY_MAX) } : {}) };
+    const items = nextUp(data, { limit: 500 }).filter(it => (!cat || it.row.category_id === cat) && keepLane(it.row.lane, lane)).slice(0, limit);
+    const rows = items.map(it => ({ ...nextRow(it), category: it.row.category || it.row.category_id, seen: !!it.row.seen, gain: Math.round(it.row.gain * 1000) / 1000,
+      ...(habitAt.has(it.topic_id) ? { habit: habitAt.get(it.topic_id) } : {}) }));
+    return { purpose, label: LESSON_LABEL, phase: data.phase && data.phase.name, rows,
+      ...(args.voice ? { say: cap(rows.length ? `Next to teach: ${items.slice(0, 3).map(itemName).join(', ')}.` : 'Nothing needs a lesson right now.', SAY_MAX) } : {}) };
+  }
+
+  if (purpose === 'weakest') {
+    // Browsing only: every seen topic by its colour as of now (live.js), weakest first. Not an order of what to do.
+    const [liveRows, names] = await batchSoft(env, [q(LIVE_CAND_SQL, user),
+      q(`SELECT t.id, t.name, t.category_id, coalesce(c.name, t.category_id) AS category FROM topics t LEFT JOIN categories c ON c.user_id = t.user_id AND c.id = t.category_id
+         WHERE t.user_id = ? AND t.status IN ('proposed','confirmed')`, user)]);
+    const nm = new Map((names || []).map(n => [n.id, n]));
+    const rows = [...liveMap(liveRows || [], now).values()].filter(r => r.t != null && nm.has(r.topic_id))
+      .map(r => ({ r, n: nm.get(r.topic_id), lane: laneOf(yieldOf(r)) }))
+      .filter(x => (!cat || x.n.category_id === cat) && keepLane(x.lane, lane))
+      .sort((a, b) => Number(b.r.t) - Number(a.r.t) || String(a.r.topic_id).localeCompare(String(b.r.topic_id))).slice(0, limit)
+      .map(({ r, n, lane: l }) => ({ id: r.topic_id, name: n.name, category: n.category, lane: l, band: r.band || 'unseen', t1000: t1000Of(r.t) }));
+    return { purpose, label: WEAKEST_LABEL, rows, ...(args.voice ? { say: cap(rows.length ? `Weakest by colour: ${rows.slice(0, 3).map(r => r.name).join(', ')}.` : 'No topic is coloured yet.', SAY_MAX) } : {}) };
   }
 
   if (purpose === 'cards') {
     const sinceId = Number.isInteger(args.since_anki_id) ? args.since_anki_id : null;
     const sinceDay = isDay(args.since_day) ? args.since_day : sinceId == null ? addDays(today, -1) : null;
-    const [rows] = await batchSoft(env, [q(`SELECT m.id, m.label, m.day, m.at, m.anki_mistake_id, m.error_type, m.confidence, m.result, m.time_s, m.slow, m.look_alikes, m.rule, m.uw_qid, m.step,
+    const [rows, gapRows] = await batchSoft(env, [q(`SELECT m.id, m.label, m.day, m.at, m.anki_mistake_id, m.error_type, m.confidence, m.result, m.time_s, m.slow, m.look_alikes, m.rule, m.uw_qid, m.step,
         m.anki_note_ids_json, m.topic_id, m.topic_raw, t.name AS topic, t.yield, coalesce(t.category_id, m.category_id) AS category_id, u.mehlman_rank,
+        (SELECT r.teach_json FROM uworld_reviews r WHERE r.user_id = m.user_id AND r.block_id = m.uworld_block_id AND r.q = m.uworld_q) AS teach_json,
         (SELECT count(*) FROM misses m2 WHERE m2.user_id = m.user_id AND m2.topic_id = m.topic_id AND m2.held = 0 AND m2.deleted_at IS NULL AND m2.at >= ?) AS topic_misses
       FROM misses m LEFT JOIN topics t ON t.user_id = m.user_id AND t.id = m.topic_id LEFT JOIN units u ON u.user_id = t.user_id AND u.id = t.unit_id
       WHERE m.user_id = ? AND m.held = 0 AND m.deleted_at IS NULL AND (? IS NULL OR m.anki_mistake_id > ?
           OR (m.anki_mistake_id IS NULL AND m.source = 'uworld' AND m.at >= ? AND m.at >= coalesce((SELECT max(x.at) FROM misses x WHERE x.user_id = m.user_id AND x.anki_mistake_id = ?), 0)))
         AND (? IS NULL OR m.day >= ?)
-      ORDER BY m.at DESC LIMIT 300`, now - 14 * DAY_MS, user, sinceId, sinceId, now - 7 * DAY_MS, sinceId, sinceDay, sinceDay)]);
+      ORDER BY m.at DESC LIMIT 300`, now - 14 * DAY_MS, user, sinceId, sinceId, now - 7 * DAY_MS, sinceId, sinceDay, sinceDay),
+    q(`SELECT g.id, g.at, g.day, g.source, g.topic AS topic_raw, g.gap, g.said, g.mixed_with, g.step, g.confidence, g.topic_id,
+        t.name AS topic, t.yield, t.category_id, u.mehlman_rank,
+        (SELECT count(*) FROM misses m2 WHERE m2.user_id = g.user_id AND m2.topic_id = g.topic_id AND m2.held = 0 AND m2.deleted_at IS NULL AND m2.at >= ?) AS topic_misses
+      FROM gaps g LEFT JOIN topics t ON t.user_id = g.user_id AND t.id = g.topic_id LEFT JOIN units u ON u.user_id = t.user_id AND u.id = t.unit_id
+      WHERE g.user_id = ? AND g.held = 0 AND g.card_id IS NULL AND g.source IN ('chat', 'spoken_cue') AND g.verdict = 'gap'
+        AND (? IS NULL OR g.at >= max(?, coalesce((SELECT max(x.at) FROM misses x WHERE x.user_id = g.user_id AND x.anki_mistake_id = ?), 0)))
+        AND (? IS NULL OR g.day >= ?)
+      ORDER BY g.at DESC LIMIT 100`, now - 14 * DAY_MS, user, sinceId, now - 7 * DAY_MS, sinceId, sinceDay, sinceDay)]);
     const slips = rows.filter(r => NO_LESSON_ERRORS.includes(r.error_type)).length;
-    const ranked = rankCardRows(rows.filter(r => !NO_LESSON_ERRORS.includes(r.error_type) && (!cat || r.category_id === cat))).filter(r => keepLane(r.lane, lane));
+    const missTopics = new Set(rows.map(r => r.topic_id).filter(Boolean));
+    const gaps = (gapRows || []).filter(g => !(g.topic_id && missTopics.has(g.topic_id)))   // a miss on the topic covers it
+      .map(g => ({ ...g, kind: 'gap', result: 'gap', error_type: 'knowledge gap' }));
+    const byLane = rankCardRows([...rows.filter(r => !NO_LESSON_ERRORS.includes(r.error_type)), ...gaps].filter(r => !cat || r.category_id === cat)).filter(r => keepLane(r.lane, lane));
+    const plan = byLane.length ? await import('../forecast/teach-plan.js').then(tp => tp.loadTeachPlan(env, user, { now, live: true })).catch(() => null) : null;
+    const { rows: ranked, skipped, ranked_by } = rankByMarks(byLane, plan);
     return {
       purpose, since: sinceId != null ? { anki_id: sinceId } : { day: sinceDay }, total: ranked.length, slips_left_out: slips,
-      rows: ranked.slice(0, limit).map(r => ({ miss_id: r.id, label: r.label, day: r.day, topic: r.topic || r.topic_raw || null, topic_id: r.topic_id || null, lane: r.lane,
+      ranked_by: ranked_by === 'marks' ? MARKS_LINE : 'Ranked by lane, then exam yield: the planner has no values yet.',
+      ...(ranked_by === 'marks' ? { marks_min: CARDS.marks_min } : {}),
+      ...(skipped.length ? { skipped: skipped.slice(0, CARDS.skipped_max).map(r => ({ topic: r.topic || r.topic_raw || null, marks: r.marks, ...(r.kind === 'gap' ? { gap_id: r.id } : { miss_id: r.id, label: r.label }) })),
+        skipped_total: skipped.length } : {}),
+      rows: ranked.slice(0, limit).map(r => (r.kind === 'gap' ? { ...gapCardRow(r), marks: r.marks ?? null } : { miss_id: r.id, label: r.label, day: r.day, topic: r.topic || r.topic_raw || null, topic_id: r.topic_id || null, lane: r.lane, marks: r.marks ?? null,
         yield: r.topic_id && r.yield != null ? Math.round(Number(r.yield) * 100) / 100 : null, mehlman_rank: r.mehlman_rank ?? null,
         error_type: r.error_type, confidence: r.confidence, result: r.result, time_s: r.time_s, slow: !!r.slow, repeats: r.topic_misses || 0,
         has_card: parse(r.anki_note_ids_json, []).length > 0, look_alike_head: lookAlikeHead(r.look_alikes), ...(r.step ? { step: r.step } : {}),
-        ...(r.anki_mistake_id == null ? { logged: false, uw_qid: r.uw_qid || null, rule: cap(r.rule, 300) } : {}) })),
-      next_step: 'Take the full fields from mistake_sources (Anki connector); rows with logged false are not in the Anki log: use their rule, or teach_debrief {uworld_id, peek: true} for the pack. step is what broke: recognise asks the diagnosis, distinguish puts the look-alike in the Versus line, test and treat ask the next step, trap asks the exception. Then suggest at most 15 cards; add only the ones Mo keeps.',
+        ...(r.anki_mistake_id == null ? { logged: false, uw_qid: r.uw_qid || null, rule: cap(r.rule, 300) } : {}), ...judgedOf(r.teach_json) })),
+      next_step: 'Cards only for the top rows (most marks first); say in one line which were skipped (skipped: too few marks) and why, and that slips get none. Take the full fields from mistake_sources (Anki connector); rows with logged false are not in the Anki log: use their rule and judged (no extra call needed). judged is the UWorld judge\'s note: build the case from its clue, the Versus line from its look_alike and separator. gap rows are gaps he stated himself, with no card yet: the card teaches what the gap says. step is what broke: recognise asks the diagnosis, distinguish puts the look-alike in the Versus line, test and treat ask the next step, trap asks the exception. Then suggest at most 15 cards; add only the ones Mo keeps.',
     };
   }
 
-  if (purpose === 'retest') {
-    // The hub's re-tests (0036): misses' and lessons', one per miss or lesson (its earliest due).
+  if (purpose === 'miss_cards') {
     const [list] = await batchSoft(env, [
       q(`SELECT r.id AS retest_id, r.kind, r.due, r.card_state, r.lesson_id, m.id, m.anki_mistake_id, m.block_id, m.rule, m.look_alikes, m.my_reasoning,
            coalesce(t.name, l.topic_name) AS topic, t.id AS topic_id, t.yield, coalesce(t.category_id, m.category_id) AS category_id, s.weakness_raw
          FROM retests r LEFT JOIN misses m ON m.user_id = r.user_id AND m.id = r.miss_id LEFT JOIN lessons l ON l.user_id = r.user_id AND l.id = r.lesson_id
            LEFT JOIN topics t ON t.user_id = r.user_id AND t.id = coalesce(m.topic_id, r.topic_id) LEFT JOIN topic_scores s ON s.user_id = r.user_id AND s.topic_id = t.id
-         WHERE r.user_id = ? AND r.result IS NULL AND r.due <= ? AND (r.kind = 'lesson' OR (m.held = 0 AND m.deleted_at IS NULL
+         WHERE r.user_id = ? AND r.result IS NULL AND r.covered IS NULL AND r.due <= ? AND (r.kind = 'lesson' OR (m.held = 0 AND m.deleted_at IS NULL
            AND (m.error_type IS NULL OR m.error_type NOT IN ('misread', 'test_taking')))) ORDER BY r.due LIMIT 300`, user, isDay(args.since_day) ? args.since_day : today),
     ]);
     const seen = new Set();
     const misses = list.filter(r => { const k = r.kind === 'lesson' ? `lesson:${r.lesson_id}` : r.id; if (seen.has(k)) return false; seen.add(k); return true; });
-    const gain = r => (Number(r.yield) || 0.05) * (r.weakness_raw != null ? Number(r.weakness_raw) : 0.5);
+    // Each topic's weakness as of now (live.js), so a re-test on a topic that faded comes up sooner.
+    const liveW = await loadLive(env, user, { ids: [...new Set(misses.map(m => m.topic_id).filter(Boolean))], now }).catch(() => new Map());
+    const rawOf = r => { const l = r.topic_id ? liveW.get(r.topic_id) : null; return l && l.weakness_raw != null ? l.weakness_raw : r.weakness_raw; };
+    const gain = r => (Number(r.yield) || 0.05) * (rawOf(r) != null ? Number(rawOf(r)) : 0.5);
     const index = misses.some(m => m.block_id) ? await leakIndexFor(env, user, { missIds: misses.filter(m => m.block_id).map(m => m.id) }).catch(() => null) : null;
     const SHAPE = { rule: questionSafe, look_alikes: questionSafe, my_reasoning: stemSafe };
     const safe = (m, k) => { const v = SHAPE[k](m[k]) ? cap(m[k], 200) : null; return v && m.block_id && (!index || leaks(index, v)) ? null : v; };
     const items = [
-      ...misses.filter(m => (!cat || m.category_id === cat) && keepLane(laneFor(m), lane)).map(m => ({ kind: 'retest',
+      ...misses.filter(m => (!cat || m.category_id === cat) && keepLane(laneFor(m), lane)).map(m => ({ kind: 'miss_card',
         ref: m.kind === 'lesson' ? `lesson:${m.lesson_id}` : m.anki_mistake_id ? `anki:${m.anki_mistake_id}` : m.id, topic: m.topic,
         topic_id: m.topic_id, rule: safe(m, 'rule'), look_alikes: safe(m, 'look_alikes'), my_reasoning: safe(m, 'my_reasoning'), due: m.due,
         ...(m.card_state === 'made' ? { card: true } : {}), _g: gain(m) })),
     ].sort((a, b) => b._g - a._g || String(a.due).localeCompare(String(b.due)));
     const rows = items.slice(0, args.voice ? Math.min(limit, 3) : limit).map(({ _g, ...r }) => r);
     return { purpose, due: items.length, rows,
-      next_step: `Rows with card true are cards in Anki's "${RETEST_DECK}" deck now; their rating records the result. For one you ask yourself, write a fresh case; record an anki: ref with the Anki connector's update_mistake (the hub reads it back).`,
-      ...(args.voice ? { say: cap(rows.length ? `${plural(items.length, 're-test')} due. First: ${rows.map(r => r.topic).filter(Boolean).slice(0, 3).join(', ')}.` : 'No re-tests are due.', SAY_MAX) } : {}) };
+      next_step: `Rows with card true are already ordinary cards in his deck "${MY_DECK}"; their first rating records the result, so leave those to his reviews. For one you ask yourself, write a fresh case; record an anki: ref with the Anki connector's update_mistake (the hub reads it back). To Mo each is just a card from that miss.`,
+      ...(args.voice ? { say: cap(rows.length ? `${plural(items.length, 'miss', 'misses')} to check again. First: ${rows.map(r => r.topic).filter(Boolean).slice(0, 3).join(', ')}.` : 'No misses to check again.', SAY_MAX) } : {}) };
   }
 
   if (purpose === 'pairs') {
@@ -334,10 +474,14 @@ export async function weakest(env, user, args = {}) {
     return { purpose, rows, next_step: 'For "test me on this pair": teach_next {mode: "pair_test", topic: a, pair: b}.' };
   }
 
-  // review: the weakest units with at least one seen topic.
-  const [units] = await batchSoft(env, [q(`WITH ${UNIT_SUMMARY_SQL}
-      SELECT us.*, u.num, u.name, u.lane, u.mehlman_rank, u.category_id FROM unit_summary us JOIN units u ON u.user_id = ?1 AND u.id = us.unit_id`, user)]);
-  const rows = units.map(u => ({ u, s: summaryFromSql(u) })).filter(({ u, s }) => s.n_seen > 0 && (!cat || u.category_id === cat) && keepLane(u.lane, lane))
+  // review: the weakest units with at least one seen topic, each summarised from its topics' colours as of now (live.js).
+  const [units, members, liveRows] = await batchSoft(env, [q(`WITH ${UNIT_SUMMARY_SQL}
+      SELECT us.*, u.num, u.name, u.lane, u.mehlman_rank, u.category_id FROM unit_summary us JOIN units u ON u.user_id = ?1 AND u.id = us.unit_id`, user),
+    q(`SELECT ut.unit_id, tp.id AS topic_id, tp.yield FROM unit_topics ut JOIN topics tp ON tp.user_id = ut.user_id AND tp.id = ut.topic_id
+        AND tp.status IN ('proposed', 'confirmed') WHERE ut.user_id = ?`, user),
+    q(LIVE_CAND_SQL, user)]);
+  const unitLive = liveRows.length ? liveSummaries(members, liveMap(liveRows, now), m => [m.unit_id]) : new Map();
+  const rows = units.map(u => ({ u, s: unitLive.get(u.unit_id) || summaryFromSql(u) })).filter(({ u, s }) => s.n_seen > 0 && (!cat || u.category_id === cat) && keepLane(u.lane, lane))
     .sort((a, b) => (b.s.t1000 ?? -1) - (a.s.t1000 ?? -1)).slice(0, limit)
     .map(({ u, s }) => ({ unit_id: u.unit_id, num: u.num, name: u.name, lane: u.lane, mehlman_rank: u.mehlman_rank, band: s.band, t1000: s.t1000,
       topics: s.n_topics, seen: s.n_seen, weak: s.n_weak, very_weak: s.n_very_weak }));

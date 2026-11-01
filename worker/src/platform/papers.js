@@ -207,6 +207,7 @@ const attemptOf = marks => (isObj(marks.attempt) && isObj(marks.attempt.answers)
 const markingOf = marks => (isObj(marks.marking) ? marks.marking : {});
 const outOf = paper => (paper.questions || []).reduce((s, q) => s + q.marks, 0);
 const schemeOf = (marks, n) => ((marks.scheme || []).find(s => s.n === n) || {}).points || [];
+const levelsOf = (marks, n) => ((marks.scheme || []).find(s => s.n === n) || {}).levels || [];
 
 /** How sure they were versus how it went: {sure: {n, full}, think_so: {n, full}, guess: {n, full}} (full = full marks). */
 export function confidenceSummary(paper, marks) {
@@ -250,6 +251,11 @@ const shape = r => {
     out.on_map = !!(marks.finish && marks.finish.batch_id);
     out.batch_id = (marks.finish && marks.finish.batch_id) || null;
     out.gaps_saved = (marks.finish && marks.finish.gaps) || 0;
+  }
+  // Written on with a pencil (ink.js): the pages with writing, the blank extra pages, when they handed it in.
+  if (isObj(marks.ink)) {
+    const pages = Object.keys(marks.ink.pages || {}).map(Number).filter(n => marks.ink.pages[n].n > 0).sort((a, b) => a - b);
+    out.ink = { pages, extra: marks.ink.extra || 0, ...(marks.ink.sent_at ? { sent_at: marks.ink.sent_at } : {}) };
   }
   if (marks.wrapper) out.wrapper = marks.wrapper;
   if (Array.isArray(marks.drafts) && marks.drafts.length) out.drafts = marks.drafts;
@@ -355,7 +361,22 @@ async function remove(request, env, ctx, params, url, user, session) {
   requireModule(session, PARTS, env);
   const r = await env.DB.prepare('DELETE FROM papers WHERE user_id = ?1 AND id = ?2').bind(user, String(params.id)).run();
   if (!r.meta || r.meta.changes === 0) throw notFound();
+  await import('./ink.js').then(m => m.deleteInk(env, user, String(params.id))).catch(e => console.error('ink delete failed', e && e.message));
   return ok({ ok: true });
+}
+
+/** Written on with a pencil, handed in: how sure they were on each question (before any marking), then their Claude marks. */
+async function handIn(request, env, ctx, params, url, user, session) {
+  requireModule(session, PARTS, env);
+  const body = await readJson(request, 20_000);
+  const list = (Array.isArray(body.answers) ? body.answers : []).filter(a => isObj(a) && a.confidence).map(a => ({ n: a.n, confidence: a.confidence }));
+  if (list.length) await saveAnswers(env, user, params.id, list);
+  const row = await mutate(env, user, params.id, ({ row, marks }) => {
+    if (row.status !== 'ready') return;
+    if (!isObj(marks.ink) || !Object.keys(marks.ink.pages || {}).length) throw new HttpError(400, 'Write on the paper first.');
+    marks.ink.sent_at = now();
+  });
+  return ok({ paper: shape(row) });
 }
 
 // ------------------------------------------------------------------ answering
@@ -471,8 +492,9 @@ async function startMarkingRoute(request, env, ctx, params, url, user, session) 
 }
 
 /** Ticks = 1-based mark-scheme point numbers. Awarded is always code: one mark per ticked point, at most the question's marks. */
-function markEntry(q, scheme, raw, by) {
+function markEntry(q, scheme, raw, by, levels = []) {
   const n = scheme.length;
+  if (levels.length && Array.isArray(raw.points)) throw new HttpError(400, `Question ${q.n} is marked by levels: give awarded (the whole marks) and the level in comment.`);
   let points = null, awarded;
   if (Array.isArray(raw.points)) {
     points = [...new Set(raw.points.map(Number))];
@@ -505,7 +527,7 @@ async function saveMarks(env, user, id, list, by = 'self') {
     for (const raw of list) {
       if (!isObj(raw)) continue;
       const q = qNumber(paper, raw.n);
-      m[q.n] = markEntry(q, schemeOf(marks, q.n), raw, by);
+      m[q.n] = markEntry(q, schemeOf(marks, q.n), raw, by, levelsOf(marks, q.n));
     }
   });
 }
@@ -783,6 +805,7 @@ export const ROUTES = [
   ['GET', '/api/p/papers/:id', get],
   ['DELETE', '/api/p/papers/:id', remove],
   ['PUT', '/api/p/papers/:id/answers', putAnswers],
+  ['POST', '/api/p/papers/:id/hand-in', handIn],
   ['POST', '/api/p/papers/:id/working', working],
   ['POST', '/api/p/papers/:id/start-marking', startMarkingRoute],
   ['PUT', '/api/p/papers/:id/marks', putMarks],
@@ -804,7 +827,8 @@ function toolView(row) {
     ...(s.source ? { from_document: s.source, note: 'An exam from their own past paper: the questions are on the PDF pages; library_read the document (doc_id, page) to see a question.' } : {}),
     questions: s.questions.map(q => ({ n: q.n, ...(q.label ? { label: q.label } : {}), ...(q.page ? { page: q.page } : {}), text: q.text, marks: q.marks, topic: q.topic, ...(q.topic_id ? { topic_id: q.topic_id } : {}), ...(q.doubtful ? { doubtful: q.note } : {}), answer: q.answer || undefined, confidence: q.confidence || undefined })) };
   if (s.scheme) {
-    view.mark_scheme = s.scheme.map(x => ({ n: x.n, points: x.points.map((text, i) => ({ point: i + 1, text })) }));
+    view.mark_scheme = s.scheme.map(x => ({ n: x.n, points: x.points.map((text, i) => ({ point: i + 1, text })),
+      ...(x.levels && x.levels.length ? { levels: x.levels, by_level: 'Pick the level that fits, then the mark within it: give awarded; the points are indicative content.' } : {}) }));
     view.marked_so_far = Object.entries(s.marking || {}).map(([n, m]) => ({ n: Number(n), awarded: m.awarded, reason: m.reason || undefined }));
   }
   if (s.status === 'marked') { view.total = s.total; view.results = s.results.map(r => ({ n: r.n, awarded: r.awarded, out_of: r.out_of, result: r.result, confidence: r.confidence, reason: r.reason })); }
@@ -812,17 +836,18 @@ function toolView(row) {
   return view;
 }
 
+const b64 = bytes => { let x = ''; for (let i = 0; i < bytes.length; i += 0x8000) x += String.fromCharCode(...bytes.subarray(i, i + 0x8000)); return btoa(x); };
 const paperGet = {
   name: 'paper_get',
   module: PARTS,
-  description: "Reads one of the student's practice papers so you can talk it through with them by voice. With no paper_id it lists their recent papers. With a paper_id it gives the questions (and any answers already saved), but NOT the mark scheme. "
-    + `Work through each question with them: let them reason out loud, and record their answer and how sure they were (${sayConfidence}) with paper_mark. `
-    + 'Only when the student says they are ready to mark, call paper_get again with show_mark_scheme true: it then shows the numbered mark-scheme points (every answered question must have a confidence first). '
-    + 'Never read the mark scheme out before they ask to mark. Practice papers Claude wrote are original: never add exam board text to those. '
-    + 'Exams made from their own past papers (exam_make) carry from_document: the questions are on the PDF pages, so read them with library_read.',
+  description: "Reads one of the student's papers. No paper_id: their recent papers. With one: the questions and saved answers, NOT the mark scheme. "
+    + `Let them reason out loud; record each answer and how sure they were (${sayConfidence}) with paper_mark. `
+    + 'Only when they are ready to mark: show_mark_scheme true shows the numbered points (every answered question needs a confidence first); never read it out before. '
+    + 'Practice papers Claude wrote are original: no exam board text. An exam from their own past paper has from_document: read its pages with library_read. handwritten: they wrote on it.',
   inputSchema: { type: 'object', additionalProperties: false, properties: {
     paper_id: { type: 'string', description: 'The paper to read. Leave out to list papers.' },
     show_mark_scheme: { type: 'boolean', description: 'true only once the student asks to mark. Needs a confidence recorded for each answered question.' },
+    pages: { type: 'array', items: { type: 'integer' }, maxItems: 4, description: 'Handwritten pages to see as pictures (handwritten.pages).' },
   } },
   annotations: { readOnlyHint: false, destructiveHint: false },
   async run(env, user, args) {
@@ -833,7 +858,18 @@ const paperGet = {
     }
     let row = await load(env, user, args.paper_id);
     if (args.show_mark_scheme === true && row.status === 'ready') row = await startMarking(env, user, row.id, null);
-    return toolView(row);
+    const view = toolView(row);
+    const { paper, marks } = parse(row);
+    if (!isObj(marks.ink)) return view;
+    const ink = await import('./ink.js');
+    const doc = paper.source && paper.source.doc_id ? await env.DB.prepare('SELECT page_count FROM library_docs WHERE user_id = ? AND id = ?').bind(user, paper.source.doc_id).first() : null;
+    const hw = ink.handwrittenView(paper, marks, (doc && doc.page_count) || 0);
+    if (hw) view.handwritten = hw;
+    if (!hw || !Array.isArray(args.pages) || !args.pages.length) return view;
+    const pics = await ink.pagePictures(env, user, row, args.pages);
+    const content = [{ type: 'text', text: JSON.stringify(view) }];
+    for (const p of pics) content.push({ type: 'text', text: `Page ${p.page}${p.missing ? ': no picture saved yet; ask them to open the paper once so it saves.' : ''}` }, ...(p.data ? [{ type: 'image', data: b64(p.data), mimeType: 'image/jpeg' }] : []));
+    return { __mcp: { content, structuredContent: view } };
   },
 };
 
@@ -848,9 +884,9 @@ const MARK_ITEM = { type: 'object', additionalProperties: false, required: ['n']
 const paperMark = {
   name: 'paper_mark',
   module: PARTS,
-  description: 'Records a practice paper as the student talks it through. Before the mark scheme: answers (the answer they gave in short, and confidence: sure, think so or guess, asked BEFORE they see the scheme). A photo of their working: write down exactly what is on it, mistakes included, as their answer. '
-    + 'After paper_get with show_mark_scheme: marks, one entry per question with the point numbers they earned (or the whole marks awarded), a reason for any lost marks and, if they said it, a one-line note of what they did not get. '
-    + 'The hub works out right, partial or wrong itself. Then the three exam-wrapper answers (went_well, marks_lost, next_time) in their words, and finish true when every answered question is marked: that puts the marks on their map and turns lost marks with a reason into gap notes. Never put exam board text in any field.',
+  description: 'Records a paper as the student talks it through. Before the mark scheme: answers (in short) and confidence (sure, think so or guess, asked BEFORE the scheme). Their working in a photo or their pencil writing: write it down exactly, mistakes included. '
+    + 'After paper_get with show_mark_scheme: marks per question (point numbers earned, or whole marks awarded), a reason for lost marks and a one-line note of what they did not get. '
+    + 'The hub decides right, partial or wrong. Then the wrapper (went_well, marks_lost, next_time) in their words, and finish true once all answered questions are marked: marks go on their map, lost marks become gap notes. No exam board text in any field.',
   inputSchema: { type: 'object', additionalProperties: false, required: ['paper_id'], properties: {
     paper_id: { type: 'string' },
     answers: { type: 'array', maxItems: MAX_QUESTIONS, items: { type: 'object', additionalProperties: false, required: ['n'], properties: {

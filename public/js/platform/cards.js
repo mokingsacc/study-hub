@@ -48,8 +48,17 @@ function renderHome(root, { app }) {
       listBox.replaceChildren(h('div', { class: 'section-title' }, 'Your cards', h('span', { class: 'aside foot' }, cards.length ? plural(cards.length, 'card') : '')), search, h('div', { style: 'height:12px' }), body);
     }).catch(e => listBox.replaceChildren(errorState(e, drawList)));
   };
+  const fixBox = h('div');
+  get('/api/p/cards/to-fix').then(({ cards }) => {
+    if (!cards.length) return;
+    fixBox.replaceChildren(h('section', { class: 'tile', style: 'flex-direction:row;align-items:center;gap:14px;margin-top:12px' },
+      h('span', { class: 'ftype' }, icon('bug')),
+      h('div', { class: 'grow' }, h('b', { class: 't-head' }, `${plural(cards.length, 'card')} for your Claude to fix`),
+        h('div', { class: 'foot' }, 'Ones you skipped with a reason, keep forgetting, or answer slowly')),
+      askClaude('Fix my flagged flashcards in my Study Hub', 'Fix them', { app })));
+  }).catch(() => {});
   load('/api/p/cards/stats', s => {
-    if (!statsBox.isConnected) root.replaceChildren(pageHead('Cards', { actions, how: 'cards' }), statsBox, listBox);
+    if (!statsBox.isConnected) root.replaceChildren(pageHead('Cards', { actions, how: 'cards' }), statsBox, fixBox, listBox);
     drawStats(s);
   }, e => root.replaceChildren(pageHead('Cards', { actions }), errorState(e, () => app.route())));
   drawList();
@@ -78,7 +87,12 @@ function renderReview(root, { app }) {
   const flash = h('div', { class: 'flash', role: 'button', tabindex: '0', 'aria-live': 'polite' });
   const rate = h('div', { class: 'rate', role: 'group', 'aria-label': 'How well did you know it?' });
   const showBtn = btn('Show answer', () => reveal(), 'primary', null, { cls: 'btn-lg btn-block' });
-  const wrap = h('div', { class: 'review' }, prog, countsEl, flash, showBtn, rate);
+  let sure = null;
+  const sureRow = h('div', { class: 'chips rv-sure', role: 'group', 'aria-label': 'How sure are you?' });
+  const drawSure = () => sureRow.replaceChildren(h('span', { class: 'foot' }, 'How sure?'), ...[['guess', 'Guess'], ['lean', 'Lean'], ['sure', 'Sure']].map(([k, w]) =>
+    h('button', { type: 'button', class: 'chip', 'aria-pressed': String(sure === k), onclick: () => { sure = sure === k ? null : k; drawSure(); } }, w)));
+  const skipBtn = btn('Skip', () => skipSheet(), 'gray', null, { cls: 'btn-sm' });
+  const wrap = h('div', { class: 'review' }, prog, countsEl, flash, sureRow, showBtn, rate, h('div', { class: 'row', style: 'justify-content:center' }, skipBtn));
 
   function paint() {
     if (!current) return finish();
@@ -91,6 +105,8 @@ function renderReview(root, { app }) {
       shown ? h('div', { class: 'meta' }, current.queue === 'new' ? 'New card' : current.queue === 'learning' ? 'Learning' : 'Review', h('span', { class: 'grow' }), 'Swipe right for Good, left for Again') : null].filter(Boolean));
     flash.style.transform = ''; flash.style.opacity = '';
     showBtn.hidden = shown;
+    sureRow.hidden = shown;
+    if (!shown) drawSure();
     rate.hidden = !shown;
     rate.replaceChildren(...RATINGS.map(([r, label, cls]) => h('button', { type: 'button', class: cls, onclick: () => rateCard(r) },
       label, current.intervals && current.intervals[r] ? h('small', null, current.intervals[r]) : h('small', null, h('span', { class: 'kbd' }, String(r))))));
@@ -104,7 +120,8 @@ function renderReview(root, { app }) {
     current = queue.shift() || null;
     shown = false; startedAt = Date.now();
     if (current) paint(); else { waiting = true; showWaiting(); }
-    post(`/api/p/cards/${encodeURIComponent(card.id)}/review`, { rating: r, duration_ms: Math.min(ms, 600000) }).then(res => {
+    const conf = sure; sure = null;
+    post(`/api/p/cards/${encodeURIComponent(card.id)}/review`, { rating: r, duration_ms: Math.min(ms, 600000), ...(conf ? { confidence: conf } : {}) }).then(res => {
       dueLeft = res.due_n;
       setCounts(res);
       const nx = res.next;
@@ -114,6 +131,22 @@ function renderReview(root, { app }) {
       toast(e.message);
       if (waiting) { waiting = false; finish(); }
     });
+  }
+  function skipSheet() {
+    if (!current) return;
+    const card = current;
+    const go = async reason => {
+      s.close();
+      try {
+        const r = await post(`/api/p/cards/${encodeURIComponent(card.id)}/skip`, reason ? { reason } : {});
+        if (current && current.id === card.id) { if (counts[card.queue] > 0) counts[card.queue]--; current = queue.shift() || null; shown = false; sure = null; startedAt = Date.now(); if (current) paint(); else finish(); }
+        toast(reason ? 'Skipped. Your Claude will fix it.' : 'Skipped until tomorrow.', { undo: async () => { await post(`/api/p/cards/${encodeURIComponent(card.id)}/skip`, { undo: r.before }); toast('Back in your deck'); } });
+      } catch (e) { toast(e.message); }
+    };
+    const s = sheet({ title: 'Skip this card', sub: 'It comes back tomorrow. Say why, and your Claude fixes it next time you ask.',
+      body: h('div', { class: 'list' }, [['badly_worded', 'Badly worded'], ['wrong', 'Wrong'], ['low_value', 'Not worth learning'], ['duplicate', 'A duplicate'], [null, 'Just not now']].map(([k, w]) =>
+        h('button', { type: 'button', class: 'li', onclick: () => go(k) }, h('span', { class: 'grow' }, h('b', null, w)), icon('chevron', 'chev')))),
+      actions: [btn('Cancel', () => s.close(), 'gray')] });
   }
   function showWaiting() { flash.replaceChildren(h('div', { class: 'hintline' }, 'Checking for more cards…')); showBtn.hidden = true; rate.hidden = true; }
   function finish() {

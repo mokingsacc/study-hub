@@ -3,6 +3,7 @@ import { categoryFor, VOCABS } from './vocab.js';
 import { systemsOf, legacySystem, withParents } from './systems.js';
 import { buildLeakIndex, leaks } from '../checks.js';
 import { hubQuestionLabel } from '../util.js';
+import { isFoundationCategory } from '../../../public/js/shared/concept.js';
 
 export const ACCEPT = 0.85;
 export const CUT_MIN = 6;               // a cut-off key shorter than this never matches by prefix
@@ -70,6 +71,17 @@ export async function fetchAliases(env, user, keys, cutKeys = []) {
     if (!byKey.get(r.key).some(x => x.id === r.id)) byKey.get(r.key).push(r);
   }
   const prefix = new Map(cutKeys.map((k, i) => [k, (res[i + 1].results || []).filter(live)]));
+  return { byKey, prefix };
+}
+
+// ---------------------------------------------------------------- root causes
+
+const rootHit = h => !!h && isFoundationCategory(h.category_id);
+/** fetchAliases' {byKey, prefix} without the root-cause topics' names (pure). */
+export function withoutRoots(data) {
+  const byKey = new Map(), prefix = new Map();
+  for (const [k, hits] of (data && data.byKey) || []) { const keep = hits.filter(h => !rootHit(h)); if (keep.length) byKey.set(k, keep); }
+  for (const [k, hits] of (data && data.prefix) || []) prefix.set(k, hits.filter(h => !rootHit(h)));
   return { byKey, prefix };
 }
 
@@ -414,14 +426,18 @@ export function queueItem(user, { texts, source = null, source_ref = null, gap_i
 // ---------------------------------------------------------------- resolveTopic
 
 /**
- * resolveTopic(env, user, {texts, system?, category_id?, card_id?, note_id?, ref?, topic_id?, exact?, source?, source_ref?, gap_id?})
+ * resolveTopic(env, user, {texts, system?, category_id?, card_id?, note_id?, ref?, topic_id?, exact?, source?, source_ref?, gap_id?, roots?})
  *   -> {topic_id, confidence, via, learn: [{alias, kind}], name?, held?, sitting_id?}
  *    | {topic_id: null, candidates: [{id, name, category_id, score, via}], queue, held?, sitting_id?}
  * texts: ordered names, most explicit first ([condition, topic] from the Anki log, [gap.topic], [analysis.topic]).
  * exact: true (links' look-alike heads) stops after the structural parts, with no prefixes or spans.
+ * roots: true lets a root-cause topic (a foundation concept) be the answer; otherwise none ever is (withoutRoots).
  */
 export async function resolveTopic(env, user, opts = {}) {
-  const { system = null, card_id = null, note_id = null, ref = null, topic_id = null, exact = false, source = null, source_ref = null, gap_id = null } = opts;
+  const { system = null, card_id = null, note_id = null, ref = null, topic_id = null, exact = false, source = null, source_ref = null, gap_id = null, roots = false } = opts;
+  // A root-cause topic is never a miss's, gap's, card's or label's home (only a link's other end asks for one).
+  const clinical = t => (roots || !t || !rootHit(t) ? t : null);
+  const aliases = async (...a) => (roots ? fetchAliases(env, user, ...a) : withoutRoots(await fetchAliases(env, user, ...a)));
   let texts = (Array.isArray(opts.texts) ? opts.texts : [opts.texts]).filter(t => typeof t === 'string' && t.trim()).map(t => t.trim().slice(0, LABEL_MAX));
   const named = texts.length > 0;
   let hint = opts.category_id || resolveCategory(system);
@@ -430,7 +446,7 @@ export async function resolveTopic(env, user, opts = {}) {
 
   // 0: a topic id given.
   if (topic_id) {
-    const t = await liveTopic(env, user, topic_id);
+    const t = clinical(await liveTopic(env, user, topic_id));
     if (t) return { topic_id: t.id, name: t.name, confidence: 1, via: 'id', learn: [] };
   }
   // 3 (read first, so its label can join the texts): the ref.
@@ -440,7 +456,7 @@ export async function resolveTopic(env, user, opts = {}) {
     if (r) {
       if (r.held) { extra.held = true; extra.sitting_id = r.sitting_id; }
       else if (r.sitting_id) extra.sitting_id = r.sitting_id;
-      if (r.topic_id) refHit = await liveTopic(env, user, r.topic_id);
+      if (r.topic_id) refHit = clinical(await liveTopic(env, user, r.topic_id));
       if (!refHit && r.texts && r.texts.length && r.uworld_label && named) uwTexts = r.texts.filter(t => !texts.includes(t));
       else if (!refHit && r.texts && r.texts.length) texts = texts.concat(r.texts.filter(t => !texts.includes(t)));
       if (!hint && r.system) { hint = resolveCategory(r.system); hints = hintSystems(null, r.system); }
@@ -448,7 +464,7 @@ export async function resolveTopic(env, user, opts = {}) {
     }
   }
   const planned = plan(texts, { exact });
-  const data = texts.length ? await fetchAliases(env, user, planned.keys, planned.cutKeys) : { byKey: new Map(), prefix: new Map() };
+  const data = texts.length ? await aliases(planned.keys, planned.cutKeys) : { byKey: new Map(), prefix: new Map() };
 
   // 1: the most explicit text, exactly.
   const firstOnly = texts.length ? decide({ items: planned.items.slice(0, 1).map(it => ({ ...it, cand: { ...it.cand, parts: it.cand.parts.slice(0, 1) } })) },
@@ -457,7 +473,7 @@ export async function resolveTopic(env, user, opts = {}) {
   // 2: the card or note.
   if (card_id != null || note_id != null) {
     const id = await cardTopic(env, user, card_id, note_id);
-    const t = id ? await liveTopic(env, user, id) : null;
+    const t = id ? clinical(await liveTopic(env, user, id)) : null;
     if (t) return { topic_id: t.id, name: t.name, confidence: 0.95, via: 'card', learn: [], ...extra };
   }
   // 3: the ref's own placed question, when no text named a topic.
@@ -466,7 +482,7 @@ export async function resolveTopic(env, user, opts = {}) {
   let d = texts.length ? decide(planned, data, hints, { exact, skipFirst: false }) : { topic_id: null, hits: [] };
   if (!d.topic_id && uwTexts.length && !d.ambiguous && !(d.hits || []).length) {
     const uwPlan = plan(uwTexts, { exact });
-    const uw = decide(uwPlan, await fetchAliases(env, user, uwPlan.keys, uwPlan.cutKeys), hints, { exact });
+    const uw = decide(uwPlan, await aliases(uwPlan.keys, uwPlan.cutKeys), hints, { exact });
     if (uw.topic_id) return { ...uw, via: `${uw.via}+uworld`, learn: [], ...extra };
     d = { ...d, hits: uw.hits || [] };
   }
@@ -481,7 +497,7 @@ export async function resolveTopic(env, user, opts = {}) {
   if (texts.length && !exact) {
     const fk = foldedKeys(texts);
     if (fk.length) {
-      const fd = await fetchAliases(env, user, fk);
+      const fd = await aliases(fk);
       for (const k of fk) for (const h of fd.byKey.get(k) || []) if (!cands.some(c => c.id === h.id)) cands.unshift({ id: h.id, name: h.name, category_id: h.category_id, unit_id: h.unit_id, score: FOLD_SCORE, via: 'fold' });
     }
   }
@@ -495,6 +511,7 @@ export async function resolveTopic(env, user, opts = {}) {
     const ref = { id: refHit.id, name: refHit.name, category_id: refHit.category_id, score: best == null ? ACCEPT : Math.max(0, Math.round(best * 100 - 5) / 100), via: 'ref' };
     if (best == null) cands.unshift(ref); else cands.push(ref);
   }
+  if (!roots) cands = cands.filter(c => !rootHit(c));
   cands = cands.slice(0, 5);
   const queue = queueItem(user, { texts, source, source_ref, gap_id, card_id, system, hint, cut: texts.some(isCut), ref_label: extra.ref_label, candidates: cands.map(c => ({ id: c.id, name: c.name, score: c.score })) });
   return { topic_id: null, candidates: cands.slice(0, 5), queue, ...extra };
@@ -602,11 +619,13 @@ export async function requeueOpen(env, user, keys, { now = Date.now(), apply = n
   if (!items.length) return { checked: 0, placed: 0 };
   const plans = items.map(it => ({ it, p: plan([it.label_raw]) }));
   const data = await fetchAliases(env, user, uniq(plans.flatMap(x => x.p.keys)), uniq(plans.flatMap(x => x.p.cutKeys)));
+  const clinical = withoutRoots(data);
   const placements = [];
   for (const { it, p } of plans) {
     let ctx = {};
     try { ctx = JSON.parse(it.context_json || '{}'); } catch { ctx = {}; }
-    const d = decide(p, data, hintSystems(ctx.category_hint || null, ctx.category_hint ? null : ctx.system));
+    // Only a concept's own item (concepts.js, context.source 'concept') may land on a root-cause topic.
+    const d = decide(p, ctx.source === 'concept' ? data : clinical, hintSystems(ctx.category_hint || null, ctx.category_hint ? null : ctx.system));
     if (d.topic_id && d.confidence >= ACCEPT) placements.push({ queue_id: it.id, topic_id: d.topic_id });
   }
   if (!placements.length) return { checked: items.length, placed: 0 };

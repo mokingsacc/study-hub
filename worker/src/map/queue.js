@@ -6,7 +6,8 @@
 import { now as nowMs } from '../util.js';
 import { userKey, rawKey, normLabel } from './ingest/map-fields.js';
 
-export const QUEUE_KINDS = ['label', 'gap', 'card', 'lookalike', 'unit', 'versus', 'review_row'];
+export const QUEUE_KINDS = ['label', 'gap', 'card', 'lookalike', 'unit', 'versus', 'review_row', 'card_fix'];
+export const PLACE_SQL = "kind != 'card_fix'";
 const FIELD_MAX = 400, CONTEXT_MAX = 2000;
 
 export function capContext(ctx) {

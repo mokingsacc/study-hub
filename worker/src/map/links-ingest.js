@@ -7,6 +7,7 @@ import {
 } from './links.js';
 import { planLinks, readState } from './links-store.js';
 import { errorKeyOf } from './weights.js';
+import { causeOf, gapShowsConfusion } from '../../../public/js/shared/cause.js';
 import { resolveTopic } from './resolve.js';
 import { writeBatch } from './events.js';
 import { norm, userKey } from '../../../public/js/shared/names.js';
@@ -35,6 +36,21 @@ export const missSource = miss => SRC[miss.source] || 'derived';
 
 // A misread or a test-taking slip (a time-out click) says nothing about which topics look alike: it makes no link.
 const isSlip = miss => SLIP_ERRORS.includes(miss.error_type);
+// A miss whose cause (judged, or from its error type and words) is a confusion: only these queue look-alike names.
+const isConfusion = miss => { const c = causeOf(miss) || {}; return c.cause === 'confusion' && !c.disputed; };   // a disputed cause waits (0067)
+
+/**
+ * Proposals that zero this miss's own earlier support on look-alikes it no longer counts as a confusion (its cause was
+ * judged again, or the old regex read "thought" near a name). Only existing support rows move (only_existing), so a
+ * contrast nobody mixed up never makes a row; a link left with no live support is retired (planLinks ctx.retire) and
+ * comes back with the next real confusion. Undo puts the support back (links' undoLinkEvent).
+ */
+function noLongerConfused(miss, cands, obs, src) {
+  return cands.filter(c => c.topic_id && c.topic_id !== miss.topic_id && !(c.cw > 0)).map(c => ({
+    type: 'versus', from: miss.topic_id, to: c.topic_id, by: 'code', source: src, source_ref: miss.id, label: miss.label || null, create: false,
+    support: { obs_key: obs, src, role: c.role || 'classic', w: 0, cw: 0, truth_id: null, miss_id: miss.id, at: miss.at, force: true, only_existing: true },
+  }));
+}
 
 // The miss's own observation key: its id without the family prefix ('anki:200', 'uw:19038:2026-10-23', 'hub:b1:4').
 export const missObsKey = (user, miss) => (String(miss.id).startsWith(`${user}.`) ? String(miss.id).slice(user.length + 1) : String(miss.id));
@@ -157,8 +173,9 @@ export async function fromMiss(env, user, miss, ctx = {}) {
   const leakIndex = miss.block_id != null && miss.q_index != null ? await leakIndexFor(env, user, { missIds: [miss.id] }) : null;
   const obs = missObsKey(user, miss);
 
-  // Unresolved heads: a resolved lookalike queue item already names the topic; otherwise queue it.
-  const open = cands.filter(c => !c.topic_id);
+  // Unresolved heads: a resolved lookalike queue item already names the topic; otherwise queue it. Only a confusion
+  // queues a name: a teaching contrast that nobody mixed up is not worth Claude's time to place.
+  const open = isConfusion(miss) ? cands.filter(c => !c.topic_id) : [];
   const queue = open.length ? await queueRowsFor(env, user, miss, open, { held }) : { rows: [], placed: new Map() };
   const { norm: normName } = await deps.names();
   for (const c of open) { const t = queue.placed.get(normName(c.text)); if (t && t !== miss.topic_id) Object.assign(c, { topic_id: t }); }
@@ -172,12 +189,13 @@ export async function fromMiss(env, user, miss, ctx = {}) {
     }
   }
 
-  const proposals = cands.filter(c => c.topic_id).map(c => ({
+  const proposals = cands.filter(c => c.topic_id && c.cw > 0).map(c => ({
     type: 'versus', from: miss.topic_id, to: c.topic_id, by: 'code', source: src, source_ref: miss.id, label: miss.label || null,
     support: { obs_key: obs, src, role: c.role, w: c.w, cw: c.cw, truth_id: c.cw > 0 ? miss.topic_id : null,
       text: safeText(segmentFor(miss, c.text), leakIndex), miss_id: miss.id, sitting_id: miss.sitting_id ?? null, held, at: miss.at },
   }));
-  const r = proposals.length ? await planLinks(env, user, proposals, ctx) : { rows: [], events: [] };
+  proposals.push(...noLongerConfused(miss, cands, obs, src));
+  const r = proposals.length ? await planLinks(env, user, proposals, { retire: 'rejudge', ...ctx }) : { rows: [], events: [] };
   return { rows: [...r.rows, ...queue.rows], events: held ? [] : r.events, queued: queue.rows.length };
 }
 
@@ -246,13 +264,16 @@ export async function fromMisses(env, user, misses, ctx = {}) {
   if (!live.length) return out;
   const per = [];
   for (const miss of live) {
+    // A slip makes no look-alike, so it gives weakness no confused_with row either (the filter used to come after).
+    if (isSlip(miss)) { out.cw.set(miss.id, []); continue; }
     const cands = await lookAlikeCandidates(env, user, miss);
-    out.cw.set(miss.id, cands.filter(c => c.topic_id).map(c => ({ ...c })));
-    if (cands.length && !isSlip(miss)) per.push({ miss, cands });
+    out.cw.set(miss.id, cands.filter(c => c.topic_id && c.cw > 0).map(c => ({ ...c })));
+    if (cands.length) per.push({ miss, cands });
   }
   if (!per.length) return out;
   const { norm } = await deps.names();
-  const queue = await queueRowsForMany(env, user, per.filter(p => p.cands.some(c => !c.topic_id)).map(p => ({ miss: p.miss, open: p.cands.filter(c => !c.topic_id), held: 0 })));
+  const queue = await queueRowsForMany(env, user, per.filter(p => isConfusion(p.miss) && p.cands.some(c => !c.topic_id))
+    .map(p => ({ miss: p.miss, open: p.cands.filter(c => !c.topic_id), held: 0 })));
   for (const p of per) for (const c of p.cands) if (!c.topic_id) { const t = queue.placed.get(norm(c.text)); if (t && t !== p.miss.topic_id) c.topic_id = t; }
   const late = per.flatMap(p => p.cands.filter(c => c.topic_id && c.role == null).map(c => ({ p, c })));
   if (late.length) {
@@ -262,19 +283,20 @@ export async function fromMisses(env, user, misses, ctx = {}) {
       c.role = lookAlikeRole(p.miss, c.titled ? 'title' : c.from, [c.text, ...(aliases.get(c.topic_id) || [])]);
       c.cw = cwForMiss(c.role, p.miss);
       c.w = weightOf(src, c.role);
+      if (c.cw > 0) out.cw.get(p.miss.id).push({ ...c });
     }
   }
   const hubIds = per.filter(p => p.miss.block_id != null && p.miss.q_index != null).map(p => p.miss.id);
   const leakIndex = hubIds.length ? await leakIndexFor(env, user, { missIds: hubIds }) : null;
   const proposals = per.flatMap(({ miss, cands }) => {
     const src = missSource(miss), obs = missObsKey(user, miss);
-    return cands.filter(c => c.topic_id && c.topic_id !== miss.topic_id).map(c => ({
+    return [...cands.filter(c => c.topic_id && c.topic_id !== miss.topic_id && c.cw > 0).map(c => ({
       type: 'versus', from: miss.topic_id, to: c.topic_id, by: 'code', source: src, source_ref: miss.id, label: miss.label || null,
       support: { obs_key: obs, src, role: c.role, w: c.w, cw: c.cw, truth_id: c.cw > 0 ? miss.topic_id : null,
         text: safeText(segmentFor(miss, c.text), miss.block_id != null ? leakIndex : null), miss_id: miss.id, sitting_id: miss.sitting_id ?? null, held: 0, at: miss.at },
-    }));
+    })), ...noLongerConfused(miss, cands, obs, src)];
   });
-  const r = proposals.length ? await planLinks(env, user, proposals, ctx) : { rows: [], events: [] };
+  const r = proposals.length ? await planLinks(env, user, proposals, { retire: 'rejudge', ...ctx }) : { rows: [], events: [] };
   out.rows.push(...r.rows, ...queue.rows);
   out.events.push(...r.events);
   out.queued = queue.rows.length;
@@ -298,7 +320,9 @@ export async function fromGap(env, user, gap, ctx = {}) {
     const [ra, rb] = [await resolveName(env, user, [pair[0]], { source: 'gap', source_ref: gap.id }), await resolveName(env, user, [pair[1]], { source: 'gap', source_ref: gap.id })];
     if (ra.topic_id && rb.topic_id) [a, b] = [ra.topic_id, rb.topic_id];
   }
-  if (!b && gap.mixed_with && a) b = (await resolveName(env, user, [gap.mixed_with], { source: 'gap', source_ref: gap.id })).topic_id;
+  // mixed_with is the look-alike a gap names; it counts as a confusion only when the gap's words show one (wave 2: a
+  // card missed for a missing fact often carries the classic look-alike, and that is no mix-up).
+  if (!b && gap.mixed_with && a && gapShowsConfusion(gap)) b = (await resolveName(env, user, [gap.mixed_with], { source: 'gap', source_ref: gap.id })).topic_id;
   if (!a || !b || a === b) return EMPTY;
   const stated = (gap.origin || 'stated') === 'stated';
   const slip = SLIP_ERRORS.includes(errorKeyOf(gap.error_type));   // gaps keep the hub's words ('test-taking')
@@ -360,6 +384,7 @@ export async function lookalikeProposals(env, user, { miss_ids = [], topic_id, h
     const src = missSource(miss);
     const role = lookAlikeRole(miss, 'head', [head, ...aliases].filter(Boolean));
     const cw = cwForMiss(role, miss);
+    if (!(cw > 0)) continue;   // only a confusion makes a look-alike
     proposals.push({ type: 'versus', from: miss.topic_id, to: topic_id, by: 'code', source: src, source_ref: miss.id, label: miss.label || null,
       support: { obs_key: missObsKey(user, miss), src, role, w: weightOf(src, role), cw, truth_id: cw > 0 ? miss.topic_id : null, miss_id: miss.id,
         sitting_id: miss.sitting_id ?? null, held: miss.held ? 1 : 0, at: miss.at } });

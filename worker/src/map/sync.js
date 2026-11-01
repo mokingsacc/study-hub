@@ -6,7 +6,10 @@ import { sweepGaps } from './ingest/gaps.js';
 import { commit, LOADERS, sweepReleases } from './ingest/hub.js';
 import { countingEnv, withBudget } from './d1-count.js';
 import { noteJob } from '../job-log.js';
+import { deferUpdates, flushUpdates } from './instant.js';
 
+// The stored scores catch up with the fade once a night, at 04:04 London (live.js reads it at once everywhere else).
+export const SETTLE_HOUR = 4;
 export const LOCK_MS = 60_000, KICK_MS = 15_000, MAX_BACKOFF_MS = 15 * 60_000, STALE_MS = 20_000;
 // How long after a good run each source is due again (slot jobs are due whenever their minute comes).
 const EVERY = { 'anki.new': 50_000, 'anki.recent': 0, 'anki.due': 0, 'anki.full': 0, 'anki.reviews': 0, 'anki.fsrs': 0 };
@@ -23,8 +26,10 @@ export function londonClock(ms) {
   return { hour: h, minute: m };
 }
 
-/** The jobs for one London minute (pure; fullRunning: the nightly pass has more pages; reviewsRunning: so has the review log). */
-export function minuteJobsFor({ hour, minute }, { fullRunning = false, reviewsRunning = false } = {}) {
+/** The jobs for one London minute (pure; fullRunning: the nightly pass has more pages; reviewsRunning: so has the review log;
+ *  honestyRunning: the honesty check has a backlog; shadow: 'off' with no challenger scoring rule, 'due' while its test has a
+ *  backlog or has not started, else 'idle': shadow.js shadowMode). */
+export function minuteJobsFor({ hour, minute }, { fullRunning = false, reviewsRunning = false, honestyRunning = false, shadow = 'off' } = {}) {
   const jobs = ['anki.new'];
   if (minute % 10 === 7) jobs.push('cards.due'); if (minute === 29) jobs.push('orbits.daily');   // map orbits (I33): due counts; 04:10 reconcile and 04:20 re-place run in the 04:29 hourly slot
   if (minute % 5 === 2) jobs.push('anki.due');
@@ -33,10 +38,18 @@ export function minuteJobsFor({ hour, minute }, { fullRunning = false, reviewsRu
   if (minute % 15 === 12 || reviewsRunning) jobs.push('anki.reviews');
   if (minute % 15 === 12) jobs.push('anki.fsrs');
   jobs.push('dirty', 'rebuild', 'gaps', 'release');
-  if ([4, 9, 14, 19].includes(minute)) jobs.push('scores');
+  if (hour === SETTLE_HOUR && [4, 9, 14, 19].includes(minute)) jobs.push('scores');   // nightly only (the fade is read live)
   if ([24, 54].includes(minute)) jobs.push('repair');
   if (minute === 29) jobs.push('hourly');
+  if (minute === 39) jobs.push('facets');   // the topics' Diagnose / Manage parts (facets.js)
+  if (minute === 17) jobs.push('forecast');   // the score forecast: checks against new forms, today's row once a day (forecast/data.js)
   if (hour === 3 && minute === 44) jobs.push('priors');
+  if ((hour === 2 && minute === 7) || honestyRunning) jobs.push('honesty');   // the map's honesty check (honesty.js)
+  if (hour === 2 && (minute === 8 || minute === 38)) jobs.push('integrity');   // right after it: the data checks (integrity.js; once a day)
+  // Shadow mode (shadow.js): a challenger scoring rule beside the live one on the honesty check's answers: after the
+  // night's forecasts, and each minute while the honesty check or its own backlog runs (a new challenger starts at once).
+  if (shadow === 'due' || (shadow === 'idle' && ((hour === 2 && minute === 9) || honestyRunning))) jobs.push('shadow');
+  if (hour === 2 && minute === 17) jobs.push('clusters');   // the error clusters (clusters-job.js), nightly after the checks
   if (hour === 3 && minute === 53) jobs.push('lessonCards');
   if (minute % 5 === 0) jobs.push('embed');   // topic embeddings for the semantic layout (embed.js; resumable)
   if (minute % 5 === 1) jobs.push('cardReviews');
@@ -187,8 +200,19 @@ const RUN = {
     links: await optional('links', 'decayLinks', env, user),
     lessons: await optional('teach', 'staleLessons', env, user),
     priors: await optional('weakness', 'priorsIfMissing', env, user),   // first run after release: no wait for 03:44
+    starting_guess: await (await import('./starting-guess.js')).startingGuessIfMissing(env, user).catch(e => ({ error: (e && e.message) || String(e) })),
+    provenance: await (await import('./provenance.js')).provenanceJob(env, user).catch(e => ({ error: (e && e.message) || String(e) })),
+    concepts: await (await import('./concepts.js')).conceptsJob(env, user).catch(e => ({ error: (e && e.message) || String(e) })),
+    // the error clusters' names still waiting for their batch (clusters-job.js); one read when none wait
+    cluster_names: await (await import('./clusters-job.js')).clusterNamesJob(env, user).catch(e => ({ error: (e && e.message) || String(e) })),
   }),
   priors: (env, user) => optional('weakness', 'refreshPriors', env, user),
+  honesty: async (env, user) => (await import('./honesty.js')).honestyJob(env, user),
+  integrity: async (env, user) => (await import('./integrity.js')).integrityJob(env, user),
+  shadow: async (env, user) => (await import('./shadow.js')).shadowJob(env, user),
+  facets: async (env, user) => (await import('./facets.js')).facetsJob(env, user),
+  forecast: async (env, user) => (user === MO ? (await import('../forecast/data.js')).forecastJob(env, user) : null),
+  clusters: async (env, user) => (await import('./clusters-job.js')).clustersJob(env, user),
   lessonCards: (env, user) => (user !== MO ? null : !env.ANKI_MCP_URL ? { skipped: 'Anki is not connected' } : optional('sources', 'refreshLessonCards', env, user)),
   embed: async (env, user) => (await import('./embed.js')).embedJob(env, user),
   cardReviews: async (env, user) => (await import('./ingest/card-reviews.js')).ingestCardReviews(env, user),
@@ -205,7 +229,8 @@ const RUN = {
  * The minute cron (registered as ingest's MINUTE). Each job runs on its own; one failing never stops the
  * others. Returns {user: {job: result | {error}}} for the tests and the logs.
  */
-// The minute's D1 queries are one invocation's (Workers Paid: 1,000; D1_QUERY_BUDGET keeps a margin): each job
+// The minute's D1 queries are one invocation's (Workers Paid: 1,000), shared with the cron's other jobs: cron.js gives
+// the dispatcher its part as D1_QUERY_BUDGET (minuteBudget) and refuses any query past the whole. Each job here
 // runs on what the jobs before it left (B2-1). An Anki job takes at most ANKI_JOB_SHARE of the budget, and the
 // Anki jobs and the rebuild leave TAIL for the jobs after them; a job with under MIN_JOB left waits a minute.
 export const ANKI_JOB_SHARE = 0.45, MIN_JOB = 8;
@@ -220,20 +245,23 @@ export async function dispatchMinute(env, ctx, scheduledTime, { run = RUN } = {}
   const at = Number(scheduledTime) || nowMs();
   const total = Math.max(10, Number(env && env.D1_QUERY_BUDGET) || 40);
   const counted = countingEnv(env);
-  const cenv = counted.env;
+  // The minute's writes collect the topics they touch; their parts are worked out once, at the end (instant.js).
+  const cenv = deferUpdates(counted.env);
   const clock = londonClock(at);
-  let fullRunning = false, reviewsRunning = false;
+  let fullRunning = false, reviewsRunning = false, honestyRunning = false, shadow = 'off';
   try {
-    const rows = (await env.DB.prepare("SELECT source, cursor FROM sync_state WHERE user_id = ? AND source IN ('anki.full', 'anki.reviews')")
+    const rows = (await env.DB.prepare("SELECT source, cursor FROM sync_state WHERE user_id = ? AND source IN ('anki.full', 'anki.reviews', 'map.honesty', 'map.shadow')")
       .bind(MO).all()).results || [];
     const cur = src => (rows.find(r => r.source === src) || {}).cursor;
     fullRunning = !!cur('anki.full');
     reviewsRunning = (() => { try { return Number(JSON.parse(cur('anki.reviews') || '{}').more) === 1; } catch { return false; } })();
+    honestyRunning = (() => { try { return Number(JSON.parse(cur('map.honesty') || '{}').more) === 1; } catch { return false; } })();
+    shadow = await import('./shadow.js').then(m => m.shadowMode(cur('map.shadow')), () => 'off');
   } catch (e) {
     if (/no such table/i.test(String(e && e.message))) return {}; // before 0010: no map yet
     throw e;
   }
-  const jobs = minuteJobsFor(clock, { fullRunning, reviewsRunning });
+  const jobs = minuteJobsFor(clock, { fullRunning, reviewsRunning, honestyRunning, shadow });
   const out = {};
   for (const user of await activeUsers(env)) {
     out[user] = {};
@@ -252,6 +280,10 @@ export async function dispatchMinute(env, ctx, scheduledTime, { run = RUN } = {}
       }
     }
   }
+  try {
+    const parts = await flushUpdates(cenv, null, { now: at });
+    for (const [user, r] of Object.entries(parts)) if (out[user]) out[user].parts = r;
+  } catch (e) { console.error('minute parts failed', e && e.message); }
   return out;
 }
 

@@ -4,7 +4,7 @@ import worker from '../../worker/src/index.js';
 import { fakeR2, fakeAI, fakeVectorize, page } from './library-helpers.mjs';
 import { BASE, platformEnv, signedIn } from './platform-helpers.mjs';
 import { _resetVectorize, _clearD1Cache, _clearQueryCache } from '../../worker/src/library/vectors.js';
-import { pdfLinks, validExam, UPLOAD_LINK_MS } from '../../worker/src/platform/exams.js';
+import { pdfLinks, validExam, markCheck, UPLOAD_LINK_MS } from '../../worker/src/platform/exams.js';
 
 const pdfBytes = (size = 2000) => { const b = new Uint8Array(Math.max(size, 40)); b.set(new TextEncoder().encode('%PDF-1.4\n% test paper\n')); return b; };
 
@@ -232,4 +232,24 @@ test('my_hub_parts: her Claude lists the parts of her hub and switches them on o
   assert.equal((await sam.c.call('GET', '/api/p/me')).data.modules.find(m => m.id === 'results').on, true, "Sam's hub is unchanged");
   assert.equal((await rpc(s.env, link, 'my_hub_parts', { parts: { map: false } })).isError, true, 'the map is always on');
   s.d.close();
+});
+
+test('marks checked by code against the paper (AQA, OCR, Edexcel); a level-marked scheme keeps its levels word for word', () => {
+  const qs = [{ label: '01.1', marks: 1, page: 2 }, { label: '01.2', marks: 2, page: 2 }, { label: '02', marks: 6, page: 3 }].map(q => ({ ...q, n: 1 }));
+  const aqa = [{ n: 1, text: 'The maximum mark for this paper is 9.' }, { n: 2, text: 'Name it. [1 mark]\nExplain. [2 marks]' }, { n: 3, text: 'Evaluate. [6 marks]' }];
+  assert.deepEqual(markCheck(aqa, qs), { listed: 9, printed: 9, sure: true, ok: true, style: 'aqa', pages_off: [] });
+  const missing = markCheck(aqa, qs.slice(0, 2));
+  assert.equal(missing.ok, false);
+  assert.deepEqual(missing.pages_off, [{ page: 3, printed: 6, listed: 0 }]);
+  const ocr = [{ n: 1, text: 'The total mark for this paper is 9.' }, { n: 2, text: 'State it. [1]\nDescribe. [2]' }, { n: 3, text: 'Discuss. [6]' }];
+  assert.equal(markCheck(ocr, qs).style, 'ocr');
+  const edexcel = [{ n: 1, text: 'The total mark for this paper is 9.' }, { n: 2, text: 'Give it.\n(1)\nExplain.\n(2)' }, { n: 3, text: 'Assess.\n(6)\n(Total for Question 2 = 6 marks)' }];
+  assert.equal(markCheck(edexcel, qs).style, 'edexcel');
+  // optional questions: the brackets do not add up to the cover, so code cannot vouch and only warns
+  assert.deepEqual(markCheck([{ n: 1, text: 'The maximum mark for this paper is 9. [6 marks] [6 marks] [3 marks]' }], qs), { listed: 9, printed: 9, sure: false, ok: true });
+  assert.deepEqual(markCheck([{ n: 1, text: 'no cover' }], qs), { listed: 9 });
+  const { scheme } = validExam({ questions: [{ label: '02', marks: 16 }], scheme: [{ label: '02', points: ['Indicative: AO1 knowledge of the model'],
+    levels: [{ marks: '13–16', text: 'Knowledge is accurate and generally well detailed.' }, { marks: '9-12', text: 'Knowledge is evident.' }] }] });
+  assert.deepEqual(scheme[0].levels, [{ marks: '13-16', text: 'Knowledge is accurate and generally well detailed.' }, { marks: '9-12', text: 'Knowledge is evident.' }]);
+  assert.throws(() => validExam({ questions: [{ label: '1', marks: 4 }], scheme: [{ label: '1', points: [], levels: [{ marks: 'high', text: 'x' }] }] }), /like 7-9/);
 });

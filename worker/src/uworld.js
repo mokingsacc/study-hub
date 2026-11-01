@@ -6,6 +6,7 @@ import { ERROR_TYPES } from './checks.js';
 import { saveCues, scrubStems } from './gaps.js';
 import { MO } from './users.js';
 import { ingestUworldQuestions, hook } from './map/ingest/hub.js';
+import { blockComplete } from './map/ingest/map-fields.js';
 import { pullForUworld } from './map/sync.js';
 import { trackHook } from './uworld-track.js';
 import { PACE } from './map/weights.js';
@@ -17,7 +18,7 @@ const DAY = /^\d{4}-\d{2}-\d{2}$/;
 
 const num = v => (typeof v === 'number' && Number.isFinite(v) ? v : null);
 
-function cleanSegments(list) {
+export function cleanSegments(list) {
   if (!Array.isArray(list) || list.length > MAX_SEGMENTS) throw new HttpError(400, 'The transcript is not in the right shape.');
   return list.map(s => {
     const start = num(s && s.start), end = num(s && s.end);
@@ -59,6 +60,7 @@ export async function put(request, env) {
       words = excluded.words, updated_at = excluded.updated_at`,
   b.id, b.date, mode, minutes, count, JSON.stringify(scrubStems(segments)), JSON.stringify(manual), JSON.stringify(results), words, t, t);
   const cues = await saveCues(env, sentenceSegments(segments), `uw:${b.id}`, cueClock(b, t));
+  await markComplete(env, b.id);   // the question count may have changed
   await trackHook(env);
   const total = await first(env, 'SELECT count(*) AS n FROM uworld_blocks');
   return json({ saved: true, id: b.id, words, blocks_saved: total ? total.n : 1, cues });
@@ -80,6 +82,7 @@ export async function deleteBlock(request, env, ctx, { id }) {
   const stmts = [
     env.DB.prepare('DELETE FROM uworld_reviews WHERE block_id = ?').bind(blockId),
     env.DB.prepare('DELETE FROM uworld_judging WHERE block_id = ?').bind(blockId),
+    env.DB.prepare('DELETE FROM uworld_review_talks WHERE block_id = ?').bind(blockId),
     env.DB.prepare('DELETE FROM uworld_blocks WHERE id = ?').bind(blockId),
   ];
   // A cue that was never placed waits in "Not on the map yet": it goes from there too.
@@ -213,10 +216,29 @@ export async function mergeQuestions(env, blockId, questions, ctx = null) {
   }
   if (!all) throw new HttpError(503, 'The block was busy saving; please try again.');
   const r = await hook('uworld', () => ingestUworldQuestions(env, MO, blockId, all));
+  await markComplete(env, blockId, all);
   const fresh = new Set(questions.map(q => q.uworld_id).filter(Boolean));
   await trackHook(env); // more questions on the block can move the day's count
   if (r && r.unseen && ctx) pullForUworld(env, ctx, MO, r.unseen.filter(id => fresh.has(id) && all.some(q => q.uworld_id === id && (q.verdict === 'wrong' || q.verdict === 'right_flawed' || q.result === 'wrong'))));
   return all;
+}
+
+/**
+ * The block's complete flag (0054; wave 2 B.3): every question 1..count saved with a result the map takes, so the honesty
+ * check may score its answers (a block with misses alone would pull the colours red). questions: the stored list, or
+ * read here. Quiet before 0054. Returns the flag, or null when it could not be stored.
+ */
+export async function markComplete(env, blockId, questions = null) {
+  try {
+    const b = await first(env, 'SELECT count, questions_json FROM uworld_blocks WHERE id = ?', blockId);
+    if (!b) return null;
+    const flag = blockComplete(b.count, questions || JSON.parse(b.questions_json || '[]'));
+    await run(env, 'UPDATE uworld_blocks SET complete = ? WHERE id = ? AND complete IS NOT ?', flag, blockId, flag);
+    return flag;
+  } catch (e) {
+    if (/no such column/i.test(String(e && e.message))) return null;
+    throw e;
+  }
 }
 
 /** Time per question over a set of saved questions: average, how many over pace, and the slow ones, slowest first. */
@@ -333,6 +355,13 @@ export async function blockWords(env, { block, date, question } = {}) {
   const saved = Number.isInteger(question) ? questions.find(x => x.q === question) : null;
   if (saved) head.details = questionLine(saved).replace(/:(\nCheck note:[\s\S]*)?$/, '');
   if (saved && saved.time_s) head.time_s = saved.time_s;
+  const talk = await import('./uworld-review-talk.js').then(m => m.reviewTalkFor(env, row.id)).catch(() => null);
+  if (talk) {
+    const one = Number.isInteger(question) ? talk.by_q.get(question) : null;
+    head.review = Number.isInteger(question)
+      ? (one ? { status: talk.status, said: one.said, at: one.at, cause: one.cause, transcript: talk.transcript(question) } : { status: talk.status, line: talk.line, note: `He said nothing on Q${question} in his review.` })
+      : { status: talk.status, line: talk.line, transcript: talk.transcript(null) || '(nothing was heard)' };
+  }
   const q = saved && saved.start_ms != null ? saved : null;
   if (q) {
     const part = splitByStarts(segs, questions).groups.get(q.q) || [];

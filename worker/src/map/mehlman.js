@@ -73,6 +73,53 @@ export function passagesFrom(reply, max = KEEP) {
 }
 export const matchOf = (reply, passages) => (reply && (reply.match === 'weak' || reply.match === 'strong') ? reply.match : passages.length ? 'strong' : 'weak');
 
+export const MIN_SHARED = 3;
+const LONG = /^[a-z]{5,}$/;
+const MEH_STOP = new Set(['about', 'after', 'again', 'because', 'before', 'being', 'between', 'could', 'every', 'first', 'their', 'there',
+  'these', 'think', 'those', 'which', 'while', 'would', 'without', 'means', 'patient', 'patients', 'usually', 'other', 'often', 'still',
+  // Words on every other page, so sharing them says nothing (Q13's lung picture matched on "disease").
+  'disease', 'diseases', 'syndrome', 'normal', 'chronic', 'acute', 'infection', 'common', 'cause', 'causes', 'treatment', 'diagnosis']);
+const lower = s => clean(s).toLowerCase();
+const stems = s => new Set(lower(s).replace(/[^a-z\s-]+/g, ' ').split(/[\s-]+/).filter(w => LONG.test(w) && !MEH_STOP.has(w)).map(w => w.slice(0, 5)));
+/** Does the passage name it: the phrase, an acronym as a word, or every long word of a longer name. */
+export function names(text, name) {
+  const n = clean(name);
+  if (!n) return false;
+  const t = ` ${lower(text).replace(/[^a-z0-9]+/g, ' ')} `;
+  const phrase = lower(n).replace(/[^a-z0-9]+/g, ' ').trim();
+  if (phrase && t.includes(` ${phrase} `)) return true;
+  const long = phrase.split(' ').filter(w => w.length >= 4 && !MEH_STOP.has(w));
+  return long.length >= 2 && long.every(w => t.includes(` ${w}`));
+}
+/**
+ * The passage that fits a question best, or null. want: {names: [the condition and its other names], look_alike, rule,
+ * clue, separator}. Pure.
+ */
+export function bestPassage(passages, want) {
+  const nameList = (want.names || []).filter(Boolean);
+  const key = stems([want.rule, want.clue, want.separator].filter(Boolean).join(' '));
+  let best = null;
+  for (const p of passages || []) {
+    const text = [p.title, p.section, p.text].filter(Boolean).join(' ');
+    // A practice question whose answer is something else only lists the name among its options (hyphema beside
+    // "The answer is B (macular degeneration)"): it does not count as naming it.
+    const answer = /the answer is\s+[a-h]\b[^.]{0,80}/i.exec(p.text || '');
+    // A practice question with its options and no answer in view ("46) A 28-year-old ... C) Hyphema D) Scleritis")
+    // is not a note on the topic either.
+    const quiz = !answer && /(?:^|\s)\d{1,3}\)\s/.test(p.text || '') && ((p.text || '').match(/\b[A-H]\)\s/g) || []).length >= 2;
+    if (quiz) continue;
+    const named = nameList.some(n => names(text, n) && (!answer || names(answer[0], n)));
+    // About the look-alike and not the condition (Klebsiella aspiration pneumonia on chemical pneumonitis): not this one.
+    if (!named && want.look_alike && names(text, want.look_alike)) continue;
+    let shared = 0;
+    for (const w of stems(text)) if (key.has(w)) shared++;
+    if (!named && shared < MIN_SHARED) continue;
+    const score = (named ? 10 : 0) + (want.look_alike && names(text, want.look_alike) ? 2 : 0) + shared;
+    if (!best || score > best.score) best = { score, p };
+  }
+  return best ? best.p : null;
+}
+
 const sameQueries = (a, b) => JSON.stringify(a || []) === JSON.stringify(b || []);
 const cut = (p, n) => ({ ...p, text: p.text.length > n ? p.text.slice(0, n - 1).replace(/\s+\S*$/, '') + '…' : p.text });
 
@@ -134,7 +181,7 @@ const withTimeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeo
  * Never throws for the Anki server: a failure gives the stale cache ('stale') or nothing ('unreachable').
  */
 export async function mehlmanFor(env, user, topic, opts = {}) {
-  const { timeoutMs = 2500, maxAgeMs = CACHE_MS, force = false } = opts;
+  const { timeoutMs = 2500, maxAgeMs = CACHE_MS, force = false, keep = KEEP } = opts;
   const now = opts.now ?? Date.now();
   let t = typeof topic === 'string' ? null : topic;
   let cache = null;
@@ -151,7 +198,7 @@ export async function mehlmanFor(env, user, topic, opts = {}) {
   }
   if (!t || !t.name) return { status: 'unreachable', match: null, passages: [], queries: [] };
   const queries = mehlmanQueries(t);
-  const shape = (status, match, passages) => ({ status, match, passages: passages.slice(0, KEEP).map(p => cut(p, PASSAGE_MAX)), queries });
+  const shape = (status, match, passages) => ({ status, match, passages: passages.slice(0, keep).map(p => cut(p, PASSAGE_MAX)), queries });
   if (!force && cache && now - cache.fetched_at < maxAgeMs && sameQueries(cache.queries, queries)) return shape('cached', cache.match, cache.passages);
 
   let reply;
@@ -160,13 +207,25 @@ export async function mehlmanFor(env, user, topic, opts = {}) {
   } catch {
     return cache ? shape('stale', cache.match, cache.passages) : shape('unreachable', null, []);
   }
-  const passages = passagesFrom(reply);
+  const passages = passagesFrom(reply, Math.max(keep, KEEP));
   const match = matchOf(reply, passages);
+  const pictures = (Array.isArray(reply && reply.pictures) ? reply.pictures : []).filter(p => p && typeof p.library === 'string')
+    .slice(0, 10).map(p => ({ library: p.library.slice(0, 120), caption: clean(p.caption).slice(0, 200), source: clean(p.source).slice(0, 120) || null }));
   if (t.id) {
     const write = env.DB.batch(cacheStatements(env, user, t.id, queries, passages, match, now))
       .catch(e => { if (!noTable(e)) console.error('mehlman cache write failed', e && e.message); });
     if (opts.ctx && typeof opts.ctx.waitUntil === 'function') opts.ctx.waitUntil(write);
     else await write;
   }
-  return shape('fresh', match, passages);
+  return { ...shape('fresh', match, passages), ...(pictures.length ? { pictures } : {}) };
+}
+
+export function bestPictures(pictures, want) {
+  const nameList = [...(want.names || []), want.look_alike].filter(Boolean);
+  // Named only (Q20, 30 Oct 2026: acromegaly got the osteoarthritis picture on "joint space"): a picture is shown as
+  // being of this condition, so a caption that only shares its words is not enough.
+  const fits = p => nameList.some(n => names(p.caption || '', n));
+  const ok = (pictures || []).filter(fits);
+  const nbme = ok.find(p => /^nbme_/i.test(p.library)), anking = ok.find(p => /^anking_hy_/i.test(p.library));
+  return [nbme, anking].filter(Boolean);
 }

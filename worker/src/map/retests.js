@@ -1,18 +1,21 @@
 import { londonDay, londonDayStart, now as nowMs } from '../util.js';
 import { ankiCall } from '../anki.js';
 import { noteJob } from '../job-log.js';
-import { retestKey, ankiKey, dayNoon, isDay, retestOutcome, sameEvidence } from './ingest/map-fields.js';
+import { retestKey, ankiKey, dayNoon, isDay, retestOutcome, sameEvidence, eventAt } from './ingest/map-fields.js';
 import { addDays, NO_LESSON_ERRORS } from './teach-priority.js';
 
+// The old deck the cards went to until 1 Nov 2026; its cards move into MY_DECK, then the server deletes it.
 export const RETEST_DECK = 'Step 2 — Re-tests';
-export const SPACING = { sure: [7, 28], lean: [7, 28], guess: [7], unsaid: [7] };
-export const LESSON_DAYS = [3, 10], MISSED_AGAIN_DAYS = 7;
-// An open re-test from the Anki log within this many days of one booked here is the same re-test (the two sides book
-// "a week after missed again" from their own today).
+export const MY_DECK = 'Step 2 — My Cards';
+export const SPACING = { sure: [7], lean: [7], guess: [7], unsaid: [7] };
+// An open re-test from the Anki log within this many days of one booked here is the same re-test.
 export const SAME_WITHIN_DAYS = 3;
 export const CATCHUP_PER_DAY = 12, BOOK_LIMIT = 200;
-// About 15 misses a day come due a week later, plus the catch-up: 30 cards a day keeps up (about $1 to $2 of cases).
-export const CARDS_PER_DAY = 30, CARDS_PER_RUN = 3, CARD_TRIES = 3, RETEST_DAILY_USD = 2, RESERVE_USD = 0.2;
+export const NEW_CARDS_PER_DAY = 3;
+export const EXPIRE_DAYS = 14;
+export const CARDS_PER_DAY = NEW_CARDS_PER_DAY, CARDS_PER_RUN = 3, CARD_TRIES = 3, RETEST_DAILY_USD = Infinity, RESERVE_USD = 0.2;
+export const QUIET_MOVES_PER_RUN = 10;
+export const COVERED_TAG = 'hub_duplicate';
 export const RESULTS = ['got_it', 'missed_again'];
 const CALL_MS = 25_000;
 
@@ -78,52 +81,41 @@ export function retestEvidence(row, miss, result, { at, day, source, source_ref,
     held: 0, result: result === 'got_it' ? 'right' : 'wrong', outcome: result, topic_id: topic,
     queue_id: topic ? null : (miss && miss.queue_id) || null, label_norm: topic ? null : (miss && miss.label_norm) || null,
     category_id: (miss && miss.category_id) || row.category_id || null, card_id,
-    detail_json: JSON.stringify({ label: (miss && miss.label) || row.label || 'lesson re-test' }),
+    detail_json: JSON.stringify({ label: (miss && miss.label) || row.label || 'lesson check' }),
   };
 }
 
-/**
- * What answering one re-test changes (pure): the answered row and every other open re-test of the same miss already
- * due by that day close with the same result (by 'same'); missed again books one more MISSED_AGAIN_DAYS later unless
- * an open one already falls by then. open: the miss's (or lesson's) open rows, the answered one included.
- * Returns {close: [{id, result, done_by}], book: [{id, due}]}.
- */
 export function closePlan(target, open, result, by, day) {
   const close = [{ id: target.id, result, done_by: by }];
   for (const r of open) if (r.id !== target.id && r.result == null && r.due <= day) close.push({ id: r.id, result, done_by: 'same' });
-  const shut = new Set(close.map(c => c.id));
-  const book = [];
-  if (result === 'missed_again') {
-    const due = addDays(day, MISSED_AGAIN_DAYS);
-    const soon = open.some(r => !shut.has(r.id) && r.result == null && r.due <= due);
-    if (!soon) book.push({ id: target.kind === 'lesson' ? lessonRetestId(target.lesson_id, due) : missRetestId(target.miss_id, due), due });
-  }
-  return { close, book };
+  return { close, book: [] };
 }
 
 /**
  * The Anki log's re-tests of one mirrored miss against those booked here (pure). ankiList: [{due, result}] as the
  * log sends them; hub: the miss's retests rows. Returns {insert: [{id, due, result}], close: [{id, result, due}],
- * evidenceFor: [{id, due, result}]}: new open rows (not within SAME_WITHIN_DAYS of an open one here), results the log
+ * evidenceFor: [{id, due, result}]}: the log's first open day when the miss has no row here yet (one card per miss), results the log
  * recorded on rows still open here, and new rows with a result (each closing this miss's open rows due by then).
  * A result here that the log only echoes (the push after a card or a lesson) is left alone.
  */
 export function importPlan(missId, ankiList, hub) {
   const byId = new Map((hub || []).map(r => [r.id, r]));
   const out = { insert: [], close: [], evidenceFor: [] };
+  const done = r => (r.done_at != null ? { done_at: r.done_at } : {});
   const near = (a, b) => Math.abs(Date.parse(a + 'T12:00:00Z') - Date.parse(b + 'T12:00:00Z')) <= SAME_WITHIN_DAYS * 86_400_000;
-  for (const r of ankiList || []) {
-    if (!r || !isDay(r.due)) continue;
+  for (const r of [...(ankiList || [])].filter(x => x && isDay(x.due)).sort((x, y) => x.due.localeCompare(y.due))) {
     const result = r.result == null ? null : retestOutcome(r.result);
     if (r.result != null && !result) continue;
     const id = missRetestId(missId, r.due);
     const h = byId.get(id);
     if (h) {
-      if (h.result == null && result) { out.close.push({ id, result, due: r.due }); out.evidenceFor.push({ id, due: r.due, result }); h.result = result; }
+      if (h.result == null && result) { out.close.push({ id, result, due: r.due }); out.evidenceFor.push({ id, due: r.due, result, ...done(r) }); h.result = result; }
       continue;
     }
     if (!result) {
-      if ((hub || []).some(x => x.result == null && near(x.due, r.due))) continue;
+      // One card per miss (1 Nov 2026): the log's open re-test is booked here only while the miss has nothing here
+      // at all; its later days (28 days, a week after missed again) are not.
+      if (byId.size) continue;
       out.insert.push({ id, due: r.due, result: null });
       byId.set(id, { id, due: r.due, result: null });
       continue;
@@ -132,8 +124,8 @@ export function importPlan(missId, ankiList, hub) {
     // closed one of this miss's re-tests within the last few days, it is that result echoed back.
     const echo = (hub || []).some(x => x.result != null && x.done_by !== 'anki' && x.done_at && near(londonDay(x.done_at), r.due) && londonDay(x.done_at) <= r.due);
     if (echo) continue;
-    out.insert.push({ id, due: r.due, result });
-    out.evidenceFor.push({ id, due: r.due, result });
+    out.insert.push({ id, due: r.due, result, ...done(r) });
+    out.evidenceFor.push({ id, due: r.due, result, ...done(r) });
     for (const x of hub || []) if (x.result == null && x.due <= r.due) { out.close.push({ id: x.id, result, due: x.due, same: true }); x.result = result; }
     byId.set(id, { id, due: r.due, result });
   }
@@ -152,17 +144,15 @@ export function insertStatement(env, user, rows, t) {
       FROM json_each(?2) WHERE json_extract(value, '$.user_id') = ?1 ON CONFLICT (user_id, id) DO NOTHING`)
     .bind(user, JSON.stringify(list.map(r => Object.fromEntries(COLS.map(c => [c, r[c] ?? null])))));
 }
-/** Results onto open rows (a row already closed keeps its first result). close: [{id, result, done_by}]. */
 export function closeStatement(env, user, close, t) {
   if (!close.length) return null;
   const pick = k => `(SELECT json_extract(j.value, '$.${k}') FROM json_each(?2) j WHERE json_extract(j.value, '$.id') = retests.id LIMIT 1)`;
-  return env.DB.prepare(`UPDATE retests SET result = ${pick('result')}, done_by = ${pick('done_by')}, done_at = ?3, updated_at = ?3
+  return env.DB.prepare(`UPDATE retests SET result = ${pick('result')}, done_by = ${pick('done_by')}, done_at = coalesce(${pick('done_at')}, ?3), updated_at = ?3
       WHERE user_id = ?1 AND result IS NULL AND id IN (SELECT json_extract(value, '$.id') FROM json_each(?2))`)
-    .bind(user, JSON.stringify(close.map(c => ({ id: c.id, result: c.result, done_by: c.done_by }))), t);
+    .bind(user, JSON.stringify(close.map(c => ({ id: c.id, result: c.result, done_by: c.done_by, done_at: Number.isSafeInteger(c.done_at) ? c.done_at : null }))), t);
 }
-/** misses.next_retest_day from the open re-tests, for these misses (null: every miss whose day is out of step). */
 export function nextRetestStatement(env, user, missIds = null) {
-  const sub = `(SELECT min(r.due) FROM retests r WHERE r.user_id = misses.user_id AND r.miss_id = misses.id AND r.result IS NULL)`;
+  const sub = `(SELECT min(r.due) FROM retests r WHERE r.user_id = misses.user_id AND r.miss_id = misses.id AND r.result IS NULL AND r.covered IS NULL)`;
   if (missIds && !missIds.length) return null;
   return env.DB.prepare(`UPDATE misses SET next_retest_day = ${sub} WHERE user_id = ?1 ${missIds ? 'AND id IN (SELECT value FROM json_each(?2))' : 'AND ?2 IS NULL'}
       AND coalesce(next_retest_day, '') <> coalesce(${sub}, '')`).bind(user, missIds ? json(missIds) : null);
@@ -172,6 +162,13 @@ const outboxStatement = (env, user, missId, result, day, t) => env.DB.prepare(`I
   .bind(crypto.randomUUID(), `retest:${user}:${missId}:${day}`, JSON.stringify({ user, miss_id: missId, result, day }), t);
 
 // ---------------------------------------------------------------- the Anki log's re-tests (anki.js and the catch-up)
+
+export function retestDoneAt(r, now = nowMs()) {
+  const fallback = dayNoon(r.due);
+  const d = r.done_at;
+  const real = isDay(d) ? Math.min(dayNoon(d), now) : typeof d === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(d) ? Date.parse(d) : d;
+  return eventAt(real, fallback, { lo: fallback - 7 * 86_400_000, hi: now });
+}
 
 /**
  * The Anki log's re-tests for mirrored misses, as parts of the caller's commit: {statements, upsert, events, recompute}.
@@ -193,10 +190,13 @@ export async function importParts(env, user, items, t = nowMs()) {
     const m = it.row;
     const plan = importPlan(m.id, it.retests, (byMiss.get(m.id) || []).map(r => ({ ...r })));
     for (const r of plan.insert) insert.push({ id: r.id, miss_id: m.id, topic_id: m.topic_id || null, due: r.due, source: 'anki', result: r.result,
-      done_at: r.result ? dayNoon(r.due) : null, done_by: r.result ? 'anki' : null, card_state: r.result ? 'done' : 'pending' });
+      done_at: r.result ? retestDoneAt(r, t) : null, done_by: r.result ? 'anki' : null, card_state: r.result ? 'done' : 'pending' });
     for (const c of plan.close) close.push({ id: c.id, result: c.result, done_by: c.same ? 'same' : 'anki' });
-    for (const e of plan.evidenceFor) ev.push(retestEvidence({ id: e.id, kind: 'miss', miss_id: m.id, due: e.due }, m, e.result,
-      { at: dayNoon(e.due), day: e.due, source: 'anki', source_ref: ankiKey(m.anki_mistake_id) }));
+    for (const e of plan.evidenceFor) {
+      const at = retestDoneAt(e, t);
+      ev.push(retestEvidence({ id: e.id, kind: 'miss', miss_id: m.id, due: e.due }, m, e.result,
+        { at, day: londonDay(at), source: 'anki', source_ref: ankiKey(m.anki_mistake_id) }));
+    }
     if (plan.insert.length || plan.close.length) touched.add(m.id);
   }
   if (ev.length) {
@@ -210,7 +210,7 @@ export async function importParts(env, user, items, t = nowMs()) {
       if (e.topic_id) out.recompute.push(e.topic_id);
       if (prev && prev.topic_id && prev.topic_id !== e.topic_id) out.recompute.push(prev.topic_id);
       if (!prev) out.events.push({ kind: 'evidence.added', target_type: 'evidence', target_id: e.obs_key, topic_id: e.topic_id,
-        summary: cap(`${parse(e.detail_json, {}).label}: re-test ${e.outcome === 'got_it' ? 'right' : 'missed again'}`), before: null, after: { topic_id: e.topic_id, kind: 'retest', outcome: e.outcome } });
+        summary: cap(`${parse(e.detail_json, {}).label}: checked again, ${e.outcome === 'got_it' ? 'right' : 'missed'}`), before: null, after: { topic_id: e.topic_id, kind: 'retest', outcome: e.outcome } });
     }
   }
   out.statements.push(...[insertStatement(env, user, insert, t), closeStatement(env, user, close, t), nextRetestStatement(env, user, [...touched])].filter(Boolean));
@@ -261,10 +261,6 @@ export async function bookRetests(env, user, { now = nowMs(), limit = BOOK_LIMIT
 
 // ---------------------------------------------------------------- closing from card ratings (anki-reviews.js)
 
-const normDeck = s => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
-/** A review that may be of a re-test card: in the re-test deck, or with no deck said. */
-export const maybeRetestCard = r => !!r && (r.deck == null || normDeck(r.deck).startsWith(normDeck(RETEST_DECK)));
-
 /**
  * The results the first ratings of re-test cards give (pure): rows are retests rows with a card; a card's first
  * rating after it was made (card ids are their creation time) answers its re-test, if still open.
@@ -287,13 +283,9 @@ export function cardResults(rows, reviews) {
   return out;
 }
 
-/**
- * card_reviews rows into re-test results, in one commit of their own. Returns {cards: Set of every re-test card id
- * among them (closed or not), so the caller keeps them out of the card evidence; closed: n}.
- */
 export async function closeFromReviews(env, user, reviews, { now = nowMs() } = {}) {
-  const cand = [...new Set((reviews || []).filter(maybeRetestCard).map(r => Number(r.card_id)).filter(Number.isSafeInteger))];
-  const out = { cards: new Set(), closed: 0 };
+  const cand = [...new Set((reviews || []).map(r => Number(r && r.card_id)).filter(n => Number.isSafeInteger(n) && n > 0))];
+  const out = { cards: new Set(), skip: new Set(), topics: new Map(), closed: 0 };
   if (!cand.length) return out;
   let rows;
   try {
@@ -302,8 +294,15 @@ export async function closeFromReviews(env, user, reviews, { now = nowMs() } = {
         LEFT JOIN topics t ON t.user_id = r.user_id AND t.id = coalesce(m.topic_id, r.topic_id)
       WHERE r.user_id = ?1 AND r.card_id IN (SELECT value FROM json_each(?2))`).bind(user, json(cand)).all()).results || [];
   } catch (e) { if (noTable(e)) return out; throw e; }
-  for (const r of rows) out.cards.add(Number(r.card_id));
+  for (const r of rows) {
+    const card = Number(r.card_id);
+    out.cards.add(card);
+    const topic = r.m_topic_id || r.topic_id;
+    if (topic && !out.topics.has(card)) out.topics.set(card, topic);
+    if (r.done_by === 'card' && r.done_at != null) out.skip.add(`${card}|${londonDay(Number(r.done_at))}`);
+  }
   const answered = cardResults(rows, (reviews || []).filter(r => out.cards.has(Number(r.card_id))));
+  for (const a of answered) out.skip.add(`${Number(a.row.card_id)}|${londonDay(a.at)}`);
   if (!answered.length) return out;
   const parts = await answerParts(env, user, answered.map(a => ({ ...a, by: 'card' })), now);
   if (parts) {
@@ -321,7 +320,7 @@ async function answerParts(env, user, answered, t) {
   const lessonIds = [...new Set(answered.map(a => a.row.lesson_id).filter(Boolean))];
   const open = (await env.DB.prepare(`SELECT * FROM retests WHERE user_id = ?1 AND result IS NULL
       AND (miss_id IN (SELECT value FROM json_each(?2)) OR lesson_id IN (SELECT value FROM json_each(?3)))`).bind(user, json(missIds), json(lessonIds)).all()).results || [];
-  const close = [], book = [], upsert = [], events = [], recompute = [], statements = [];
+  const close = [], upsert = [], events = [], recompute = [], statements = [];
   const done = new Set();
   for (const a of answered) {
     const row = a.row;
@@ -330,23 +329,21 @@ async function answerParts(env, user, answered, t) {
     const mine = open.filter(o => (row.kind === 'lesson' ? o.lesson_id === row.lesson_id : o.miss_id === row.miss_id) && !done.has(o.id));
     const plan = closePlan(row, mine.some(o => o.id === row.id) ? mine : [row, ...mine], a.result, a.by, day);
     for (const c of plan.close) done.add(c.id);
-    close.push(...plan.close);
-    for (const b of plan.book) book.push({ id: b.id, kind: row.kind, miss_id: row.miss_id || null, lesson_id: row.lesson_id || null, topic_id: row.m_topic_id || row.topic_id || null,
-      due: b.due, source: row.kind === 'lesson' ? 'lesson' : 'hub' });
+    close.push(...plan.close.map(c => ({ ...c, done_at: a.at })));
     const miss = row.kind === 'lesson' ? null : { anki_mistake_id: row.anki_mistake_id, topic_id: row.m_topic_id, queue_id: row.queue_id, label_norm: row.label_norm,
       category_id: row.m_category_id || row.t_category_id, label: row.label };
-    const e = retestEvidence({ ...row, category_id: row.t_category_id, label: row.kind === 'lesson' ? `${row.topic_name || 'lesson'}: lesson re-test` : row.label }, miss, a.result,
+    const e = retestEvidence({ ...row, category_id: row.t_category_id, label: row.kind === 'lesson' ? `${row.topic_name || 'lesson'}: lesson check` : row.label }, miss, a.result,
       { at: a.at, day, source: 'anki', source_ref: `retest:${row.id}`, card_id: row.card_id != null ? Number(row.card_id) : null });
     upsert.push(e);
     if (e.topic_id) recompute.push(e.topic_id);
     events.push({ kind: 'evidence.added', target_type: 'evidence', target_id: e.obs_key, topic_id: e.topic_id,
-      summary: cap(`${parse(e.detail_json, {}).label}: re-test ${a.result === 'got_it' ? 'right' : 'missed again'} (card)`), before: null, after: { topic_id: e.topic_id, kind: 'retest', outcome: a.result } });
+      summary: cap(`${parse(e.detail_json, {}).label}: its card ${a.result === 'got_it' ? 'right' : 'missed'} the first time`), before: null, after: { topic_id: e.topic_id, kind: 'retest', outcome: a.result } });
     // The Anki log agrees: its own re-test of the miss gets the same result (only a re-test the log booked itself, so it
     // never adds one of its own for a day it had none).
     const ankiOwned = [row, ...mine].some(o => plan.close.some(c => c.id === o.id) && o.source === 'anki');
     if (row.anki_mistake_id != null && ankiOwned) statements.push(outboxStatement(env, user, row.miss_id, a.result, day, t));
   }
-  statements.unshift(...[closeStatement(env, user, close, t), insertStatement(env, user, book, t)].filter(Boolean));
+  statements.unshift(...[closeStatement(env, user, close, t)].filter(Boolean));
   const s = nextRetestStatement(env, user, missIds);
   if (s) statements.push(s);
   return { statements, evidence: { upsert }, events, recompute };
@@ -382,52 +379,31 @@ export async function lessonRetests(env, user, { topicId, lessonId, today }) {
 }
 
 /**
- * A lesson's re-test rows for its own applyChange batch (pure): the final case closes the topic's due re-tests (right
- * got_it, wrong missed_again, partial leaves them open; missed again books one a week on), and a lesson that only
- * partly landed (or did not) books its own at LESSON_DAYS. No retest evidence: the lesson_final row already carries
- * that answer. each misses.next_retest_day that moves is a row too. rt: lessonRetests' reply. Returns {rows, events,
- * outbox: [{miss_id, result}]}, rows as applyChange row diffs (retests, misses), events paired with them by index.
+ * A lesson's rows for its own applyChange batch (pure): the final case closes the topic's due checks (right got_it,
+ * wrong missed_again, partial leaves them open). It books nothing (1 Nov 2026: lessons no longer book re-tests, and
+ * missed again books nothing). No retest evidence: the lesson_final row already carries that answer. Each
+ * misses.next_retest_day that moves is a row too. rt: lessonRetests' reply. Returns {rows, events, outbox: [{miss_id,
+ * result}]}, rows as applyChange row diffs (retests, misses), events paired with them by index.
  */
-export function lessonParts({ lesson, topicId, topicName, final, outcome, rt, now, today }) {
+export function lessonParts({ topicId, topicName, final, rt, now }) {
   const rows = [], events = [], outbox = [];
   const add = (row, event) => { rows.push(row); events.push({ topic_id: topicId, ...event, summary: cap(event.summary) }); };
   const result = final === 'right' ? 'got_it' : final === 'wrong' ? 'missed_again' : null;
-  const booked = new Set(rt.booked || []);
   const open = new Map((rt.open || []).map(r => [r.id, { ...r }]));
   const on = topicName || 'a topic';
   if (result) {
     for (const r of rt.due || []) {
       add({ table: 'retests', op: 'update', key: { id: r.id }, before: { result: null, done_at: null, done_by: null, updated_at: r.updated_at },
         after: { result, done_at: now, done_by: 'lesson', updated_at: now } },
-      { kind: 'miss.updated', target_type: 'retests', target_id: r.id, summary: `Re-test ${result === 'got_it' ? 'passed' : 'missed'} in a lesson on ${on}` });
+      { kind: 'miss.updated', target_type: 'retests', target_id: r.id, summary: `${result === 'got_it' ? 'Right' : 'Missed'} again in a lesson on ${on}` });
       open.delete(r.id);
       if (r.source === 'anki' && r.anki_mistake_id != null && r.miss_id && !outbox.some(o => o.miss_id === r.miss_id)) outbox.push({ miss_id: r.miss_id, result });
     }
-    if (result === 'missed_again') {
-      const due = addDays(today, MISSED_AGAIN_DAYS);
-      for (const missId of new Set((rt.due || []).map(r => r.miss_id).filter(Boolean))) {
-        const id = missRetestId(missId, due);
-        if (booked.has(id) || [...open.values()].some(o => o.miss_id === missId && o.due <= due)) continue;
-        add({ table: 'retests', op: 'insert', key: { id }, after: { kind: 'miss', miss_id: missId, topic_id: topicId, due, source: 'hub', card_state: 'pending', created_at: now, updated_at: now } },
-          { kind: 'miss.updated', target_type: 'retests', target_id: id, summary: `Re-test booked for ${due} after a lesson on ${on}` });
-        open.set(id, { id, miss_id: missId, due, result: null });
-        booked.add(id);
-      }
-    }
     for (const [missId, before] of rt.next || new Map()) {
-      const after = nextDue([...open.values()].filter(o => o.miss_id === missId));
+      const after = nextDue([...open.values()].filter(o => o.miss_id === missId && o.covered == null));
       if ((before ?? null) === after) continue;
       add({ table: 'misses', op: 'update', key: { id: missId }, before: { next_retest_day: before ?? null }, after: { next_retest_day: after } },
-        { kind: 'miss.updated', target_type: 'miss', target_id: missId, summary: `Next re-test ${after || 'none'} after a lesson on ${on}` });
-    }
-  }
-  if (topicId && (outcome === 'partial' || outcome === 'not_landed')) {
-    for (const d of LESSON_DAYS) {
-      const due = addDays(today, d);
-      const id = lessonRetestId(lesson.id, due);
-      if (booked.has(id)) continue;
-      add({ table: 'retests', op: 'insert', key: { id }, after: { kind: 'lesson', lesson_id: lesson.id, topic_id: topicId, due, source: 'lesson', card_state: 'pending', created_at: now, updated_at: now } },
-        { kind: 'miss.updated', target_type: 'retests', target_id: id, summary: `Lesson re-test on ${on} booked for ${due}` });
+        { kind: 'miss.updated', target_type: 'miss', target_id: missId, summary: `Checked in a lesson on ${on}` });
     }
   }
   return { rows, events, outbox };
@@ -435,9 +411,9 @@ export function lessonParts({ lesson, topicId, topicName, final, outcome, rt, no
 
 // ---------------------------------------------------------------- the cards (minute job)
 
-export const CASE_SYSTEM = `You write one Anki re-test card for Mo, a learner preparing for USMLE Step 2 CK (exam day).
+export const CASE_SYSTEM = `You write one Anki card for Mo, a learner preparing for USMLE Step 2 CK (exam day).
 
-The card re-tests the concept behind something he got wrong, with a NEW case: a different patient, setting and wording, so remembering the original question would not help. You are given only the teaching point: the topic, his rule ("if X then Y"), the look-alike, what he thought, the kind of miss and the checklist step that broke (or, for a lesson, what he still left out). You never see the original question; never imitate a question bank's stem.
+The card checks the concept behind something he got wrong, with a NEW case: a different patient, setting and wording, so remembering the original question would not help. You are given only the teaching point: the topic, his rule ("if X then Y"), the look-alike, what he thought, the kind of miss and the checklist step that broke (or, for a lesson, what he still left out). You never see the original question; never imitate a question bank's stem.
 
 Mo's card style:
 - stem: one or two full sentences, under 30 words, with only the findings that decide the answer; never name the answer in it.
@@ -510,46 +486,88 @@ async function writeCase(env, item) {
   }
 }
 
+export const OWN_CARD_SQL = `(coalesce(m.anki_note_ids_json, '[]') NOT IN ('[]', '') OR (m.topic_id IS NOT NULL AND EXISTS (SELECT 1 FROM lessons l2
+    WHERE l2.user_id = m.user_id AND l2.topic_id = m.topic_id AND l2.card_id IS NOT NULL AND l2.card_action IN ('added', 'edited_existing'))))`;
+
 const DUE_SQL = `SELECT r.*, m.label, m.rule, m.look_alikes, m.my_reasoning, m.error_type, m.confidence, m.step, m.block_id, m.system_raw,
     coalesce(t.name, m.condition_raw, m.topic_raw, l.topic_name) AS topic, t.yield, l.weak_spot, l.goal, l.teach_back_json, l.final_explain_json,
     (m.confidence = 'sure' AND m.result = 'wrong') AS sure_wrong
   FROM retests r LEFT JOIN misses m ON m.user_id = r.user_id AND m.id = r.miss_id
     LEFT JOIN lessons l ON l.user_id = r.user_id AND l.id = r.lesson_id
     LEFT JOIN topics t ON t.user_id = r.user_id AND t.id = coalesce(m.topic_id, r.topic_id)
-  WHERE r.user_id = ?1 AND r.result IS NULL AND r.due <= ?2 AND r.card_state IN ('pending', 'written') AND r.card_tries < ?3
+  WHERE r.user_id = ?1 AND r.result IS NULL AND r.covered IS NULL AND r.due <= ?2 AND r.card_state IN ('pending', 'written') AND r.card_tries < ?3
     AND (r.kind = 'lesson' OR (m.held = 0 AND m.deleted_at IS NULL AND (m.error_type IS NULL OR m.error_type NOT IN ('misread', 'test_taking'))))
-    AND NOT EXISTS (SELECT 1 FROM retests o WHERE o.user_id = r.user_id AND o.id <> r.id AND o.card_state = 'made' AND o.result IS NULL
+    AND NOT EXISTS (SELECT 1 FROM retests o WHERE o.user_id = r.user_id AND o.id <> r.id AND o.card_id IS NOT NULL
       AND ((r.kind = 'miss' AND o.miss_id = r.miss_id) OR (r.kind = 'lesson' AND o.lesson_id = r.lesson_id)))
-  ORDER BY r.card_state = 'written' DESC, sure_wrong DESC, r.due, coalesce(t.yield, 0) DESC LIMIT ?4`;
+  ORDER BY r.card_state = 'written' DESC, sure_wrong DESC, coalesce(t.yield, 0) DESC, r.due DESC LIMIT ?4`;
+
+const OLD_SQL = `SELECT r.id, r.kind, r.card_id, r.due, r.result, r.card_state, (m.confidence = 'sure' AND m.result = 'wrong') AS sure_wrong,
+    CASE WHEN r.kind = 'miss' AND m.id IS NOT NULL AND ${OWN_CARD_SQL} THEN 1 ELSE 0 END AS own,
+    CASE WHEN r.result IS NOT NULL OR r.card_state = 'done' OR r.covered IS NOT NULL OR (r.kind = 'miss' AND (m.id IS NULL OR m.held = 1 OR m.deleted_at IS NOT NULL
+      OR m.error_type IN ('misread', 'test_taking'))) THEN 1 ELSE 0 END AS closed
+  FROM retests r LEFT JOIN misses m ON m.user_id = r.user_id AND m.id = r.miss_id
+  WHERE r.user_id = ?1 AND r.card_deck = 'retests' AND r.card_id IS NOT NULL
+  ORDER BY sure_wrong DESC, r.due LIMIT 80`;
+
+const COVER_SQL = `UPDATE retests SET covered = 'own_card', updated_at = ?2 WHERE user_id = ?1 AND kind = 'miss' AND result IS NULL AND covered IS NULL
+    AND card_id IS NULL AND card_state IN ('pending', 'written', 'failed') AND miss_id IN (SELECT m.id FROM misses m WHERE m.user_id = ?1 AND ${OWN_CARD_SQL})`;
+
+// Open rows with no card that waited past EXPIRE_DAYS (?3 is the cut-off day): let go, never carded or counted.
+const EXPIRE_SQL = `UPDATE retests SET covered = 'expired', updated_at = ?2 WHERE user_id = ?1 AND result IS NULL AND covered IS NULL
+    AND card_id IS NULL AND card_state IN ('pending', 'written', 'failed') AND due < ?3`;
+
+const TODAY_SQL = `SELECT count(*) AS n FROM retests WHERE user_id = ?1 AND card_state = 'made' AND covered IS NULL
+    AND ((card_at >= ?2 AND card_moved_at IS NULL) OR card_moved_at >= ?2)`;
 
 /**
- * The card job: suspends the cards of re-tests now closed, writes the cases of the due ones (the written ones first, so
- * a retry adds the same card), and adds them to the re-test deck with one retest_cards call. At most CARDS_PER_RUN cases
- * written a run (none while that many wait unsent) and CARDS_PER_DAY cards a day. Returns what it did, or {skipped}.
+ * Today's share of new cards (pure): the old cards to move as they are and the due rows to card, sure-and-wrong first,
+ * then the ones ready to go (an old card, or a case already written), then the earliest due. left: how many more today.
+ * Returns {move: [old rows], add: [due rows]} within left and CARDS_PER_RUN.
  */
+export function pickToday(old, due, left, perRun = CARDS_PER_RUN) {
+  const items = [...old.map(r => ({ r, kind: 'move', ready: 1 })), ...due.map(r => ({ r, kind: 'add', ready: r.card_state === 'written' ? 1 : 0 }))];
+  items.sort((a, b) => (Number(b.r.sure_wrong) || 0) - (Number(a.r.sure_wrong) || 0) || b.ready - a.ready || String(a.r.due).localeCompare(String(b.r.due)));
+  const take = items.slice(0, Math.max(0, Math.min(perRun, left)));
+  return { move: take.filter(x => x.kind === 'move').map(x => x.r), add: take.filter(x => x.kind === 'add').map(x => x.r) };
+}
+
 export async function retestCards(env, user, { now = nowMs(), write = writeCase } = {}) {
   if (!env.ANKI_MCP_URL) return { skipped: 'Anki is not connected' };
   const today = londonDay(now);
   const q = (sql, ...a) => env.DB.prepare(sql).bind(...a);
-  let due, doneCards, made;
+  let dueRes, oldRes, made, expired;
   try {
-    [due, doneCards, made] = await env.DB.batch([
+    [, expired, dueRes, oldRes, made] = await env.DB.batch([
+      q(COVER_SQL, user, nowMs()),
+      q(EXPIRE_SQL, user, nowMs(), addDays(today, -EXPIRE_DAYS)),
       q(DUE_SQL, user, today, CARD_TRIES, CARDS_PER_RUN * 4),
-      q(`SELECT id, card_id FROM retests WHERE user_id = ?1 AND card_state = 'made' AND result IS NOT NULL AND card_id IS NOT NULL LIMIT 50`, user),
-      q(`SELECT count(*) AS n FROM retests WHERE user_id = ?1 AND card_at >= ?2`, user, londonDayStart(now)),
+      q(OLD_SQL, user),
+      q(TODAY_SQL, user, londonDayStart(now)),
     ]);
   } catch (e) { if (noTable(e)) return { skipped: 'not ready' }; throw e; }
   const left = Math.max(0, CARDS_PER_DAY - Number((made.results[0] || {}).n || 0));
-  // One card at a time per miss or lesson: two of its re-tests due together are one card.
+  // One card per miss or lesson: two of its rows due together are one card.
   const one = new Set();
-  const rows = (due.results || []).filter(r => { const k = r.kind === 'lesson' ? `l:${r.lesson_id}` : `m:${r.miss_id}`; if (one.has(k)) return false; one.add(k); return true; })
-    .slice(0, Math.min(CARDS_PER_RUN, left));
-  const done = doneCards.results || [];
-  if (!rows.length && !done.length) return { made: 0, suspended: 0 };
+  const due = (dueRes.results || []).filter(r => { const k = r.kind === 'lesson' ? `l:${r.lesson_id}` : `m:${r.miss_id}`; if (one.has(k)) return false; one.add(k); return true; });
+  const old = oldRes.results || [];
+  const quiet = old.filter(r => Number(r.closed) || Number(r.own)).slice(0, QUIET_MOVES_PER_RUN);
+  const pick = pickToday(old.filter(r => !Number(r.closed) && !Number(r.own)), due, left);
+  const rows = pick.add;
+  const letGo = Number(expired && expired.meta && expired.meta.changes) || 0;
+  if (!rows.length && !pick.move.length && !quiet.length) {
+    if (letGo) await noteJob(env, { job: 'retest_cards', user, key: `${today}:ok`, state: 'ok', add: true, at: now, counts: { expired: letGo } });
+    return { made: 0, moved: 0, hidden: 0, expired: letGo };
+  }
   const note = (state, counts, detail = null) => noteJob(env, { job: 'retest_cards', user, key: `${today}:${state}`, state, add: state === 'ok', at: now, counts, detail });
-  const report = async o => { if (o.made || o.suspended || o.written || o.failed) await note('ok', { made: o.made, suspended: o.suspended, written: o.written, unusable: o.failed }); return o; };
+  const report = async o => {
+    o.expired = letGo;
+    if (o.made || o.moved || o.hidden || o.written || o.failed || o.deck_removed || letGo) {
+      await note('ok', { made: o.made, moved: o.moved, hidden: o.hidden, written: o.written, unusable: o.failed, ...(o.deck_removed ? { deck_removed: 1 } : {}), ...(letGo ? { expired: letGo } : {}) });
+    }
+    return o;
+  };
   const t = nowMs();
-  const stmts = [], out = { written: 0, made: 0, suspended: 0, failed: 0 };
+  const stmts = [], out = { written: 0, made: 0, moved: 0, hidden: 0, failed: 0 };
   // Cases: the written ones are sent again as they are; new ones under the day's limit.
   let spent = 0;
   try { spent = Number((await q('SELECT value FROM settings WHERE key = ?1', spentKey(today)).first() || {}).value) || 0; } catch { spent = 0; }
@@ -580,8 +598,10 @@ export async function retestCards(env, user, { now = nowMs(), write = writeCase 
       if (c && r.block_id && (!index || leaks(index, [c.stem, ...c.questions, c.answer, c.management, c.vs, c.why].join(' ')))) { c = null; err = 'the case shared words with the question'; }
       if (!c && !err) err = 'the case came back unusable';
     } catch (e) {
+      // Waiting for its Message Batch (claude.js): the next due rows are queued too; the next run finds the cases.
+      if (e && e.pending === true && e.batch === true) { await note('held', { batch: 1 }); continue; }
       // Only an answer that cannot be used counts as a try (422: refused, cut off, not JSON); a cap, a missing key or
-      // the API being down stops this run and leaves the re-test as it was for the next.
+      // the API being down stops this run and leaves the row as it was for the next.
       if (!(e && e.status === 422)) {
         console.error(JSON.stringify({ retest_case_not_written: { user, id: r.id, error: String((e && e.message) || e).slice(0, 200) } }));
         await note(e && e.status === 429 ? 'held' : 'failed', { writing: 1 }, e);
@@ -601,17 +621,19 @@ export async function retestCards(env, user, { now = nowMs(), write = writeCase 
     }
   }
   if (stmts.length) await env.DB.batch(stmts.splice(0));
-  if (!send.length && !done.length) return report(out);
+  const move = [...pick.move.map(r => ({ card_id: Number(r.card_id) })),
+    ...quiet.map(r => ({ card_id: Number(r.card_id), suspend: true, ...(Number(r.own) ? { tag: COVERED_TAG } : {}) }))];
+  if (!send.length && !move.length) return report(out);
   let reply;
   try {
     reply = await ankiCall(env, 'retest_cards', {
       add: send.map(({ r, c }) => ({ key: cardKey(r.id), ...c, ...(r.system_raw ? { system: r.system_raw } : {}) })),
-      done: [...new Set(done.map(d => Number(d.card_id)))],
+      move,
     }, { timeoutMs: CALL_MS });
   } catch (e) {
     // The written cases stay written and go again next run, with the same keys, so no card is ever added twice.
-    console.error(JSON.stringify({ retest_cards_failed: { user, add: send.length, done: done.length, error: (e && e.message) || String(e) } }));
-    await note('failed', { waiting: send.length, to_suspend: done.length }, e);
+    console.error(JSON.stringify({ retest_cards_failed: { user, add: send.length, move: move.length, error: (e && e.message) || String(e) } }));
+    await note('failed', { waiting: send.length + pick.move.length }, e);
     await report(out);   // the cases written this run, if any
     return { ...out, error: (e && e.message) || String(e) };
   }
@@ -619,12 +641,27 @@ export async function retestCards(env, user, { now = nowMs(), write = writeCase 
   for (const { r } of send) {
     const a = byKey.get(cardKey(r.id));
     if (!a) continue;
-    stmts.push(q(`UPDATE retests SET card_state = 'made', card_id = ?3, note_id = ?4, card_at = ?5, card_error = NULL, updated_at = ?5 WHERE user_id = ?1 AND id = ?2`,
+    stmts.push(q(`UPDATE retests SET card_state = 'made', card_deck = 'mine', card_id = ?3, note_id = ?4, card_at = ?5, card_error = NULL, updated_at = ?5 WHERE user_id = ?1 AND id = ?2`,
       user, r.id, Number(a.card_id), Number.isSafeInteger(Number(a.note_id)) ? Number(a.note_id) : null, t));
     out.made++;
   }
-  const gone = new Set(((reply && reply.suspended) || []).map(Number));
-  for (const d of done) if (gone.has(Number(d.card_id))) { stmts.push(q(`UPDATE retests SET card_state = 'done', updated_at = ?3 WHERE user_id = ?1 AND id = ?2`, user, d.id, t)); out.suspended++; }
+  const moved = new Set(((reply && reply.moved) || []).map(Number));
+  const gone = new Set(((reply && reply.missing) || []).map(Number));
+  for (const r of pick.move) {
+    if (moved.has(Number(r.card_id))) { stmts.push(q(`UPDATE retests SET card_deck = 'mine', card_moved_at = ?3, updated_at = ?3 WHERE user_id = ?1 AND id = ?2`, user, r.id, t)); out.moved++; }
+  }
+  for (const r of quiet) {
+    if (!moved.has(Number(r.card_id))) continue;
+    stmts.push(Number(r.own) && !Number(r.closed)
+      ? q(`UPDATE retests SET card_deck = 'mine', card_moved_at = ?3, covered = 'own_card', updated_at = ?3 WHERE user_id = ?1 AND id = ?2`, user, r.id, t)
+      : q(`UPDATE retests SET card_deck = 'mine', card_moved_at = ?3, card_state = 'done', updated_at = ?3 WHERE user_id = ?1 AND id = ?2`, user, r.id, t));
+    out.hidden++;
+  }
+  // A card deleted in Anki: nothing to move; the row stops waiting for it.
+  for (const r of [...pick.move, ...quiet]) {
+    if (gone.has(Number(r.card_id))) stmts.push(q(`UPDATE retests SET card_deck = NULL, card_state = 'done', card_error = 'card deleted in Anki', updated_at = ?3 WHERE user_id = ?1 AND id = ?2`, user, r.id, t));
+  }
+  if (reply && reply.deck_removed) out.deck_removed = true;
   if (stmts.length) await env.DB.batch(stmts);
   return report(out);
 }
@@ -638,10 +675,9 @@ export const UNLOGGED_SQL = `SELECT m.sitting_id, s.name, max(m.day) AS day, cou
       AND (m.error_type IS NULL OR m.error_type NOT IN ('misread', 'test_taking'))
       AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.kind = 'debrief' AND o.idem_key LIKE 'debrief:' || m.sitting_id || ':%')
     GROUP BY m.sitting_id ORDER BY day DESC LIMIT 5`;
-/** The open re-tests due by ?2 (a day), not on a slip or a held or deleted miss. ?1 user. */
 export const DUE_COUNT_SQL = `SELECT count(DISTINCT coalesce(r.miss_id, r.lesson_id)) AS n, min(r.due) AS oldest,
       count(DISTINCT CASE WHEN r.card_state = 'made' THEN coalesce(r.miss_id, r.lesson_id) END) AS cards
     FROM retests r LEFT JOIN misses m ON m.user_id = r.user_id AND m.id = r.miss_id
-    WHERE r.user_id = ?1 AND r.result IS NULL AND r.due <= ?2 AND (r.kind = 'lesson'
+    WHERE r.user_id = ?1 AND r.result IS NULL AND r.covered IS NULL AND r.due <= ?2 AND (r.kind = 'lesson'
       OR (m.held = 0 AND m.deleted_at IS NULL AND (m.error_type IS NULL OR m.error_type NOT IN ('misread', 'test_taking'))))`;
 export const unloggedWords = list => (list || []).map(r => ({ sitting: r.name, sitting_id: r.sitting_id, day: r.day, misses: Number(r.misses) || 0 }));

@@ -4,6 +4,7 @@ import { buildLeakIndex, leaks } from '../checks.js';
 import { HttpError, json, readJson, londonDay, now as nowMs } from '../util.js';
 import { looksLikeStem } from './guard.js';
 import { MO } from '../users.js';
+import { noteJob } from '../job-log.js';
 
 export const BATCH = 20, FORM_USD = 3, DAY_USD = 6, RESERVE_USD = 0.6, LABEL_MAX = 80, EXPL_MAX = 1500;
 export const ROLE = 'labeller';
@@ -116,6 +117,11 @@ export async function labelStep(env, user = MO, { exam_id = null, now = nowMs(),
         messages: [{ role: 'user', content: `${questions.size} questions from ${exam.name}:\n\n${content}` }] }));
     } catch (e) {
       await release(0);
+      // Waiting for its Message Batch (claude.js): nothing written; the next run asks the same and finds the answer.
+      if (e && e.pending === true && e.batch === true) {
+        await noteJob(env, { job: 'labeller', user, key: `batch:${exam.id}:${day}`, ref: exam.id, state: 'held', at: now, counts: { batch: 1 } });
+        return { waiting: 'batch', exam: exam.id };
+      }
       const spent = Number(e && e.usd) || 0;
       if (spent) await env.DB.batch([spendStatement(env, user, state, exam.id, spent, day, now)]);
       throw e;

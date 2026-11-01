@@ -1,10 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { tools, INSTRUCTIONS } from '../../worker/src/platform/mcp.js';
+import { tools, INSTRUCTIONS, listed as advertised } from '../../worker/src/platform/mcp.js';
 import { LIST_MAX, DESCRIPTION_MAX } from '../../worker/src/mcp/registry.js';
 
 const INSTRUCTIONS_MAX = 2_000;
-const listed = () => tools().map(({ name, description, inputSchema, annotations }) => ({ name, description, inputSchema, ...(annotations ? { annotations } : {}) }));
+const listed = () => advertised(tools());
 
 test('tools/list, every description and the instructions stay inside the caps', () => {
   const size = JSON.stringify({ tools: listed() }).length;

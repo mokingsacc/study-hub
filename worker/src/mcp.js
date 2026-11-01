@@ -7,6 +7,7 @@ import { TOOLS, INSTRUCTIONS, toolByName, listTools } from './mcp/registry.js';
 import { checkArgs } from './mcp/args.js';
 import { legacy, jsonResult, londonStamp } from './mcp/reply.js';
 import { NOTES_SERVER } from './mcp/notes-registry.js';
+import { noteTrace } from './debug/trace.js';
 
 export const VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
 const SERVER_INFO = { name: 'step2-practice-hub', version: '2.0.0' };
@@ -48,6 +49,7 @@ const DB_RAW = /D1_ERROR|SQLITE_|constraint failed|no such (?:table|column)/i;
 export function failure(name, e) {
   if (e instanceof Refusal || (e instanceof HttpError && e.status < 500)) return { refused: true, reason: e.message };
   console.error('connector tool failed', name, e && e.message);
+  noteTrace(t => t.fail(e));   // the request's trace keeps the stack (debug/trace.js)
   const msg = e && e.message ? String(e.message) : 'unknown error';
   if (/UNIQUE constraint failed/i.test(msg)) return { error: 'The hub could not save that: it clashed with another change made at the same moment. Call it once more.' };
   if (DB_RAW.test(msg)) return { error: "The hub's database could not do that just now. Call it once more; if it fails again, tell Mo the hub had a database error." };
@@ -58,6 +60,9 @@ export function failure(name, e) {
 export async function callTool(env, user, name, args, ctx = {}, server = MAIN_SERVER) {
   const tool = server.toolByName(name);
   if (!tool) return legacy({ error: `Unknown tool ${name}` }, null, true);
+  // A renamed argument or value still works (1 Nov 2026: the "re-test" names became "miss card" ones): the tool's
+  // alias maps the old one to the new before the check.
+  if (typeof tool.alias === 'function' && isObj(args)) args = tool.alias(args);
   // The 12 original tools keep their own (lenient) checks, as before the split; every new tool is checked here.
   const problems = tool.legacy ? [] : checkArgs(tool.inputSchema, args, { unknownOk: !!tool.unknownOk });
   if (problems.length) return jsonResult({ problems, next_step: `Fix these and call ${name} again.` }, { cap: tool.cap });
@@ -65,7 +70,7 @@ export async function callTool(env, user, name, args, ctx = {}, server = MAIN_SE
   if (tool.raw) { try { return await tool.run(env, user, args, ctx); } catch (e) { const f = failure(name, e); return legacy(f, f.reason || f.error, true); } }
   const runCtx = {
     surface: typeof args.surface === 'string' ? args.surface : 'chat', via: `mcp:${name}`, request_id: ctx.request_id || null,
-    ...(ctx.waitUntil ? { waitUntil: ctx.waitUntil } : {}),
+    ...(ctx.waitUntil ? { waitUntil: ctx.waitUntil } : {}), ...(ctx.gradeViva ? { gradeViva: ctx.gradeViva } : {}),
   };
   if (tool.legacy) {
     try { return await tool.run(env, user, args, runCtx); } catch (e) {
@@ -98,11 +103,15 @@ async function dispatch(env, msg, user, ctx, server = MAIN_SERVER) {
   if (method === 'tools/call') {
     const args = params.arguments || {};
     if (typeof args !== 'object' || Array.isArray(args)) return error(id, -32602, 'arguments must be an object');
+    noteTrace(t => { t.noteTool(params.name); if (!t.route) t.route = `mcp ${String(params.name || '').slice(0, 60)}`; });
     const waitUntil = ctx && typeof ctx.waitUntil === 'function' ? ctx.waitUntil.bind(ctx) : null;
     // New Anki misses come across soon after any conversation turn (at most once every 15 s, in the background).
     if (waitUntil && server.kick) waitUntil(Promise.resolve().then(() => io.kick(env, ctx)).catch(() => {}));
     try {
-      return result(id, await callTool(env, user, String(params.name || ''), args, { waitUntil, request_id: String(id) }, server));
+      // gradeViva: the hub's own marker for a lesson viva (index.js hands it in, bound to the hub's env); the tool never
+      // sees that env or the key, only this one call.
+      const gradeViva = ctx && typeof ctx.gradeViva === 'function' ? ctx.gradeViva : null;
+      return result(id, await callTool(env, user, String(params.name || ''), args, { waitUntil, request_id: String(id), ...(gradeViva ? { gradeViva } : {}) }, server));
     } catch (e) {
       const f = failure(String(params.name || ''), e);
       return result(id, legacy({ error: f.reason || f.error || 'The hub could not do that.' }, null, true));

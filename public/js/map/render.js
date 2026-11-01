@@ -564,7 +564,7 @@ function paintScene(ctx, lctx, S, { w, h, dpr, now }) {
     ctx.setTransform(dpr * k, 0, 0, dpr * k, dpr * tx, dpr * ty);
     // On the whole map a mixed-up pair shows at 55% (25 Oct: quiet, so the stars lead); it comes up to full on hover.
     drawLinks(ctx, { links: m.links, indices: lines, x: m.x, y: m.y, layer: 'base', tokens: S.linkTokens, k, qx: curvesOf(S) && curvesOf(S).qx, qy: curvesOf(S) && curvesOf(S).qy, pairFade: 0.55 });
-    if (S.sysLinks && S.sysLinks.length) drawLinks(ctx, { links: m.links, indices: S.sysLinks, x: m.x, y: m.y, layer: 'focus', tokens: S.linkTokens, k,
+    if (!(S.selected >= 0) && S.sysLinks && S.sysLinks.length) drawLinks(ctx, { links: m.links, indices: S.sysLinks, x: m.x, y: m.y, layer: 'focus', tokens: S.linkTokens, k,
       radius: j => drawnRadius(m, j, k, dotScale) + 3 / k, qx: curvesOf(S) && curvesOf(S).qx, qy: curvesOf(S) && curvesOf(S).qy });
     ctx.restore();
   }

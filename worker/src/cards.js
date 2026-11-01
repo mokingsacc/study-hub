@@ -1,5 +1,6 @@
 import { HttpError, json, readJson, now } from './util.js';
 import { ankiCall, ankiCallFull, AnkiError } from './anki.js';
+import { queueSkip, unqueueSkip } from './card-fix.js';
 
 export const RATINGS = ['again', 'hard', 'good', 'easy'];   // ease 1..4, as Anki numbers them
 export const DEFAULT_DECK = 'Step 2 — My Cards';
@@ -196,7 +197,8 @@ async function applyOnce(kind, request, env, ctx, params) {
   let r;
   try {
     r = kind === 'rate' ? await rateCard(env, id, RATINGS[ease - 1], b.before_exam === true)
-      : await ankiCall(env, kind === 'suspend' ? 'suspend_card' : 'bury_card', { card_id: id }, { timeoutMs: 20_000 });
+      : kind === 'suspend' ? await ankiCall(env, 'suspend_card', { card_id: id }, { timeoutMs: 20_000 })
+      : await ankiCall(env, 'bury_card', { card_id: id, queue: false, ...(list ? { any_card: true } : {}) }, { timeoutMs: 20_000 });
   } catch (e) {
     if (kind === 'suspend' && e instanceof AnkiError && !e.ambiguous && /unknown tool/i.test(e.message)) { await mark('refused'); throw new HttpError(409, NEEDS_SUSPEND); }
     // A refusal from Anki itself (the card is not due, say) can never apply: final. Anything that may have reached
@@ -209,6 +211,10 @@ async function applyOnce(kind, request, env, ctx, params) {
   const superseded = !!(by && by !== 'this voice review');
   await mark(superseded ? 'superseded' : 'applied');
   dueSoon();
+  if (kind === 'bury') {
+    const q = queueSkip(env, 'mo', { card_id: id, skip_id: key, note_id: ms(b.note_id), deck: typeof b.deck === 'string' ? b.deck.slice(0, 120) : null }, ctx);
+    if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(q); else await q;
+  }
   return json({ ok: true, card_id: id, status: superseded ? 'superseded' : 'applied', superseded, already: !!by && !superseded,
     rating: kind === 'rate' ? (by ? r.already_rated.rating : r.rating) : null, next_due_in: (r && r.next_due_in) || null,
     remaining: (r && r.remaining) || null, ...(list ? {} : { card: shapeCard(r && r.next_card) }), ms: took,
@@ -216,12 +222,13 @@ async function applyOnce(kind, request, env, ctx, params) {
 }
 
 async function rateCard(env, id, rating, beforeExam) {
-  const args = { card_id: id, rating };
-  if (!beforeExam) return ankiCall(env, 'rate_card', args, { timeoutMs: 20_000 });
+  const args = { card_id: id, rating, gap_note: false };
   try {
-    return await ankiCall(env, 'rate_card', { ...args, before_exam: true }, { timeoutMs: 20_000 });
+    return await ankiCall(env, 'rate_card', beforeExam ? { ...args, before_exam: true } : args, { timeoutMs: 20_000 });
   } catch (e) {
-    if (e instanceof AnkiError && !e.ambiguous && /before_exam|unexpected|additional|unknown/i.test(e.message)) return ankiCall(env, 'rate_card', args, { timeoutMs: 20_000 });
+    if (e instanceof AnkiError && !e.ambiguous && /before_exam|gap_note|unexpected|additional|unknown/i.test(e.message)) {
+      return ankiCall(env, 'rate_card', { card_id: id, rating }, { timeoutMs: 20_000 });
+    }
     throw e;
   }
 }
@@ -233,6 +240,9 @@ async function rateCard(env, id, rating, beforeExam) {
 // POST /api/cards/undo {ease}: replace the last rating (change_last_rating: Anki undoes it and rates again).
 export async function undo(request, env, ctx) {
   const b = await readJson(request, 2000);
+  // Undo after a Skip (skip_id: the skip's review_id): Anki takes the bury back (undo_last un-buries the card it last
+  // buried) and the card stops waiting for Claude (card-fix.js queueFix undo).
+  const skipId = typeof b.skip_id === 'string' && KEY_RE.test(b.skip_id) ? b.skip_id : null;
   if (b.mode === 'last') {
     let r;
     try { r = await ankiCall(env, 'undo_last', {}, { timeoutMs: 20_000 }); } catch (e) {
@@ -241,9 +251,13 @@ export async function undo(request, env, ctx) {
       throw ankiHttp(e);
     }
     const u = (r && r.undone) || {};
+    if (skipId && Number(u.card_id)) {
+      const q = unqueueSkip(env, 'mo', { card_id: Number(u.card_id), skip_id: skipId });
+      if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(q); else await q;
+    }
     // the map's due orbs (I33): the card is due again, so its row is re-read
     if (env.DUE_ORBS === 'on' && Number(u.card_id) && ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(import('./orbits/due.js').then(m => m.refreshDue(env, 'mo', [Number(u.card_id)])).catch(() => {}));
-    return json({ ok: true, mode: 'last', card_id: Number(u.card_id) || null, undone: RATINGS.includes(u.rating) ? u.rating : null, card: shapeCard(r && r.card) });
+    return json({ ok: true, mode: 'last', card_id: Number(u.card_id) || null, undone: RATINGS.includes(u.rating) ? u.rating : null, skip: !!u.skip, card: shapeCard(r && r.card) });
   }
   const ease = Number(b.ease);
   if (![1, 2, 3, 4].includes(ease)) throw new HttpError(400, 'Choose the rating it should have been.');

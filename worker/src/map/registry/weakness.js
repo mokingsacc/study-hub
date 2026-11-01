@@ -2,6 +2,7 @@
 // from evidence (recomputeTopics and refreshPriors), so an import that leaves them out loses nothing.
 import { BAND_CODES } from '../../../../public/js/map/scale.js';
 import * as move from '../miss-move.js';
+import * as correct from '../correct.js';
 import * as linkStore from '../links-store.js';
 // labeller.js calls the API (claude.js), so it is loaded only when its route runs: nothing the connector loads imports it.
 const labeller = () => import('../labeller.js');
@@ -12,16 +13,24 @@ const labeller = () => import('../labeller.js');
 export const CHANGE_KINDS = {
   'miss.move': { tier: 'free', kind: move.MOVE_KIND, undoable: true, get writes() { return { ...linkStore.LINK_WRITES }; },
     evidence: { remove: [], repoint: true }, plan: (...a) => move.planMissMove(...a) },
+  'miss.correct': { tier: 'free', kind: 'miss.corrected', undoable: true, get writes() { return { ...linkStore.LINK_WRITES, ...correct.CORRECT_WRITES }; },
+    plan: (...a) => correct.planCorrect(...a), apply: (...a) => correct.applyCorrect(...a) },
 };
 export const UNDO = { [`target:${move.MOVE_TARGET}`]: (...a) => move.undoMissMove(...a) };
 export const ROUTES = [
   ['POST', '/api/map/misses/:id/move', (...a) => move.moveRoute(...a)],
+  // "Not right?" on a miss or a gap in the topic panel (wave 2 E).
+  ['POST', '/api/map/correct', (...a) => correct.correctRoute(...a)],
+  ['POST', '/api/map/provenance', async (...a) => (await import('../provenance.js')).provenanceRoute(...a)],
+  ['GET', '/api/map/overnight', async (...a) => (await import('../snapshots.js')).overnightRoute(...a)],
+  ['POST', '/api/map/overnight/seen', async (...a) => (await import('../snapshots.js')).overnightSeenRoute(...a)],
+  ['POST', '/api/map/rejudge', async (...a) => (await import('../rejudge.js')).rejudgeRoute(...a)],
   ['GET', '/api/map/labeller', async (...a) => (await labeller()).statusRoute(...a)],
   ['POST', '/api/map/labeller/run', async (...a) => (await labeller()).runRoute(...a)],
 ];
 
 const SCORE_REALS = ['prior_mastery', 'q_pass', 'q_fail', 'card_pass', 'card_fail', 'card_state', 'lesson_pass', 'lesson_fail',
-  'self_pass', 'self_fail', 'gap_fail', 'mastery', 'weakness', 'weakness_raw', 't', 'certainty', 'fsrs_s', 'fsrs_d', 'fsrs_n'];
+  'self_pass', 'self_fail', 'gap_fail', 'mastery', 'weakness', 'weakness_raw', 't', 'certainty', 'fsrs_s', 'fsrs_d', 'fsrs_n', 'fsrs_real_n', 'gate_nq'];
 const SCORE_INTS = ['seen', 'first_seen_at', 'last_seen_at', 'last_question_at', 'last_miss_at', 'ref_at', 'n_seen', 'questions_n', 'right_n',
   'misses_n', 'sure_wrong_n', 'slow_n', 'cards_n', 'lapses_n', 'lessons_n', 'retests_n', 'gaps_n', 'evidence_at', 'ev_rev', 'computed_at',
   'refreshed_at', 'formula_version', 'fsrs_at', 'trend'];
@@ -30,14 +39,22 @@ const SCORE_COLS = ['user_id', 'topic_id', 'seen', 'first_seen_at', 'last_seen_a
   'self_fail', 'gap_fail', 'strong_fails_json', 'mastery', 'weakness', 'weakness_raw', 't', 'band', 'certainty', 'certainty_level',
   'n_seen', 'questions_n', 'right_n', 'misses_n', 'sure_wrong_n', 'slow_n', 'cards_n', 'lapses_n', 'lessons_n', 'retests_n', 'gaps_n',
   'why_json', 'evidence_at', 'ev_rev', 'computed_at', 'refreshed_at', 'formula_version',
-  'fsrs_s', 'fsrs_d', 'fsrs_at', 'fsrs_n', 'trend'];   // 0013: FSRS memory per topic (WEA2)
+  'fsrs_s', 'fsrs_d', 'fsrs_at', 'fsrs_n', 'trend',   // 0013: FSRS memory per topic (WEA2)
+  'fsrs_real_n', 'trend_basis_json',   // 0055: evidence strength and the trend's basis (wave 2 C)
+  'gate_nq'];   // 0062: a strong viva and right card days toward the gates (WEIGHTS_VERSION 8)
+
+// Wave 2 (0053): working tables, not study data. The causes themselves are on misses (exported with them).
+export const EXPORT_SKIP = {
+  cause_judgements: "The re-judge's working copy of each judged cause (rejudge.js), so a real run applies what its dry run showed; the causes live on misses.",
+  score_snapshots: "Each topic's colour before a weights change, for the one-time \"what changed overnight\" list (snapshots.js); not study data.",
+};
 
 export const EXPORT = {
   topic_scores: {
     cols: SCORE_COLS,
     required: ['user_id', 'topic_id', 'prior_mastery', 'ref_at', 'computed_at', 'refreshed_at'],
     types: {
-      user_id: 't', topic_id: 't', category_id: 't', strong_fails_json: 'ja', why_json: 'ja', band: BAND_CODES,
+      user_id: 't', topic_id: 't', category_id: 't', strong_fails_json: 'ja', why_json: 'ja', trend_basis_json: 'jo', band: BAND_CODES,
       certainty_level: ['low', 'medium', 'high'],
       ...Object.fromEntries(SCORE_REALS.map(c => [c, 'r'])), ...Object.fromEntries(SCORE_INTS.map(c => [c, 'i'])),
     },

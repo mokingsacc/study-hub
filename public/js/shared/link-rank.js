@@ -6,7 +6,7 @@ export const LINK_TYPES = {
   adverse_effect: { code: 2, directed: true, label: 'Side effect', back: 'Caused by drug', pill: 'side effect', dash: [], arrow: 'to', typeW: 0.8,
     from_kinds: ['drug'], hows: ['common', 'serious', 'teratogen'] },
   causes: { code: 3, directed: true, label: 'Causes', back: 'Caused by', pill: 'causes', dash: [], arrow: 'to', typeW: 0.6,
-    hows: ['organism', 'risk_factor', 'complication'] },
+    hows: ['organism', 'risk_factor', 'complication', 'underlies'] },
 };
 // Payload type codes, in order (meta.link_types).
 export const TYPE_NAMES = Object.keys(LINK_TYPES);

@@ -10,6 +10,8 @@ import { handlePlatformMcp } from './platform/mcp.js';
 import { runPlatformCron } from './platform/cron.js';
 import { assetVersion, parseVersioned, servePage, serveVersioned } from './assets.js';
 import { LISTEN_PATH } from './listen.js';
+import { ensureLiveSet } from './map/weight-sets.js';
+import { traceRequest, tracedEnv, captureOn } from './debug/trace.js';
 
 // The live map's Durable Object (wrangler.toml MAP_LIVE): one per user, holding the open pages' sockets.
 export { MapLive };
@@ -27,7 +29,7 @@ async function keyMatches(given, expected) {
 const PLATFORM_PAGE = /^\/(platform\.html|platform\.webmanifest|js\/platform\/|css\/platform|icons\/platform-)/;
 
 // What the platform Worker serves besides its API: the page, its scripts and styles, the weakness scale, icons.
-const PLATFORM_FILES = /^\/(platform\.html|platform\.webmanifest|robots\.txt|js\/platform\/[\w.-]+\.js|js\/map\/(?:scale|camera|colour|data|donut|families|halos|hover|labels|layout|links-draw|marks|motion|nodes|pick|render|semantic|similarity|sky|sprites|tween)\.js|js\/shared\/link-rank\.js|js\/mnemonics\/run\.js|css\/platform\.css|icons\/platform-[\w.-]+\.png)$/;
+const PLATFORM_FILES = /^\/(platform\.html|platform\.webmanifest|robots\.txt|js\/platform\/[\w.-]+\.js|js\/map\/(?:scale|camera|colour|data|donut|families|foundations-ring|halos|hover|labels|layout|links-draw|marks|motion|nodes|pick|render|semantic|similarity|sky|sprites|tween)\.js|js\/shared\/(?:link-rank|concept|cause|evidence)\.js|js\/mnemonics\/run\.js|css\/platform\.css|icons\/platform-[\w.-]+\.png)$/;
 
 async function platformOnly(request, env, url) {
   if (url.pathname === '/api/health' && request.method === 'GET') return json({ ok: true });
@@ -63,9 +65,36 @@ function withPageHeaders(response, url) {
   return r;
 }
 
+// Which requests run inside a trace (debug/trace.js; bug reports, 1 Nov 2026): the keyed API and the connector, never a
+// WebSocket (the live map, the Cards page's voice commands), the health check or the static files.
+export function tracedPath(url, request) {
+  const p = url.pathname;
+  if (!p.startsWith('/api/') && !p.startsWith('/mcp/')) return false;
+  if (p === '/api/health' || (p === LISTEN_PATH && request.method === 'GET')) return false;
+  return String(request.headers.get('Upgrade') || '').toLowerCase() !== 'websocket';
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    if (!platformRequest(env, url) && tracedPath(url, request)) return traceRequest(request, env, ctx, url, serve);
+    return serve(request, env, ctx, url);
+  },
+
+  async scheduled(event, env, ctx) {
+    if (env.HUB_OFF === '1') return runPlatformCron(event, env, ctx);
+    await ensureLiveSet(env);   // the scoring rules in use, before any job scores (map/weight-sets.js)
+    // Each job runs in its own trace (cron.js) unless debug_capture is off; a failing one is kept and its line names it.
+    const traced = await captureOn(env);
+    runScheduled(event, traced ? tracedEnv(env) : env, ctx, undefined, traced);
+  },
+};
+
+// A request the platform answers itself (its connector, its API, or anything at all on the platform Worker).
+const platformRequest = (env, url) => platformOn(env) && (env.HUB_OFF === '1' || url.pathname.startsWith('/mcp/u/')
+  || url.pathname.startsWith('/mcp/admin/') || isPlatformPath(url.pathname));
+
+async function serve(request, env, ctx, url) {
     if (platformOn(env)) {
       if (url.pathname.startsWith('/mcp/u/') || url.pathname.startsWith('/mcp/admin/')) return noindex(await handlePlatformMcp(request, platformMcpEnv(env, url), url, ctx));
       if (isPlatformPath(url.pathname)) {
@@ -76,7 +105,7 @@ export default {
     } else if (PLATFORM_PAGE.test(url.pathname)) {
       return noindex(new Response('Not found', { status: 404 }));
     }
-    if (url.pathname.startsWith('/mcp/')) return noindex(await handleMcp(request, mcpEnv(env, url, request), url, ctx));
+    if (url.pathname.startsWith('/mcp/')) { await ensureLiveSet(env); return noindex(await handleMcp(request, mcpEnv(env, url, request), url, mcpCtx(ctx, env))); }
     // The live map's WebSocket (a 60 s ticket from GET /api/map/live-ticket stands in for the key). Never wrapped
     // in noindex(): copying the response would drop the 101's webSocket.
     if (url.pathname === '/live/map') return handleLive(request, env, url);
@@ -86,6 +115,7 @@ export default {
     if (url.pathname.startsWith('/api/')) {
       if (url.pathname === '/api/health' && request.method === 'GET') return noindex(json({ ok: true }));
       if (!(await keyMatches(request.headers.get(KEY_HEADER), env.HUB_KEY))) return noindex(errorResponse(401, 'This hub needs its bookmark link.'));
+      await ensureLiveSet(env);
       // A change says which device it came from (X-Hub-Device; Recent activity); reads keep the shared env.
       const dev = request.method === 'GET' ? null : deviceOf(request);
       const res = noindex(await handleApi(request, dev ? { ...env, HUB_DEVICE: dev } : env, ctx, url));
@@ -111,13 +141,7 @@ export default {
       return withPageHeaders(await servePage(env, request, assetUrl, version), url);
     }
     return withPageHeaders(await env.ASSETS.fetch(assetUrl === url ? request : new Request(assetUrl, request)), url);
-  },
-
-  async scheduled(event, env, ctx) {
-    if (env.HUB_OFF === '1') return runPlatformCron(event, env, ctx);
-    runScheduled(event, env, ctx);
-  },
-};
+}
 
 // The platform's connectors run on each person's own Claude subscription: no Anthropic key, no AES root for
 // sealed AI keys (no tool can open one).
@@ -136,6 +160,12 @@ export function deviceOf(request) {
 export function mcpClientOf(request) {
   const ua = String((request && request.headers.get('User-Agent')) || '');
   return /claude-code/i.test(ua) ? 'code' : null;
+}
+
+export function mcpCtx(ctx, env) {
+  const waitUntil = ctx && typeof ctx.waitUntil === 'function' ? p => ctx.waitUntil(p) : null;
+  return { ...(waitUntil ? { waitUntil } : {}),
+    gradeViva: (user, id) => import('./map/viva-job.js').then(m => m.gradeNow(env, user, id)) };
 }
 
 function mcpEnv(env, url, request = null) {

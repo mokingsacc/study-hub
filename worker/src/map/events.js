@@ -1,4 +1,5 @@
 import { planEvidence, scoreStatements } from './recompute.js';
+import { readStatements, afterScores, isDeferred } from './instant.js';
 
 export const ACTORS = ['mo', 'claude', 'code', 'anki', 'extractor', 'cron'];
 export const SURFACES = ['chat', 'voice', 'code', 'web', 'cron', 'anki', 'hook', 'routine', 'anki_desktop', 'ankimobile', 'anki_voice', 'lesson'];
@@ -30,6 +31,7 @@ export const EVENT_KINDS = [
   'uk.added', 'uk.updated', 'uk.removed',
   // topic photos (I28)
   'media.removed',
+  'media.reordered',
   // mnemonics (I35)
   'mnemonic.added', 'mnemonic.updated', 'mnemonic.removed', 'mnemonic.reviewed',
   // the history search's index (history/sweep.js): built, failing, working again, items updated (Recent activity)
@@ -42,6 +44,16 @@ export const EVENT_KINDS = [
   'galaxy.added', 'galaxy.updated', 'galaxy.removed', 'picture.added', 'picture.removed',
   // the platform's chat notes (0105)
   'chat.saved',
+  // the Study Hub library's folders (0108): documents moved or a folder renamed, undoable
+  'library.filed',
+  'data.cleaned',
+  'miss.corrected', 'gap.corrected',
+  // the viva (viva.js, wave 4): one graded viva's evidence written, undoable
+  'viva.graded',
+  'self.rated',
+  'plan.changed', 'plan.step',
+  // a card Claude rewrote, suspended or kept from the card_fix queue (card-fix.js, 1 Nov), undoable (it puts the card back in Anki)
+  'card.fixed',
 ];
 const KIND_SET = new Set(EVENT_KINDS);
 
@@ -62,11 +74,14 @@ export const PK = {
   note_books: ['user_id', 'id'], note_sections: ['user_id', 'id'], note_pages: ['user_id', 'id'], note_blocks: ['user_id', 'id'], note_strokes: ['user_id', 'id'],
   uk_entries: ['user_id', 'id'],
   topic_photos: ['user_id', 'id'], topic_pictures: ['user_id', 'topic_id', 'source', 'ref'],
+  photo_inbox: ['user_id', 'id'],   // the photo inbox (0080)
+  library_docs: ['user_id', 'id'],   // the Study Hub's library folders (0108): only the folder column is ever written this way
   mnemonics: ['user_id', 'id'], mnemonic_reviews: ['user_id', 'mnemonic_id', 'dir'],   // mnemonics (I35)
   retests: ['user_id', 'id'],   // re-tests (0036): lesson_save closes and books them in its own batch
   // The platform's study tables (0101).
   subjects: ['user_id', 'id'], result_logs: ['user_id', 'id'], papers: ['user_id', 'id'],
   galaxies: ['user_id', 'id'], galaxy_topics: ['user_id', 'topic_id'], study_pictures: ['user_id', 'id'], chat_notes: ['user_id', 'id'],
+  plan_days: ['user_id', 'day'], plan_feedback: ['user_id', 'id'],   // the forecast sheet's day plan, Done and Skip (0075)
 };
 export const UNKEYED = new Set(['settings', 'users', 'outbox']);
 
@@ -76,7 +91,7 @@ export const SOFT = {
   links: { status: 'removed', removed_at: '$now' }, topic_notes: { status: 'deleted' }, card_topics: { removed_at: '$now' },
   resource_links: { status: 'hidden' }, teach_memory: { status: 'retired' },
   uk_entries: { deleted_at: '$now' },
-  topic_photos: { deleted_at: '$now' }, topic_pictures: { hidden_at: '$now' },
+  topic_photos: { deleted_at: '$now' }, topic_pictures: { hidden_at: '$now' }, photo_inbox: { deleted_at: '$now' },
   mnemonics: { deleted_at: '$now' },
   subjects: { status: 'removed' }, result_logs: { deleted_at: '$now' },
 };
@@ -280,10 +295,17 @@ export async function writeBatch(env, user, o) {
     ...eventStatements(env.DB, events),
   ];
   if (!stmts.length) return { batch_id, seq: null, scores: {}, dirty: [] };
-  const res = await env.DB.batch(stmts);
+  // The topics recoloured here get their Diagnose / Manage parts worked out again now too (instant.js, 1 Nov 2026): their
+  // reads ride at the end of this batch (after its evidence and scores), so they cost no query; a write only if a part moved.
+  const touched = Object.keys(score.scores || {});
+  const partReads = await readStatements(env, user, touched, { ready: ev.facetsReady });
+  const all = await env.DB.batch([...stmts, ...partReads]);
+  const res = partReads.length ? all.slice(0, all.length - partReads.length) : all;
   let seq = null;
   for (const r of res) for (const x of (r && r.results) || []) if (x && Number.isInteger(x.seq) && (seq == null || x.seq > seq)) seq = x.seq;
   if (seq != null) await notifyLive(env, user, seq);
+  if (partReads.length) await afterScores(env, user, touched, { now: at, reads: all.slice(all.length - partReads.length) });
+  else if (touched.length && isDeferred(env)) await afterScores(env, user, touched, { now: at });
   return { batch_id, seq, scores: score.scores, dirty: score.dirty };
 }
 

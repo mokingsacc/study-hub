@@ -1,5 +1,4 @@
-// Study Hub shell and router: one page, hash routes, each screen imported on demand (warmed on idle). Signed-in
-// state from GET /api/auth/me; the CSRF token stays in api.js memory.
+// Study Hub shell and router: hash routes, screens imported on demand. Signed-in state from GET /api/auth/me.
 import { get, DEMO, setCsrf, onAuthLost } from './api.js';
 import { $, $$, h, icon, onThemeChange, state, btn } from './ui.js';
 
@@ -133,7 +132,7 @@ async function route() {
   }
 }
 app.route = route;
-// Back after 15 s or more (from the Claude app, say): the screen refreshes if it set app.onReturn.
+// Back after 15 s or more: the screen refreshes if it set app.onReturn.
 let away = 0;
 document.addEventListener('visibilitychange', () => { if (document.hidden) away = Date.now(); else if (away && Date.now() - away > 15e3 && app.onReturn) app.onReturn(); });
 
@@ -144,6 +143,6 @@ onThemeChange(() => route());
 if (DEMO) document.body.append(h('div', { class: 'demo-badge', 'aria-hidden': 'true' }, 'Demo'));
 route();
 
-// Warm the other screens once the first one has painted, so a tab tap never waits on the network.
+// Warm the other screens once the first has painted.
 const warm = () => ['./today.js', './subjects.js', './map.js', './cards.js', './results.js', './library.js', './settings.js'].forEach(p => import(p).catch(() => {}));
 if ('requestIdleCallback' in window) requestIdleCallback(warm, { timeout: 2500 }); else setTimeout(warm, 1200);

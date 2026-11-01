@@ -12,6 +12,7 @@
 // unfinished sitting shows no marks.
 import { TOPIC_FLAGS as F } from '../../../public/js/map/marks.js';
 import { londonDay, londonDayStart } from '../util.js';
+import { EVIDENCE, DAY_MS } from '../../../public/js/shared/evidence.js';
 
 export { TOPIC_FLAGS } from '../../../public/js/map/marks.js';
 
@@ -26,17 +27,24 @@ function check(v, re, what) {
 }
 
 export function topicFlagsSql({ user = '?1', today = '?2', now = '?3', dayStart = '?4', t = 't', s = 's' } = {}) {
-  const [u, d, n, ds] = [check(user, PARAM, 'user'), check(today, PARAM, 'today'), check(now, PARAM, 'now'), check(dayStart, PARAM, 'dayStart')];
+  // today is still checked (the callers bind it), though no flag reads it since the re-test dot went (1 Nov 2026).
+  const [u, , n, ds] = [check(user, PARAM, 'user'), check(today, PARAM, 'today'), check(now, PARAM, 'now'), check(dayStart, PARAM, 'dayStart')];
   const [T, S] = [check(t, IDENT, 'alias'), check(s, IDENT, 'alias')];
   const lesson = cond => `EXISTS (SELECT 1 FROM lessons l WHERE l.user_id = ${u} AND (l.topic_id = ${T}.id OR l.pair_topic_id = ${T}.id) AND ${cond})`;
   // A pair test is not a lesson (LRN4-1): it never makes a topic "taught today" or answers a stated gap.
   const lastLesson = `coalesce((SELECT max(l.ended_at) FROM lessons l WHERE l.user_id = ${u} AND (l.topic_id = ${T}.id OR l.pair_topic_id = ${T}.id)
       AND l.status = 'done' AND coalesce(l.kind, 'lesson') <> 'pair_test'), 0)`;
+  // n_eff now (shared/evidence.js nEff, levelOfScore): the stored question-side weight faded from its review clock; a row
+  // from before 0055 counts its questions and re-tests from the last one.
+  const fade = `${EVIDENCE.fade_days * DAY_MS}.0`;
+  const neff = `(CASE WHEN ${S}.fsrs_real_n IS NOT NULL THEN ${S}.fsrs_real_n * pow(0.5, max(0, ${n} - coalesce(${S}.fsrs_at, ${S}.last_question_at, ${n})) / ${fade})
+      ELSE (coalesce(${S}.questions_n, 0) + coalesce(${S}.retests_n, 0)) * pow(0.5, max(0, ${n} - coalesce(${S}.last_question_at, ${n})) / ${fade}) END)`;
   return `(
     (CASE WHEN ${T}.status = 'proposed' THEN ${F.proposed} ELSE 0 END)
+  | (CASE WHEN coalesce(${S}.seen, 0) = 1 AND ${neff} < ${EVIDENCE.thin} THEN ${F.thin} ELSE 0 END)
+  | (CASE WHEN coalesce(${S}.seen, 0) = 1 AND ${neff} >= ${EVIDENCE.solid} AND coalesce(${S}.last_question_at, 0) >= ${n} - ${EVIDENCE.recent_days * DAY_MS}
+      THEN ${F.solid} ELSE 0 END)
   | (CASE WHEN ${lesson(`l.status = 'done' AND l.ended_at >= ${ds} AND coalesce(l.kind, 'lesson') <> 'pair_test'`)} THEN ${F.taught_today} ELSE 0 END)
-  | (CASE WHEN ${T}.id IN (SELECT m.topic_id FROM misses m WHERE m.user_id = ${u} AND m.topic_id IS NOT NULL AND m.held = 0 AND m.deleted_at IS NULL
-      AND m.next_retest_day IS NOT NULL AND m.next_retest_day <= ${d}) THEN ${F.retest_due} ELSE 0 END)
   | (CASE WHEN ${lesson(`l.status = 'requested' AND coalesce(l.requested_at, 0) >= ${n} - ${REQUEST_MS}`)} THEN ${F.requested} ELSE 0 END)
   | (CASE WHEN ${lesson(`l.status = 'in_progress' AND coalesce(l.started_at, 0) >= ${n} - ${TEACHING_MS}`)} THEN ${F.teaching_now} ELSE 0 END)
   | (CASE WHEN coalesce(${S}.sure_wrong_n, 0) > 0 THEN ${F.sure_wrong} ELSE 0 END)

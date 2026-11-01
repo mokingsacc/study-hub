@@ -1,5 +1,6 @@
 import { minuteJobs } from '../map/registry/index.js';
 import { activeUsers } from '../users.js';
+import { countingEnv } from '../map/d1-count.js';
 
 const DAY = 86_400_000;
 
@@ -39,8 +40,10 @@ const JOBS = {
 
 export function runPlatformCron(event, env, ctx, jobs = JOBS) {
   const names = platformJobs(event.scheduledTime);
+  const budget = Number(env.D1_QUERY_BUDGET) || 45;
+  const shared = countingEnv(env, { max: budget }).env;
   for (const name of names) {
-    ctx.waitUntil(Promise.resolve().then(() => jobs[name](env, ctx, event.scheduledTime))
+    ctx.waitUntil(Promise.resolve().then(() => jobs[name](shared, ctx, event.scheduledTime))
       .catch(e => console.error(`platform cron ${name} failed`, e && e.stack || e)));
   }
   return names;

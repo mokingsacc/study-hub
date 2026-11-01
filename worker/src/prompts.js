@@ -2,6 +2,9 @@
 // no ids) so prompt caching keeps hitting; everything that varies goes in the user message.
 import { ERROR_TYPES } from './checks.js';
 import { CONF_MEANINGS } from '../../public/js/conf-words.js';
+import { CAUSE_RULES } from '../../public/js/shared/cause.js';
+import { CONCEPT_RULES } from '../../public/js/shared/concept.js';
+import { CORE_RULES, CORE_SCHEMA_PROPS, CORE_FIELDS, CHECK_CORE_PROPS, CHECK_CORE_FIELDS, CHECK_CORE_RULES } from './answer-core.js';
 
 export const SYSTEMS = ['Obstetrics', 'Paediatrics', "Gynaecology and Men's Health", 'Endocrine', 'Cardiology', 'Respiratory',
   'Renal and Acid-Base', 'GI and Hepatology', 'Haematology and Oncology', 'Infectious Disease', 'Immunology and Allergy',
@@ -10,6 +13,7 @@ export const SYSTEMS = ['Obstetrics', 'Paediatrics', "Gynaecology and Men's Heal
 
 export const VERDICTS = ['wrong', 'right_flawed', 'sound', 'no_reasoning_heard'];
 export const FLAW_KINDS = ['none', 'lucky_guess', 'right_wrong_reason', 'shaky_elimination', 'misread_detail'];
+export const FIVE_STEPS = ['recognise', 'distinguish', 'test', 'treat', 'trap'];
 
 const RULES = `## Ground truth
 Whether Mo was right or wrong has already been decided by code (Mo's final letter against the key). It is given to you as a fact. Never question it, never re-mark it, and never treat the key as doubtful.
@@ -56,9 +60,13 @@ const FIELDS = `## Fields you write
 - topic: the diagnosis or concept tested, in 2 to 5 words ("Subacute thyroiditis").
 - system: one of the listed systems.
 - rule: the take-away as one sentence "If <finding>, then <conclusion or action>." in plain words.
-- look_alike: the option or diagnosis Mo was drawn to (or the classic look-alike) and the one feature that separates it, one sentence.
+- cause, cause_quote, cause_inferred, cause_detail: why he missed it, by the cause rules below (for sound and no_reasoning_heard: cause null, the other three empty or true).
+- concept, concept_discipline, concept_quote: the underlying principle the miss rests on, by the concept rules below (empty whenever the miss is not conceptual); for sound, only a principle his words show he understands (the core rules); empty for no_reasoning_heard.
+- look_alike: a teaching contrast only: the condition the right answer is best told apart from and the one feature that separates it, one sentence, or an empty string. It is never a claim that Mo mixed them up (that is cause confusion).
+- step, for wrong and right_flawed only (null for the others): the one step that broke, as the question asked it. recognise: did not know what it is from the findings. distinguish: narrowed to it and a look-alike and could not tell them apart. test: knew what it is but chose the wrong workup or next test, or misread a result. treat: knew what it is but chose the wrong management or next step. trap: fell for a classic exception, threshold or contraindication.
 - card: a card in Mo's style for wrong and right_flawed (null for sound and no_reasoning_heard, and always null for misread and test-taking errors).
 - card_search_terms: two or three key words of the card's point, for finding a card Mo may already have ("de Quervain thyroiditis"). Empty list when there is no card.
+- core: confidence, confidence_words, confidence_inferred, other_conditions and heard, by the core rules below (the confidence he tapped is given; these say how sure he sounded).
 
 ## Medicine
 Teach to current US guidelines (USPSTF, ACOG, AAP, ACC/AHA, ADA, IDSA, CDC), as the exam does. Mo is a learner: where UK practice (NICE, BNF, UK names such as paracetamol or adrenaline) differs in a way that could trip him up, say so in one short line in the card notes ("UK: ... ; the exam wants ..."). Use US drug names in the card. Never invent a guideline number; if unsure of a figure, leave it out.`;
@@ -105,6 +113,12 @@ ${SPEECH_FIELDS}
 
 ${FIELDS}
 
+${CAUSE_RULES}
+
+${CONCEPT_RULES}
+
+${CORE_RULES}
+
 ${CARD_STYLE}
 
 ${EXAMPLES}
@@ -113,7 +127,7 @@ ${LEAK}
 
 Answer with the JSON object only.`;
 
-const DESKTOP_FIELDS = FIELDS.split('\n').filter(l => !/^- card/.test(l)).join('\n').replace('in the card notes', 'in the gap');
+const DESKTOP_FIELDS = FIELDS.split('\n').filter(l => !/^- (card|cause|step|concept|core)/.test(l)).join('\n').replace('in the card notes', 'in the gap');
 const DESKTOP_EXAMPLES = EXAMPLES.replace(', with a card for the point he did not know', '').replace(' No card.', '');
 export const DESKTOP_RULES = `You are checking Mo's own thinking out loud on his practice exam questions, one question at a time, as an expert USMLE Step 2 CK educator. This is not a request for your reasoning: don't show your reasoning, just fill in the fields below. Mo is a UK foundation doctor sitting Step 2 CK on exam day and aiming for a high score. He thinks aloud while answering; the hub has already marked every question right or wrong in code. Your job: judge what he said honestly and kindly, find the lucky guesses and the right answers reached for a wrong reason, name the error type, and link the point to his Mehlman notes. Use everything the hub gives you (timing, visits, highlights, struck options, answer changes, earlier sittings) to see why he went wrong, not only what he got wrong.
 
@@ -140,8 +154,11 @@ export const CHECKER_SYSTEM = `You are an independent second reviewer of one USM
 2. mo_reasoning: then say in one or two sentences what Mo actually reasoned, from his transcript and clicks only (or "No speech" if none).
 3. Compare the two and give verdict, flaw_kind and error_type by the rules below.
 4. why: one sentence explaining your verdict.
+5. For wrong and right_flawed: your own cause (with cause_quote, cause_inferred, cause_detail) and step, by the rules below; null, empty, true and null for the others. Judge them yourself from his words: the other reviewer's are not shown to you.
 
 ${RULES}
+
+${CHECK_CORE_RULES}
 
 ${LEAK}
 
@@ -183,12 +200,14 @@ export const JUDGE_SCHEMA = {
     topic: { type: 'string' },
     system: { type: 'string', enum: SYSTEMS },
     rule: { type: 'string' },
+    // A teaching contrast only (wave 2): it may be empty, and it never makes a look-alike penalty; cause does.
     look_alike: { type: 'string' },
+    ...CORE_SCHEMA_PROPS,
     card: nullable(CARD_SCHEMA),
     card_search_terms: { type: 'array', items: { type: 'string' } },
   },
   required: ['verdict', 'flaw_kind', 'error_type', 'cleaned_transcript', 'spoken_answer', 'mo_quote', 'paraphrase', 'gap',
-    'topic', 'system', 'rule', 'look_alike', 'card', 'card_search_terms'],
+    'topic', 'system', 'rule', 'look_alike', ...CORE_FIELDS, 'card', 'card_search_terms'],
   additionalProperties: false,
 };
 
@@ -201,8 +220,10 @@ export const CHECKER_SCHEMA = {
     flaw_kind: { type: 'string', enum: FLAW_KINDS },
     error_type: nullable({ type: 'string', enum: ERROR_TYPES }),
     why: { type: 'string' },
+    // The second judge's own cause and step (answer forms, 1 Nov 2026): a disagreement on the cause goes to the tie-break.
+    ...CHECK_CORE_PROPS,
   },
-  required: ['correct_reasoning', 'mo_reasoning', 'verdict', 'flaw_kind', 'error_type', 'why'],
+  required: ['correct_reasoning', 'mo_reasoning', 'verdict', 'flaw_kind', 'error_type', 'why', ...CHECK_CORE_FIELDS],
   additionalProperties: false,
 };
 
@@ -291,10 +312,16 @@ export function judgeTask() {
   return 'Review this question by the rules and write the JSON.';
 }
 
-export function tieBreakTask(judge, checker) {
-  return `Two reviewers disagreed on the verdict for this question. Decide it yourself by the rules, then write the full JSON again (all fields, card included where the rules call for one).
-Reviewer 1: verdict ${judge.verdict}, flaw_kind ${judge.flaw_kind}, error_type ${judge.error_type ?? 'null'}. Their paraphrase of Mo: ${judge.paraphrase} Their gap: ${judge.gap}
-Reviewer 2 (blind): verdict ${checker.verdict}, flaw_kind ${checker.flaw_kind}, error_type ${checker.error_type ?? 'null'}. Correct reasoning: ${checker.correct_reasoning} Mo's reasoning as they heard it: ${checker.mo_reasoning} Why: ${checker.why}`;
+/**
+ * The third look (tie-break) when the two reviewers disagree on the verdict, or (answer forms, 1 Nov 2026) agree on it but
+ * name different causes: the cause decides the penalties and the look-alike lines, so it is settled before anything counts.
+ */
+export function tieBreakTask(judge, checker, on = 'verdict') {
+  const cause = r => `cause ${r.cause ?? 'null'}${r.cause_detail ? ` (${r.cause_detail})` : ''}${r.cause_quote ? `, his words "${r.cause_quote}"` : ''}, step ${r.step ?? 'null'}`;
+  const what = on === 'cause' ? 'agreed on the verdict but named different causes of the miss' : 'disagreed on the verdict';
+  return `Two reviewers ${what} for this question. Decide it yourself by the rules, from his own words, then write the full JSON again (all fields, card included where the rules call for one).
+Reviewer 1: verdict ${judge.verdict}, flaw_kind ${judge.flaw_kind}, error_type ${judge.error_type ?? 'null'}, ${cause(judge)}. Their paraphrase of Mo: ${judge.paraphrase} Their gap: ${judge.gap}
+Reviewer 2 (blind): verdict ${checker.verdict}, flaw_kind ${checker.flaw_kind}, error_type ${checker.error_type ?? 'null'}, ${cause(checker)}. Correct reasoning: ${checker.correct_reasoning} Mo's reasoning as they heard it: ${checker.mo_reasoning} Why: ${checker.why}`;
 }
 
 export function retryTask(failures) {

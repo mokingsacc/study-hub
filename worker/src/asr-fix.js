@@ -111,6 +111,8 @@ export async function correctLines(env, lines, { user = MO, reserved = false } =
     const done = applyFixes(todo, r.data, lexicon);
     return { lines: [...done.lines, ...asIs.lines.slice(todo.length)], fixes: done.fixes, usd };
   } catch (e) {
+    // Waiting for its Message Batch: the caller waits too (its judge reads the fixed words).
+    if (e && e.pending === true && e.batch === true) throw e;
     usd = Number(e && e.usd) || 0;
     console.error('spelling check skipped', e && e.message);
     return { ...asIs, usd, skipped: e && e.status === 429 ? 'limit' : 'error' };

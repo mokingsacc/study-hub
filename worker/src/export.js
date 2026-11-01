@@ -13,25 +13,32 @@ import { MODES as UW_MODES } from './uworld.js';
 import { SOURCES as GAP_SOURCES, GAP_VERDICTS } from './gaps.js';
 import { DEVICES, STATUSES, CARD_VERDICTS } from './spoken.js';
 import { OUTBOX_KINDS } from './outbox.js';
+import { CAUSES } from '../../public/js/shared/cause.js';
+import { HEARD } from './answer-core.js';
 
 export const TABLES = {
   exams: ['id', 'name', 'created_at', 'question_count', 'questions_json'],
   sittings: ['id', 'name', 'kind', 'exam_id', 'external_label', 'scheduled_date', 'preset', 'block_size', 'block_minutes', 'break_minutes', 'voice_mode', 'status', 'score_pct', 'official_score', 'notes', 'created_at', 'finished_at', 'exam_type', 'timing'],
   blocks: ['id', 'sitting_id', 'idx', 'q_from', 'q_to', 'state_json', 'started_at', 'ended_at', 'correct', 'scored'],
   transcripts: ['block_id', 'q_index', 'segments_json', 'text', 'flags_json'],
-  analyses: ['block_id', 'q_index', 'status', 'verdict', 'flaw_kind', 'error_type', 'error_confirmed', 'paraphrase', 'gap', 'mo_quote', 'cleaned_transcript', 'spoken_answer', 'topic', 'system', 'rule', 'look_alike', 'mehlman_note', 'mehlman_src', 'card_json', 'card_decision', 'existing_card_json', 'agreement', 'checker_json', 'decided_by', 'mo_override', 'error', 'created_at', 'decided_at', 'attempts'],
+  analyses: ['block_id', 'q_index', 'status', 'verdict', 'flaw_kind', 'error_type', 'error_confirmed', 'paraphrase', 'gap', 'mo_quote', 'cleaned_transcript', 'spoken_answer', 'topic', 'system', 'rule', 'look_alike', 'mehlman_note', 'mehlman_src', 'card_json', 'card_decision', 'existing_card_json', 'agreement', 'checker_json', 'decided_by', 'mo_override', 'error', 'created_at', 'decided_at', 'attempts',
+    'cause', 'cause_quote', 'cause_inferred', 'cause_detail', 'step',
+    // The answer forms' shared core and the second judge on the cause (0067).
+    'heard', 'confidence', 'confidence_words', 'confidence_inferred', 'other_json', 'cause_check', 'form_version'],
   outbox: ['id', 'kind', 'idem_key', 'payload_json', 'status', 'attempts', 'last_error', 'result_json', 'created_at', 'done_at'],
   usage: ['day', 'usd', 'calls', 'input_tokens', 'output_tokens', 'whisper_seconds'],
   settings: ['key', 'value'],
   uworld_log: ['id', 'day', 'n', 'kind', 'created_at'],
   cms_log: ['id', 'subject', 'form', 'score_pct', 'day', 'created_at'],
-  uworld_blocks: ['id', 'day', 'mode', 'minutes', 'count', 'segments_json', 'manual_json', 'results_json', 'questions_json', 'words', 'created_at', 'updated_at'],
-  // The columns after created_at come with 0010_map.sql (the map's view of each gap); step and confidence with 0035.
+  // complete comes with 0054 (every question saved with a result: the honesty check's targets).
+  uworld_blocks: ['id', 'day', 'mode', 'minutes', 'count', 'segments_json', 'manual_json', 'results_json', 'questions_json', 'words', 'created_at', 'updated_at', 'complete'],
+  // The columns after created_at come with 0010_map.sql (the map's view of each gap); step and confidence with 0035; review_id with 0051.
   gaps: ['id', 'at', 'day', 'source', 'card_id', 'note_id', 'ref', 'topic', 'gap', 'said', 'error_type', 'verdict', 'created_at',
-    'user_id', 'origin', 'topic_id', 'sitting_id', 'held', 'map_state', 'mapped_at', 'mixed_with', 'step', 'confidence'],
+    'user_id', 'origin', 'topic_id', 'sitting_id', 'held', 'map_state', 'mapped_at', 'mixed_with', 'step', 'confidence', 'review_id', 'mo_corrected_json',
+    'cause', 'cause_quote', 'cause_inferred', 'cause_detail', 'heard', 'form_version'],
   // cards_json (card text kept only until a session is checked) is never exported.
   anki_sessions: ['id', 'device', 'day', 'started_at', 'ended_at', 'segments_json', 'events_json', 'words', 'status', 'attempts', 'last_error', 'created_at', 'updated_at'],
-  anki_cards: ['session_id', 'n', 'card_id', 'note_id', 'deck', 'tags', 'shown_at', 'revealed_at', 'answered_at', 'ease', 'before_json', 'after_json', 'words', 'verdict', 'error_type', 'gap', 'said', 'topic', 'checked_by'],
+  anki_cards: ['session_id', 'n', 'card_id', 'note_id', 'deck', 'tags', 'shown_at', 'revealed_at', 'answered_at', 'ease', 'before_json', 'after_json', 'words', 'verdict', 'error_type', 'gap', 'said', 'topic', 'checked_by', 'cause', 'heard', 'form_version'],
 };
 const REQUIRED = { exams: ['id', 'name', 'created_at', 'question_count', 'questions_json'], sittings: ['id', 'name', 'kind', 'created_at'], blocks: ['id', 'sitting_id', 'idx', 'q_from', 'q_to'], transcripts: ['block_id', 'q_index', 'segments_json', 'text'], analyses: ['block_id', 'q_index'], outbox: ['id', 'kind', 'idem_key', 'payload_json', 'created_at'], usage: ['day'], settings: ['key', 'value'],
   uworld_log: ['id', 'day', 'n', 'created_at'], cms_log: ['id', 'subject', 'form', 'day', 'created_at'],
@@ -51,19 +58,22 @@ const TYPES = {
   transcripts: { block_id: T, q_index: I, segments_json: 'ja', text: T, flags_json: 'ja' },
   analyses: { block_id: T, q_index: I, status: ['pending', 'running', 'done', 'error'], verdict: ['wrong', 'right_flawed', 'sound', 'no_reasoning_heard'],
     card_decision: ['pending', 'yes', 'no', 'edited', 'existing'], card_json: 'j', existing_card_json: 'j', checker_json: 'j',
-    mo_override: ['sound'], created_at: I, decided_at: I, attempts: I },
+    mo_override: ['sound'], created_at: I, decided_at: I, attempts: I,
+    cause: CAUSES, cause_quote: T, cause_inferred: [0, 1], cause_detail: T, step: ['recognise', 'distinguish', 'test', 'treat', 'trap'],
+    heard: HEARD, confidence: ['sure', 'lean', 'guess'], confidence_words: T, confidence_inferred: [0, 1], other_json: 'ja', cause_check: ['agreed', 'tie-break', 'disputed'], form_version: I },
   outbox: { id: T, kind: OUTBOX_KINDS, idem_key: T, payload_json: 'jo', status: ['pending', 'sending', 'done', 'failed'], attempts: I,
     last_error: T, result_json: 'j', created_at: I, done_at: I },
   usage: { day: T, usd: R, calls: I, input_tokens: I, output_tokens: I, whisper_seconds: R },
   settings: { key: T, value: 'j' },
   uworld_log: { id: T, day: T, n: I, kind: ['first_pass', 'incorrect'], created_at: I },
   cms_log: { id: T, subject: CMS_SUBJECTS, form: T, score_pct: R, day: T, created_at: I },
-  uworld_blocks: { id: T, day: T, mode: UW_MODES, minutes: I, count: I, segments_json: 'ja', manual_json: 'ja', results_json: 'jo', questions_json: 'ja', words: I, created_at: I, updated_at: I },
+  uworld_blocks: { id: T, day: T, mode: UW_MODES, minutes: I, count: I, segments_json: 'ja', manual_json: 'ja', results_json: 'jo', questions_json: 'ja', words: I, created_at: I, updated_at: I, complete: [0, 1] },
   gaps: { id: T, at: I, day: T, source: GAP_SOURCES, card_id: I, note_id: I, ref: T, topic: T, gap: T, said: T, error_type: T, verdict: GAP_VERDICTS, created_at: I,
     user_id: T, origin: ['stated', 'review'], topic_id: T, sitting_id: T, held: [0, 1], map_state: ['placed', 'queued'], mapped_at: I, mixed_with: T,
-    step: ['recognise', 'distinguish', 'test', 'treat', 'trap'], confidence: ['sure', 'lean', 'guess'] },
+    step: ['recognise', 'distinguish', 'test', 'treat', 'trap'], confidence: ['sure', 'lean', 'guess'], review_id: I, mo_corrected_json: 'jo',
+    cause: CAUSES, cause_quote: T, cause_inferred: [0, 1], cause_detail: T, heard: HEARD, form_version: I },
   anki_sessions: { id: T, device: DEVICES, day: T, started_at: I, ended_at: I, segments_json: 'ja', events_json: 'ja', words: I, status: STATUSES, attempts: I, last_error: T, created_at: I, updated_at: I },
-  anki_cards: { session_id: T, n: I, card_id: I, note_id: I, deck: T, tags: 'ja', shown_at: I, revealed_at: I, answered_at: I, ease: I, before_json: 'ja', after_json: 'ja', words: I, verdict: CARD_VERDICTS, error_type: T, gap: T, said: T, topic: T, checked_by: T },
+  anki_cards: { session_id: T, n: I, card_id: I, note_id: I, deck: T, tags: 'ja', shown_at: I, revealed_at: I, answered_at: I, ease: I, before_json: 'ja', after_json: 'ja', words: I, verdict: CARD_VERDICTS, error_type: T, gap: T, said: T, topic: T, checked_by: T, cause: CAUSES, heard: HEARD, form_version: I },
 };
 
 function checkValue(t, col, v, type) {

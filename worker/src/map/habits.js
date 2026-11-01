@@ -1,6 +1,8 @@
 import { londonDay } from '../util.js';
 import { addDays, daysLeft } from './teach-priority.js';
+import { readExamDay } from '../exam-day.js';
 import { stemSafe, questionSafe } from './guard.js';
+import { isBoilerplate } from './ingest/map-fields.js';
 
 export const TRAPS = {
   anchored_first_clue: { label: 'anchored on the first clue', hint: 'locked onto one early clue (the age, a drug, a recent infection, how the scan looks) and read the rest to fit it' },
@@ -26,9 +28,9 @@ export const trapLabel = k => (TRAPS[k] ? TRAPS[k].label : null);
 export const TRAPS_PER_ITEM = 2;
 
 // A habit is active with at least ACTIVE_N items on ACTIVE_TOPICS topics, the last within ACTIVE_DAYS; counted over
-// WINDOW_DAYS. map_weakest's lesson list lifts a topic where an active habit recurs by HABIT_BOOST (a tie-breaker
-// between close topics, never a reorder of the map's evidence: no weight changes, WEIGHTS_VERSION stays).
-export const ACTIVE_N = 3, ACTIVE_TOPICS = 2, ACTIVE_DAYS = 21, WINDOW_DAYS = 60, HABIT_BOOST = 1.1;
+// WINDOW_DAYS. map_weakest's lesson rows name the habit on a topic where one recurs; it no longer lifts the topic (One
+// list of what to do next, 1 Nov 2026: a habit is fixed by practice, not by a lesson on the topic, so the planner's order stays).
+export const ACTIVE_N = 3, ACTIVE_TOPICS = 2, ACTIVE_DAYS = 21, WINDOW_DAYS = 60;
 export const EXAMPLES = 3, NOTE_MAX = 200, PROFILE_MAX = 1200, INSIGHT_MAX = 500;
 
 const noTable = e => /no such table|no such column/i.test(String(e && e.message));
@@ -162,10 +164,12 @@ export function forExplaining(d) {
     const top = (m.items || []).find(x => !x.slip) || (m.items || [])[0];
     const sure = m.by_confidence && m.by_confidence.sure ? `, ${m.by_confidence.sure} when sure` : '';
     let line = `${plural(m.total, 'miss', 'misses')} on ${name}${sure}`;
-    if (top) line += `; newest ${top.label} (${shortDay(top.day) || top.day})${top.my_reasoning ? `: he thought ${cap(top.my_reasoning, 110)}` : top.look_alike ? `, took it for ${cap(top.look_alike, 50)}` : ''}`;
+    const why = top && top.cause_words ? ` (${cap(top.cause_words, 80)}${top.cause_inferred === false ? '' : ', inferred'})` : '';
+    if (top) line += `; newest ${top.label} (${shortDay(top.day) || top.day})${why}${top.my_reasoning ? `: he thought ${cap(top.my_reasoning, 110)}`
+      : top.look_alike && top.cause === 'confusion' ? `, took it for ${cap(top.look_alike, 50)}` : ''}`;
     bits.push(line);
   }
-  if (g && g.total) { const x = (g.items || [])[0]; bits.push(`${plural(g.total, 'gap')}${x && (x.text || x.gap) ? `, latest "${cap(x.text || x.gap, 80)}"` : ''}`); }
+  if (g && g.total) { const x = (g.items || []).find(i => !isBoilerplate(i.text || i.gap)); bits.push(`${plural(g.total, 'gap')}${x ? `, latest "${cap(x.text || x.gap, 80)}"` : ''}`); }
   if (miscs.length) bits.push(`open misconception "${cap(miscs[0].belief, 90)}"`);
   const first = bits.length ? `${cap(bits.join('; '), 330)}.` : `No misses, gaps or misconceptions on ${name} yet.`;
   const h = d.habits && d.habits.here && d.habits.here[0];
@@ -180,7 +184,7 @@ export function forExplaining(d) {
 
 /**
  * The code facts for the profile, in one read batch plus calibration and the look-alike pairs: weakest systems and
- * topics, the overconfident system, active habits, open misconceptions, re-tests due, what teaching worked, days left.
+ * topics, the overconfident system, active habits, open misconceptions, checks due (a fact only, never a profile line), what teaching worked, days left.
  */
 export async function profileFacts(env, user, { now = Date.now() } = {}) {
   const today = londonDay(now);
@@ -210,7 +214,7 @@ export async function profileFacts(env, user, { now = Date.now() } = {}) {
   const pairs = await topPairs(env, user, 2, { mixedOnly: true }).catch(() => []);
   const r = retests[0] || {};
   return {
-    day: today, days_left: daysLeft(today),
+    day: today, days_left: daysLeft(today, await readExamDay(env).catch(() => null)),
     weakest_systems: cats.map(c => c.name), weakest_topics: topics.map(t => t.name),
     overconfident: over ? { system: over.system, sure_wrong: over.sure_wrong, sure: over.sure } : null,
     habits: habits.map(shapeHabit),
@@ -232,9 +236,8 @@ export function composeProfile({ insight = null, facts = {} } = {}) {
   if (f.weakest_topics && f.weakest_topics.length) lines.push(`Weakest topics: ${f.weakest_topics.join(', ')}.`);
   if (f.misconceptions && f.misconceptions.open) lines.push(`${plural(f.misconceptions.open, 'open misconception')}${f.misconceptions.top[0] ? `, e.g. "${f.misconceptions.top[0].belief}" (${f.misconceptions.top[0].topic})` : ''}.`);
   if (f.pairs && f.pairs.length) lines.push(`Mixes up: ${f.pairs.join('; ')}.`);
-  if (f.retests_due) lines.push(`${plural(f.retests_due, 're-test')} due.`);
   if ((f.worked && f.worked.length) || f.clicked) lines.push(`Teaching that works: ${[f.worked && f.worked.length ? f.worked.join(', ') : null, f.clicked ? `last clicked "${f.clicked}"` : null].filter(Boolean).join('; ')}.`);
-  if (f.days_left != null) lines.push(`${f.days_left} days to the exam.`);
+  if (f.days_left > 0) lines.push(`${f.days_left} days to the exam.`);   // none with no exam set or after it
   let text = lines.join(' ');
   // Too long: the code lines go from the end first (the insight and the habits are kept longest).
   while (text.length > PROFILE_MAX && lines.length > 2) { lines.splice(lines.length - 2, 1); text = lines.join(' '); }

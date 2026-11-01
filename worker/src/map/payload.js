@@ -1,5 +1,5 @@
 import { json, readJson, londonDay, HttpError } from '../util.js';
-import { BANDS, BAND_CODES, STOPS_DARK, STOPS_LIGHT, EDGES_LIGHT, UNSEEN, GLOW } from '../../../public/js/map/scale.js';
+import { BANDS, BAND_CODES, bandOf, STOPS_DARK, STOPS_LIGHT, EDGES_LIGHT, UNSEEN, GLOW } from '../../../public/js/map/scale.js';
 import { rankJoin, RANK_COLS } from '../exam-ranks.js';
 import { TYPE_NAMES, LINK_TYPES, FLAGS as LINK_FLAGS } from '../../../public/js/shared/link-rank.js';
 import { CATEGORY_SUMMARY_SQL, summaryFromSql } from './weakness.js';
@@ -8,6 +8,8 @@ import { ensurePositions, MISSING_SQL, LAYOUT_STATE_SQL, layoutFromRow } from '.
 import { buildProfile } from '../profiles.js';
 import { DISCIPLINES } from './systems.js';
 import { applyChange, changeResponse } from './change.js';
+import { liveStatement, liveMap, liveSummaries } from './live.js';
+import { liveFacetRows } from './facets.js';
 
 export const PAYLOAD_VERSION = 2;
 export const MAX_IDS = 200;
@@ -27,6 +29,8 @@ const CONFUSION_SQL = 'CAST(round(max(0, min(2.55, coalesce(l.confusion, 0))) * 
 const T1000_SQL = 'CASE WHEN s.seen = 1 AND s.t IS NOT NULL THEN CAST(round(s.t * 1000) AS INTEGER) END';
 const CERT_SQL = 'CAST(round(coalesce(s.certainty, 0) * 100) AS INTEGER)';
 const YIELD_SQL = 'CAST(round(max(0, min(1, coalesce(t.yield, 0))) * 100) AS INTEGER)';
+// A topic's part on the map's scale, only when its evidence is more than thin (wave 3, 0058; binds ?1 user, alias t).
+export const FACET_T_SQL = f => `(SELECT x.t1000 FROM topic_facets x WHERE x.user_id = ?1 AND x.topic_id = t.id AND x.facet = '${f}' AND x.strength <> 'thin')`;
 
 // The numbered lists every full build shares (binds ?1 user). Indices follow ids, so they are stable between
 // two builds of the same map, and categories follow their sort.
@@ -47,7 +51,7 @@ SELECT json_object(
         CASE WHEN p.x IS NULL THEN NULL ELSE round(p.x, 1) END, CASE WHEN p.y IS NULL THEN NULL ELSE round(p.y, 1) END,
         ${YIELD_SQL}, ${T1000_SQL}, ${CERT_SQL}, ${BAND_INDEX_SQL},
         coalesce(s.misses_n, 0), coalesce(s.cards_n, 0), s.last_miss_at, ${topicFlagsSql({ t: 't', s: 's' })},
-        coalesce(t.oncology, 0), coalesce(t.disciplines, 0), s.trend))
+        coalesce(t.oncology, 0), coalesce(t.disciplines, 0), s.trend, ${FACET_T_SQL('diagnose')}, ${FACET_T_SQL('manage')}))
       FROM live t LEFT JOIN topic_positions p ON p.user_id = ?1 AND p.kind = 'topic' AND p.ref_id = t.id
       LEFT JOIN topic_scores s ON s.user_id = ?1 AND s.topic_id = t.id),
   'links', (SELECT json_group_array(json_array(l.from_id, l.to_id, ${TYPE_CODE_SQL}, ${STRENGTH_SQL}, ${CONFUSION_SQL}, ${LINK_FLAGS_SQL}))
@@ -80,9 +84,14 @@ const TAGS = 't.oncology, t.disciplines,';
 const untagged = sql => sql.replace(TAGS, '0 AS oncology, 0 AS disciplines,');
 export const BODY_SQL_UNTAGGED = untagged(BODY_SQL);
 const isTagError = e => /no such column/i.test(String(e && e.message)) && /oncology|disciplines/.test(String(e && e.message));
-// Before 0013 (weakness model v2) topic_scores has no trend: the same SQL with it read as null.
-const noTrend = sql => sql.replace(', s.trend))', ', NULL))').replace('s.trend AS trend', 'NULL AS trend');
-const isTrendError = e => /no such column/i.test(String(e && e.message)) && /trend/.test(String(e && e.message));
+// Before 0013 (weakness model v2) topic_scores has no trend: the same SQL with it read as null. Before 0055 it has no
+// evidence strength either (flags.js thin and solid then count questions and re-tests), so a database missing either
+// reads without both.
+const noTrend = sql => sql.replace(', s.trend,', ', NULL,').replace(', s.trend))', ', NULL))').replace('s.trend AS trend', 'NULL AS trend').replace(/s\.fsrs_(?:real_n|at)\b/g, 'NULL');
+const isTrendError = e => /no such column/i.test(String(e && e.message)) && /trend|fsrs_/.test(String(e && e.message));
+// Before 0058 (wave 3) there are no topic parts: the same SQL with both read as null.
+const noFacets = sql => sql.split(FACET_T_SQL('diagnose')).join('NULL').split(FACET_T_SQL('manage')).join('NULL');
+const isFacetError = e => /topic_facets/.test(String(e && e.message));
 const RANK_JOIN_U = rankJoin('u');
 const noRanks = sql => sql.split(RANK_JOIN_U).join('').replace('u.mehlman_rank, xrn.rank, xrc.rank)', 'u.mehlman_rank, NULL, NULL)').replace(`, ${RANK_COLS} FROM`, ', NULL AS nbme_rank, NULL AS cms_rank FROM');
 const isRankError = e => /xq_rank/.test(String(e && e.message));
@@ -100,15 +109,65 @@ export const META_SQL = `SELECT (SELECT max(seq) FROM map_events WHERE user_id =
      AND topic_id IS NOT NULL ORDER BY started_at DESC LIMIT 1) AS teaching_now,
   (SELECT profile FROM users WHERE id = ?1) AS profile, (SELECT profile_json FROM users WHERE id = ?1) AS profile_json`;
 
-/** One category tuple from a CATEGORIES_SQL row. */
-export function categoryTuple(r) {
-  const s = summaryFromSql(r);
+/** One category tuple from a CATEGORIES_SQL row (live: its summary worked out from the live topics instead). */
+export function categoryTuple(r, live = null) {
+  const s = live || summaryFromSql(r);
   return [r.i, r.id, r.name, r.short_name || r.name, s.t1000, Math.round(100 * s.coverage), s.n_weak, s.n_unseen, s.n_topics];
 }
 
-/** The ETag of a build: the user's newest seq and the London day (the day-bound marks change at midnight). */
+/**
+ * The ETag of a build: the user's newest seq, the London day (the day-bound marks change at midnight) and the hour
+ * (the colours fade on read, live.js, so a map kept open all day still refetches its fade each hour).
+ */
 export function etagOf(user, seq, now = Date.now()) {
-  return `W/"m3-${user === 'mo' ? '' : user + '.'}${Number(seq) || 0}-${londonDay(now)}"`;
+  return `W/"m3-${user === 'mo' ? '' : user + '.'}${Number(seq) || 0}-${londonDay(now)}-h${Math.floor(now / 3600_000) % 24}"`;
+}
+
+// ------------------------------------------------------------------ the fade, on read (live.js)
+
+// Every live topic's system ids and yield (for the halos) and every part row's offsets (for the lens), in the build's batch.
+const LIVE_TOPICS_SQL = `SELECT t.id AS topic_id, t.category_id, t.category2_id, t.yield FROM topics t WHERE t.user_id = ?1 AND t.status IN ${LIVE}`;
+const LIVE_FACETS_SQL = `SELECT topic_id, facet, n_eff, d_system, d_topic, t1000 FROM topic_facets WHERE user_id = ?1 AND strength <> 'thin'`;
+const NO_FACETS_SQL = 'SELECT NULL AS topic_id WHERE 0 AND ?1 = ?1', NO_LAYOUT_SQL = 'SELECT NULL AS n WHERE 0 AND ?1 = ?1';
+const isLiveError = e => /no such column/i.test(String(e && e.message)) && /fsrs_|ref_at|prior_mastery|formula_version|strong_fails|category2_id|_pass|_fail|card_state|gate_nq|d_system|d_topic/.test(String(e && e.message));
+const BAND_I = Object.fromEntries(BAND_CODES.map((c, i) => [c, i]));
+
+/**
+ * The live reads' rows into what the overlay needs (pure): {live: Map, parts: Map(topic_id -> {diagnose, manage} t1000),
+ * cats: Map(category_id -> summary) | null}.
+ */
+export function liveParts({ scoreRows = [], facetRows = [], topicRows = null }, now = Date.now()) {
+  const live = liveMap(scoreRows, now);
+  const parts = new Map();
+  const byTopic = new Map();
+  for (const r of facetRows || []) { if (!byTopic.has(r.topic_id)) byTopic.set(r.topic_id, []); byTopic.get(r.topic_id).push(r); }
+  for (const [id, rows] of byTopic) {
+    const l = live.get(id);
+    const faded = liveFacetRows(rows, l && l.weakness_raw != null ? 1 - Number(l.weakness_raw) : null);
+    parts.set(id, Object.fromEntries(faded.map(r => [r.facet, r.t1000 == null ? null : Number(r.t1000)])));
+  }
+  const cats = topicRows ? liveSummaries(topicRows, live, t => [t.category_id, t.category2_id && t.category2_id !== t.category_id ? t.category2_id : null]) : null;
+  return { live, parts, cats };
+}
+
+/**
+ * One payload topic tuple with its colour as of now (pure). at: the tuple's index of t1000 (cert100 and band_i follow),
+ * and of the two parts. A topic with no live entry (unseen, or a row without its state) keeps its stored values.
+ */
+export function liveTuple(tuple, id, { live, parts }, { t = 9, fd = 19 } = {}) {
+  const l = live.get(id);
+  const out = tuple.slice();
+  if (l && l.t != null) {
+    out[t] = Math.round(Number(l.t) * 1000);
+    out[t + 1] = Math.round(100 * (Number(l.certainty) || 0));
+    out[t + 2] = BAND_I[l.band || bandOf(out[t])] ?? out[t + 2];
+  }
+  const p = parts.get(id);
+  if (p) {
+    if ('diagnose' in p) out[fd] = p.diagnose;
+    if ('manage' in p) out[fd + 1] = p.manage;
+  }
+  return out;
 }
 export const aliasEtag = (user, seq) => `W/"a1-${user === 'mo' ? '' : user + '.'}${Number(seq) || 0}"`;
 
@@ -147,14 +206,17 @@ export async function buildMapPayload(env, user, { now = Date.now() } = {}) {
   const q = (sql, ...a) => env.DB.prepare(sql).bind(...a);
   // The layout's state rides in the same batch; before 0011 (no embeddings table) the batch runs without it.
   // Likewise before 0012 the topics carry no tags (read as 0).
-  let withLayout = true, withTags = true, withTrend = true, withRanks = true;
-  const bodySql = () => { const b = withTags ? BODY_SQL : BODY_SQL_UNTAGGED; const t = withTrend ? b : noTrend(b); return withRanks ? t : noRanks(t); };
+  let withLayout = true, withTags = true, withTrend = true, withRanks = true, withFacets = true, withLive = true;
+  const bodySql = () => { const b = withTags ? BODY_SQL : BODY_SQL_UNTAGGED; const t = withTrend ? b : noTrend(b); const f = withFacets ? t : noFacets(t); return withRanks ? f : noRanks(f); };
+  // The fade on read (live.js) rides in the same batch: the seen topics' states, the topics' systems, the parts' offsets.
+  const liveStatements = () => (withLive ? [liveStatement(env, user), q(LIVE_TOPICS_SQL, user), q(withFacets ? LIVE_FACETS_SQL : NO_FACETS_SQL, user)] : []);
   const run = () => env.DB.batch([
     q(META_SQL, user, today, now),
     q(MISSING_SQL, user, 1),
     q(withTags ? CATEGORIES_SQL : CATEGORIES_SQL_UNTAGGED, user),
     q(bodySql(), user, today, now, dayStart),
-    ...(withLayout ? [q(LAYOUT_STATE_SQL, user)] : []),
+    q(withLayout ? LAYOUT_STATE_SQL : NO_LAYOUT_SQL, user),
+    ...liveStatements(),
   ]);
   const attempt = async () => {
     for (;;) {
@@ -163,6 +225,8 @@ export async function buildMapPayload(env, user, { now = Date.now() } = {}) {
         if (withTags && isTagError(e)) { withTags = false; continue; }
         if (withTrend && isTrendError(e)) { withTrend = false; continue; }
         if (withRanks && isRankError(e)) { withRanks = false; continue; }
+        if (withFacets && isFacetError(e)) { withFacets = false; continue; }
+        if (withLive && isLiveError(e)) { withLive = false; continue; }   // before the state columns: the stored values
         if (!withLayout) throw e;
         withLayout = false;
       }
@@ -182,8 +246,10 @@ export async function buildMapPayload(env, user, { now = Date.now() } = {}) {
   const metaRow = (res[0].results || [])[0] || {};
   const layout = withLayout && res[4] ? layoutFromRow((res[4].results || [])[0], { ai: !!env.AI }) : null;
   const meta = metaOf(metaRow, { user, now, layout });
-  const cats = (res[2].results || []).map(categoryTuple);
+  const lv = withLive ? liveParts({ scoreRows: res[5].results || [], topicRows: res[6].results || [], facetRows: res[7].results || [] }, now) : null;
+  const cats = (res[2].results || []).map(r => categoryTuple(r, lv && lv.cats ? lv.cats.get(r.id) || null : null));
   const body = numberBody(String(((res[3].results || [])[0] || {}).body || '{"units":[],"topics":[],"links":[]}'), cats);
+  if (lv) body.topics = body.topics.map(tp => liveTuple(tp, tp[1], lv));
   const text = `{"v":${PAYLOAD_VERSION},"meta":${JSON.stringify(meta)},"categories":${JSON.stringify(cats)},"units":${JSON.stringify(body.units)},`
     + `"topics":${JSON.stringify(body.topics)},"links":${JSON.stringify(body.links)}}`;
   return { text, seq: meta.seq, ready: true };
@@ -196,7 +262,8 @@ const IDS_SQL = `SELECT t.id, t.name, t.short_name, t.category_id, t.unit_id, t.
     CASE WHEN p.x IS NULL THEN NULL ELSE round(p.x, 1) END AS x, CASE WHEN p.y IS NULL THEN NULL ELSE round(p.y, 1) END AS y,
     ${YIELD_SQL} AS yield100, ${T1000_SQL} AS t1000, ${CERT_SQL} AS cert100, ${BAND_INDEX_SQL} AS band_i,
     coalesce(s.misses_n, 0) AS misses, coalesce(s.cards_n, 0) AS cards, s.last_miss_at, ${topicFlagsSql({ t: 't', s: 's' })} AS flags,
-    coalesce(t.oncology, 0) AS oncology, coalesce(t.disciplines, 0) AS disciplines, s.trend AS trend
+    coalesce(t.oncology, 0) AS oncology, coalesce(t.disciplines, 0) AS disciplines, s.trend AS trend,
+    ${FACET_T_SQL('diagnose')} AS fd, ${FACET_T_SQL('manage')} AS fm
   FROM topics t LEFT JOIN topic_positions p ON p.user_id = t.user_id AND p.kind = 'topic' AND p.ref_id = t.id
   LEFT JOIN topic_scores s ON s.user_id = t.user_id AND s.topic_id = t.id
   WHERE t.user_id = ?1 AND t.id IN (SELECT value FROM json_each(?5))`;
@@ -216,15 +283,27 @@ export async function buildIdsPayload(env, user, ids, { now = Date.now() } = {})
   const [, today, , dayStart] = flagParams(user, now);
   await ensurePositions(env, user, { ids: want, now });
   const q = (sql, ...a) => env.DB.prepare(sql).bind(...a);
-  let trend = true, ranks = true;
+  let trend = true, ranks = true, facets = true, withLive = true;
   const batch0 = tags => env.DB.batch([
     q(META_SQL, user, today, now),
-    q((s => (trend ? s : noTrend(s)))(tags ? IDS_SQL : IDS_SQL_UNTAGGED), user, today, now, dayStart, list),
+    q((s => (trend ? s : noTrend(s)))((s => (facets ? s : noFacets(s)))(tags ? IDS_SQL : IDS_SQL_UNTAGGED)), user, today, now, dayStart, list),
     q(IDS_LINKS_SQL, user, today, list),
     q(ranks ? IDS_UNITS_SQL : noRanks(IDS_UNITS_SQL), user, list),
     q(tags ? CATEGORIES_SQL : CATEGORIES_SQL_UNTAGGED, user),
+    // The fade on read (live.js), as the full build: every seen topic (the halos need them all) and these topics' parts.
+    ...(withLive ? [liveStatement(env, user), q(LIVE_TOPICS_SQL, user),
+      q(facets ? `${LIVE_FACETS_SQL} AND topic_id IN (SELECT value FROM json_each(?2))` : 'SELECT NULL AS topic_id WHERE 0 AND ?1 = ?2', user, list)] : []),
   ]);
-  const batch = async tags => { try { return await batch0(tags); } catch (e) { if (ranks && isRankError(e)) { ranks = false; return batch0(tags); } throw e; } };
+  const batch = async tags => {
+    for (;;) {
+      try { return await batch0(tags); } catch (e) {
+        if (ranks && isRankError(e)) { ranks = false; continue; }
+        if (facets && isFacetError(e)) { facets = false; continue; }
+        if (withLive && isLiveError(e)) { withLive = false; continue; }
+        throw e;
+      }
+    }
+  };
   let res;
   try { res = await batch(true); } catch (e) {
     if (isTrendError(e)) { trend = false; try { res = await batch(true); } catch (e2) { if (!isTagError(e2)) throw e2; res = await batch(false); } }
@@ -235,12 +314,14 @@ export async function buildIdsPayload(env, user, ids, { now = Date.now() } = {})
   const rows = res[1].results || [];
   const live = rows.filter(r => r.status === 'proposed' || r.status === 'confirmed');
   const liveIds = new Set(live.map(r => r.id));
+  const lv = withLive && res[5] ? liveParts({ scoreRows: res[5].results || [], topicRows: res[6].results || [], facetRows: res[7].results || [] }, now) : null;
   return {
     v: PAYLOAD_VERSION, partial: true, seq: meta.seq, layout_version: meta.layout_version, teaching_now: meta.teaching_now,
-    categories: (res[4].results || []).map(categoryTuple),
+    categories: (res[4].results || []).map(r => categoryTuple(r, lv && lv.cats ? lv.cats.get(r.id) || null : null)),
     units: (res[3].results || []).map(u => [u.id, u.name, u.category_id, u.lane, u.mehlman_rank, u.nbme_rank ?? null, u.cms_rank ?? null]),
     topics: live.map(r => [r.id, r.name, r.short_name, r.category_id, r.unit_id, r.x, r.y, r.yield100, r.t1000, r.cert100, r.band_i,
-      r.misses, r.cards, r.last_miss_at, r.flags, r.oncology, r.disciplines, r.trend ?? null]),
+      r.misses, r.cards, r.last_miss_at, r.flags, r.oncology, r.disciplines, r.trend ?? null, r.fd ?? null, r.fm ?? null])
+      .map(tp => (lv ? liveTuple(tp, tp[0], lv, { t: 8, fd: 18 }) : tp)),
     links: (res[2].results || []).map(l => [l.from_id, l.to_id, l.type_code, l.s100, l.c100, l.flags]),
     gone: want.filter(id => !liveIds.has(id)),
   };

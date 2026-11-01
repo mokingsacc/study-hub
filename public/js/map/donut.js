@@ -1,4 +1,6 @@
 
+import { isFoundationCategory } from '../shared/concept.js';
+
 /** [id, name, member category ids]. The order is the default order round the ring (top, then clockwise). */
 export const FAMILIES = Object.freeze([
   ['women-children', 'Women & children', ['obstetrics', 'gynaecology-and-breast', 'neonates-genetics-and-child-development']],
@@ -415,29 +417,72 @@ export function placeSeats(seats, seatOf, R, { gap = DONUT.gap, familyGap = DONU
   return { x, y, rho, hole: { x: 0, y: 0, r: Math.max(0, clear) }, turn, wedges };
 }
 
-/**
- * Each family's wedge on the map as it is drawn: [{id, name, a0, a1, r0, r1, members: [category index]}], angles
- * in radians (screen: clockwise from +x, a1 > a0), radii in world units round {cx, cy}: the donut's centre, the world's
- * origin, where placeSeats puts it. Null when there are fewer than 3 systems. Each wedge is the angular hull of its
- * galaxies (their centres and their reach), which is exactly the wedge placeSeats gave the family; were two to overlap
- * (a layout from before v7), they meet half way.
- */
-export function familySectors(model, { pad = 0.04 } = {}) {
-  const sums = new Map();
+export function galaxyFootprints(model, { link = DONUT.gap } = {}) {
+  const by = new Map();
   for (let i = 0; i < model.n; i++) {
     if (!model.placed[i]) continue;
     const c = model.cat[i];
-    let s = sums.get(c);
-    if (!s) sums.set(c, (s = { c, x: 0, y: 0, n: 0, list: [] }));
-    s.x += model.x[i]; s.y += model.y[i]; s.n++; s.list.push(i);
+    if (!by.has(c)) by.set(c, []);
+    by.get(c).push(i);
   }
-  const gals = [...sums.values()].map(s => {
-    const x = s.x / s.n, y = s.y / s.n;
+  const out = [];
+  for (const [c, all] of by) {
+    // the clusters by single linkage (a union-find over the system's own dots)
+    const n = all.length, up = Int32Array.from({ length: n }, (_, q) => q);
+    const root = q => { while (up[q] !== q) { up[q] = up[up[q]]; q = up[q]; } return q; };
+    for (let p = 0; p < n; p++) {
+      const i = all[p], xi = model.x[i], yi = model.y[i], ri = model.r[i] || 0;
+      for (let q = p + 1; q < n; q++) {
+        const j = all[q], d = link + ri + (model.r[j] || 0), dx = model.x[j] - xi;
+        if (dx > d || dx < -d) continue;
+        const dy = model.y[j] - yi;
+        if (dy > d || dy < -d || dx * dx + dy * dy >= d * d) continue;
+        const a = root(p), b = root(q);
+        if (a !== b) up[Math.max(a, b)] = Math.min(a, b);
+      }
+    }
+    const size = new Int32Array(n);
+    for (let q = 0; q < n; q++) size[root(q)]++;
+    let main = 0;
+    for (let q = 1; q < n; q++) if (size[q] > size[main]) main = q;
+    const list = [], strays = [];
+    for (let q = 0; q < n; q++) (root(q) === main ? list : strays).push(all[q]);
+    let x = 0, y = 0;
+    for (const i of list) { x += model.x[i]; y += model.y[i]; }
+    x /= list.length; y /= list.length;
     let R = 0;
-    for (const i of s.list) R = Math.max(R, Math.hypot(model.x[i] - x, model.y[i] - y) + (model.r[i] || 0));
-    const cat = model.cats[s.c];
-    return { c: s.c, x, y, R, fam: familyOf(cat ? cat.id : null) };
+    for (const i of list) R = Math.max(R, Math.hypot(model.x[i] - x, model.y[i] - y) + (model.r[i] || 0));
+    out.push({ c, x, y, R, n, list, strays });
+  }
+  return out.sort((p, q) => p.c - q.c);
+}
+
+/**
+ * Each family's wedge on the map as it is drawn: [{id, name, a0, a1, r0, r1, members: [category index]}], angles
+ * in radians (screen: clockwise from +x, a1 > a0), radii in world units round {cx, cy}: the donut's centre, the world's
+ * origin, where placeSeats puts it; ring: the foundation galaxies [{c, name (short), x, y, R}]. Null when there are
+ * fewer than 3 systems. Each wedge is the angular hull of its galaxies as drawn (galaxyFootprints: their main
+ * clusters' centres and reach), which is exactly the wedge placeSeats gave the family; were two to overlap (a layout
+ * from before v7), they meet half way. r0 and r1 are the nearest and farthest reach of those clusters' dots from the
+ * centre (strays left out): every family's arc is drawn on the one circle past r1 (families.js arcRadiusPx).
+ */
+export function familySectors(model, { pad = 0.04 } = {}) {
+  const all = galaxyFootprints(model).map(g => {
+    const cat = model.cats[g.c];
+    const ring = isFoundationCategory(cat ? cat.id : null);
+    let { x, y, R } = g;
+    if (ring) {
+      // a foundation orb is placed whole (foundations-ring.js), every dot of it
+      const list = [...g.list, ...g.strays];
+      x = list.reduce((t, i) => t + model.x[i], 0) / list.length; y = list.reduce((t, i) => t + model.y[i], 0) / list.length;
+      R = 0;
+      for (const i of list) R = Math.max(R, Math.hypot(model.x[i] - x, model.y[i] - y) + (model.r[i] || 0));
+    }
+    return { c: g.c, x, y, R, list: g.list, fam: familyOf(cat ? cat.id : null), ring, name: cat ? cat.short || cat.name || cat.id : '' };
   });
+  // the foundations ring round the donut has no wedge (foundations-ring.js); each of its galaxies is named beside it
+  const ring = all.filter(g => g.ring).map(g => ({ c: g.c, name: g.name, x: g.x, y: g.y, R: g.R }));
+  const gals = all.filter(g => !g.ring);
   if (gals.length < 3) return null;
   const cx = 0, cy = 0;
   let r0 = Infinity, r1 = 0;
@@ -445,7 +490,9 @@ export function familySectors(model, { pad = 0.04 } = {}) {
     g.rho = Math.hypot(g.x - cx, g.y - cy);
     g.a = Math.atan2(g.y - cy, g.x - cx);
     g.half = g.rho > g.R ? Math.asin(Math.min(1, g.R / g.rho)) : Math.PI / 2;
-    r0 = Math.min(r0, g.rho - g.R); r1 = Math.max(r1, g.rho + g.R);
+    g.r0 = Infinity; g.r1 = 0;
+    for (const i of g.list) { const d = Math.hypot(model.x[i] - cx, model.y[i] - cy), r = model.r[i] || 0; g.r0 = Math.min(g.r0, d - r); g.r1 = Math.max(g.r1, d + r); }
+    r0 = Math.min(r0, g.r0); r1 = Math.max(r1, g.r1);
   }
   const byFam = new Map();
   for (const g of gals) { if (!byFam.has(g.fam.id)) byFam.set(g.fam.id, { fam: g.fam, gals: [] }); byFam.get(g.fam.id).gals.push(g); }
@@ -473,5 +520,5 @@ export function familySectors(model, { pad = 0.04 } = {}) {
     n.a0 = meet + pad - shift;
   }
   for (const s of spans) { while (s.a1 < s.a0) s.a1 += TAU; delete s.mid; }
-  return { cx, cy, r0: Math.max(0, r0), r1, sectors: spans };
+  return { cx, cy, r0: Math.max(0, r0), r1, sectors: spans, ring };
 }

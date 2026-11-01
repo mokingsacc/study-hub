@@ -1,10 +1,11 @@
 import { normError, leaks } from '../../checks.js';
-import { hubQuestionLabel } from '../../util.js';
+import { hubQuestionLabel, londonDay } from '../../util.js';
 import { SERVER_ERROR } from '../../anki.js';
 import { stemSafe, questionSafe } from '../guard.js';
 import { norm, userKey } from '../../../../public/js/shared/names.js';
 import { PACE } from '../weights.js';
 import { normSystem } from '../../uworld-systems.js';
+import { CAUSES, CAUSE_VERSION, tidyCause } from '../../../../public/js/shared/cause.js';
 
 export const ERROR_KEYS = Object.values(SERVER_ERROR);
 const ERROR_WORDS = Object.fromEntries(Object.entries(SERVER_ERROR).map(([w, k]) => [k, w]));
@@ -54,7 +55,7 @@ export { gapOrigin, CHECK_SOURCES } from '../weights.js';
 
 // Evidence sources ingestion writes (open text in the table; this list is what code checks). A new spoken
 // source (ankimobile, anki_iphone) is one more entry here and in gaps.js SOURCES.
-export const EVIDENCE_SOURCES = ['hub', 'uworld', 'anki', 'chat', 'anki_voice', 'anki_mac', 'anki_hub', 'anki_phone', 'spoken_cue'];
+export const EVIDENCE_SOURCES = ['hub', 'uworld', 'anki', 'chat', 'anki_voice', 'anki_mac', 'anki_hub', 'anki_phone', 'anki_voice_check', 'spoken_cue'];
 
 export { userKey };
 export const normLabel = s => norm(s);
@@ -94,6 +95,51 @@ export const isDay = d => typeof d === 'string' && DAY.test(d);
 export const dayNoon = d => Date.parse(`${d}T12:00:00Z`);
 export const dayDiff = (a, b) => Math.round(Math.abs(dayNoon(a) - dayNoon(b)) / 86_400_000);
 
+export const SAME_QUESTION_DAYS = 14;
+export function sameQuestion(row, incoming) {
+  if (!row || !incoming || row.deleted_at != null || !row.uw_qid || String(row.uw_qid) !== String(incoming.uw_qid || '')) return false;
+  if (!isDay(row.day) || !isDay(incoming.day) || dayDiff(row.day, incoming.day) > SAME_QUESTION_DAYS) return false;
+  return !(row.uworld_block_id && incoming.uworld_block_id && row.uworld_block_id !== incoming.uworld_block_id);
+}
+
+const BOILERPLATE = [/^missed this card in a voice review\.?$/i, /^missed (?:this|the) card\.?$/i, /^did not hold this card\.?$/i,
+  /^(?:no|none|n\/a|nothing said|\(none\)|\(no words\))\.?$/i, /^he (?:did not|didn't) (?:say|answer)\b/i];
+export const isBoilerplate = s => { const t = String(s ?? '').replace(/\s+/g, ' ').trim(); return !t || BOILERPLATE.some(re => re.test(t)); };
+
+export const SAID_WINDOW = { after_shown_ms: 2_000, after_answer_ms: 60_000, session_ms: 3_000, share: 0.6 };
+const saidTokens = s => String(s || '').toLowerCase().replace(/\(read the (?:card|question)\)/g, ' ').match(/[a-z0-9']{3,}/g) || [];
+/**
+ * The speech of one card inside its window: parts [{t (ms from the session start), text}] -> the words said in it.
+ * card: {shown_at, revealed_at, answered_at} (epoch ms); startedAt: the session's start (epoch ms). Pure.
+ */
+export function windowText(parts, card, startedAt) {
+  const shown = Number(card && card.shown_at), end = Number((card && (card.answered_at || card.revealed_at)) || shown);
+  if (!Number.isFinite(shown) || !Number.isFinite(Number(startedAt))) return '';
+  const lo = Math.max(shown + SAID_WINDOW.after_shown_ms, Number(startedAt) + SAID_WINDOW.session_ms), hi = end + SAID_WINDOW.after_answer_ms;
+  return (parts || []).filter(p => p && Number.isFinite(Number(p.t)) && Number(startedAt) + Number(p.t) >= lo && Number(startedAt) + Number(p.t) <= hi)
+    .map(p => String(p.text || '')).join(' ');
+}
+export function saidInWindow(said, text) {
+  if (isBoilerplate(said)) return false;
+  const want = saidTokens(said), have = new Set(saidTokens(text));
+  if (!want.length || !have.size) return false;
+  return want.filter(w => have.has(w)).length / want.length >= SAID_WINDOW.share;
+}
+
+export function eventAt(real, fallback, { lo = -Infinity, hi = Infinity } = {}) {
+  const t = real == null || real === '' ? NaN : Number(real);
+  return Number.isFinite(t) && t >= lo && t <= hi ? Math.round(t) : fallback;
+}
+
+export function uworldQuestionAt(block, q) {
+  const noon = dayNoon(block.day) + q.q * 1000;
+  const id = /^\d{12,14}$/.test(String(block.id)) ? Number(block.id) : null;
+  const start = id != null && londonDay(id) === block.day ? id : null;
+  if (start == null) return noon;
+  const off = Number.isFinite(Number(q.start_ms)) && q.start_ms != null && Number(q.start_ms) >= 0 ? Number(q.start_ms) : null;
+  return eventAt(off == null ? start + q.q * 1000 : start + off, noon, { lo: start, hi: start + 12 * 3600_000 });
+}
+
 // ---------------------------------------------------------------- change gating
 /** FNV-1a (32 bit) of a string, as 8 hex characters. */
 export function fnv1a(str) {
@@ -121,8 +167,27 @@ export const MISS_INGEST_COLS = ['source', 'source_ref', 'label', 'qbank', 'day'
   'uworld_q', 'anki_mistake_id', 'result', 'outcome', 'flaw_kind', 'confidence', 'confidence_source', 'error_type', 'time_s', 'slow', 'others_pct',
   'time_source', 'topic_raw', 'condition_raw', 'system_raw', 'label_norm', 'topic_id', 'category_id', 'queue_id', 'match_status', 'match_method',
   'rule', 'my_reasoning', 'reasoning_source', 'right_reasoning', 'look_alikes', 'look_alike_names_json', 'learning_point', 'retests_json',
-  'next_retest_day', 'anki_note_ids_json', 'held', 'src_hash', 'deleted_at', 'updated_at', 'step'];
+  'next_retest_day', 'anki_note_ids_json', 'held', 'src_hash', 'deleted_at', 'updated_at', 'step', ...['cause', 'cause_quote', 'cause_inferred', 'cause_detail', 'cause_version'], 'cause_disputed'];
+export const MISS_CAUSE_COLS = ['cause', 'cause_quote', 'cause_inferred', 'cause_detail', 'cause_version'];
+/** A judge's cause fields as miss columns, or {} when it named none (so a stored cause is never wiped). */
+export function causeCols(x, safe = v => v) {
+  const c = tidyCause(x);
+  if (!c.cause) return {};
+  return { cause: c.cause, cause_quote: safe(c.cause_quote), cause_inferred: c.cause_inferred, cause_detail: safe(c.cause_detail), cause_version: CAUSE_VERSION };
+}
 export const MISS_TOPIC_COLS = ['topic_id', 'category_id', 'queue_id', 'match_status', 'match_method'];
+
+export const MO_FIX_COLS = { cause: MISS_CAUSE_COLS, confidence: ['confidence', 'confidence_source'], his_words: ['his_words', 'his_words_at', 'his_words_src'] };
+export function moFixed(row) {
+  let o = null;
+  try { o = row && row.mo_corrected_json ? JSON.parse(row.mo_corrected_json) : null; } catch { o = null; }
+  return o && typeof o === 'object' && !Array.isArray(o) ? Object.keys(o).filter(k => MO_FIX_COLS[k]) : [];
+}
+export function keepMoFixes(row, existing) {
+  for (const g of moFixed(existing)) for (const c of MO_FIX_COLS[g]) row[c] = existing[c] ?? null;
+  if (existing && existing.mo_corrected_json) row.mo_corrected_json = existing.mo_corrected_json;
+  return row;
+}
 export const STICKY_METHODS = ['claude', 'mo'];
 export const CODE_PLACED = ['alias', 'label'];
 export const wordsChanged = (row, text) => {
@@ -160,7 +225,8 @@ export function nextRetestDay(retests) {
   return due[0] || null;
 }
 const cleanRetests = list => (Array.isArray(list) ? list : []).filter(r => r && isDay(r.due))
-  .map(r => ({ due: r.due, result: r.result == null ? null : retestOutcome(r.result) || String(r.result).slice(0, 20) }));
+  .map(r => ({ due: r.due, result: r.result == null ? null : retestOutcome(r.result) || String(r.result).slice(0, 20),
+    ...(r.result != null && r.done_at != null && r.done_at !== '' ? { done_at: typeof r.done_at === 'number' ? r.done_at : String(r.done_at).slice(0, 40) } : {}) }));
 
 /**
  * An Anki Voice mistake record -> the miss fields it owns (no id, key or topic yet). A whitelist: the two
@@ -182,6 +248,7 @@ export function missFromAnki(rec, now = Date.now()) {
     rule: questionSafe(line(rec.rule)), my_reasoning: stemSafe(line(rec.my_reasoning)), reasoning_source: line(rec.reasoning_source, 20),
     look_alikes: questionSafe(line(rec.look_alikes)), look_alike_names_json: JSON.stringify(lookAlikeNames(rec)), learning_point: questionSafe(line(rec.learning_point)),
     retests_json: JSON.stringify(retests), next_retest_day: nextRetestDay(retests), anki_note_ids_json: JSON.stringify(ids(rec.anki_note_ids)),
+    ...causeCols(rec, v => questionSafe(v)),
   };
 }
 export const ANKI_COPY_COLS = ['anki_mistake_id', 'retests_json', 'anki_note_ids_json'];
@@ -193,6 +260,7 @@ const CONF_PAIR = ['confidence', 'confidence_source'];
 export function confidenceWinner(existing, incoming, from) {
   if (!incoming || incoming.confidence == null || incoming.confidence === '') return null;
   if (!existing || existing.confidence == null || existing.confidence === '') return true;
+  if (existing.confidence_source === 'mo' || moFixed(existing).includes('confidence')) return incoming.confidence_source === 'mo';
   if (from === 'anki') return incoming.confidence_source === 'reported' || existing.confidence_source === 'assumed' || existing.confidence_source == null;
   // The hub's own reading over an Anki row: only where the stored value was assumed.
   if (existing.anki_mistake_id != null) return existing.confidence_source === 'assumed' && incoming.confidence_source != null && incoming.confidence_source !== 'assumed';
@@ -238,7 +306,8 @@ export function fromAnalysis(a, ctx) {
   const confidence = confFromHub(ctx.conf);
   const timeS = Number.isFinite(ctx.secs) && ctx.secs > 0 ? Math.round(ctx.secs) : null;
   const label = hubLabel(ctx.sitting.name, ctx.num, a.q_index, ctx.block.idx);
-  const answer = { result, verdict, confidence, error_type: errorType, flaw_kind: flaw, time_s: timeS, others_pct: null, label, topic, system: systemLine(safe(a.system), 2000) };
+  const answer = { result, verdict, confidence, error_type: errorType, flaw_kind: flaw, time_s: timeS, others_pct: null, label, topic, system: systemLine(safe(a.system), 2000),
+    ...heardOf(a.heard) };
   if (result === 'right') return { miss: null, answer };
   const miss = {
     source: 'hub', source_ref: `block:${ctx.block.id}:q${a.q_index}`, label, qbank: qbankOfSitting(ctx.sitting),
@@ -246,17 +315,34 @@ export function fromAnalysis(a, ctx) {
     result, outcome: null, flaw_kind: flaw, confidence, confidence_source: confidence ? (ctx.confFrom === 'voice' ? 'voice' : 'reported') : null, error_type: errorType,
     time_s: timeS, slow: timeS > SLOW_S ? 1 : 0, time_source: timeS ? 'hub' : null,
     topic_raw: topic, system_raw: answer.system, rule: safe(a.rule), my_reasoning: safe(a.paraphrase), reasoning_source: a.paraphrase ? 'hub' : null,
-    right_reasoning: safe(a.gap), look_alikes: safe(a.look_alike),
+    right_reasoning: safe(a.gap), look_alikes: safe(a.look_alike), ...causeCols(a, safe),
+    // The two judges named different causes and the third look could not settle it (0067): no look-alike counts yet.
+    // A check made with the shared core always says (0 once settled), an older one leaves the column as it is.
+    ...(a.cause_check === 'disputed' && a.cause ? { cause_disputed: 1 } : a.form_version != null ? { cause_disputed: 0 } : {}),
   };
+  if (['recognise', 'distinguish', 'test', 'treat', 'trap'].includes(a.step)) miss.step = a.step;
   return { miss, answer };
+}
+
+export function uworldResultOf(q) {
+  const verdict = (q && q.verdict) || null;
+  let result = q && q.result === 'right' ? 'right' : q && q.result === 'wrong' ? 'wrong' : q && q.result === 'omitted' ? 'omitted' : null;
+  if (verdict === 'wrong') result = 'wrong';
+  if (verdict === 'right_flawed' && result !== 'wrong') result = 'flawed';
+  if (!result && verdict === 'sound') result = 'right';
+  return result;
+}
+
+export function blockComplete(count, questions) {
+  const n = Number(count);
+  if (count == null || !Number.isInteger(n) || n < 1) return 0;
+  const got = new Set((questions || []).filter(q => q && Number.isInteger(q.q) && q.q >= 1 && q.q <= n && uworldResultOf(q)).map(q => q.q));
+  return got.size >= n ? 1 : 0;
 }
 
 export function fromUworld(q, block) {
   const verdict = q.verdict || null;
-  let result = q.result === 'right' ? 'right' : q.result === 'wrong' ? 'wrong' : q.result === 'omitted' ? 'omitted' : null;
-  if (verdict === 'wrong') result = 'wrong';
-  if (verdict === 'right_flawed' && result !== 'wrong') result = 'flawed';
-  if (!result && verdict === 'sound') result = 'right';
+  const result = uworldResultOf(q);
   if (!result) return null;
   const qid = q.uworld_id || null;
   const label = qid ? uwLabel(qid) : `UW ${block.day} Q${q.q}`;
@@ -267,10 +353,11 @@ export function fromUworld(q, block) {
   const flaw = result === 'flawed' && FLAW_KINDS.includes(q.flaw_kind) ? q.flaw_kind : null;
   const outcome = result === 'wrong' || result === 'flawed' ? uworldOutcome({ ...q, result: result === 'flawed' ? 'right' : q.result === 'omitted' ? 'omitted' : 'wrong' }) : null;
   const answer = { result, verdict, confidence, error_type: errorType, flaw_kind: flaw, time_s: timeS, others_pct: Number.isInteger(q.others_pct) ? q.others_pct : null,
-    label, topic: line(q.topic, 80), system: systemLine(q.system, 80), from_block: 1, ...(/_changed_/.test(outcome || '') ? { outcome } : {}) };
+    label, topic: line(q.topic, 80), system: systemLine(q.system, 80), from_block: 1, ...(/_changed_/.test(outcome || '') ? { outcome } : {}),
+    ...(block.mode === 'tutor' ? { tutor: 1 } : {}), ...heardOf(q.heard) };
   if (result !== 'wrong' && result !== 'flawed') return { miss: null, answer };
   const miss = {
-    source: 'uworld', source_ref: `uworld:${block.id}:q${q.q}`, label, qbank: 'uworld', day: block.day, at: dayNoon(block.day) + q.q * 1000,
+    source: 'uworld', source_ref: `uworld:${block.id}:q${q.q}`, label, qbank: 'uworld', day: block.day, at: uworldQuestionAt(block, q),
     uw_qid: qid, uworld_block_id: block.id, uworld_q: q.q, result, error_type: errorType, flaw_kind: flaw, time_s: timeS, slow: timeS > SLOW_S ? 1 : 0,
     others_pct: answer.others_pct, time_source: timeS ? 'uworld' : null, topic_raw: answer.topic, system_raw: answer.system,
     my_reasoning: stemSafe(line(q.note, 300)), reasoning_source: q.note ? 'claude' : null,
@@ -282,6 +369,7 @@ export function fromUworld(q, block) {
   const rule = stemSafe(line(q.rule, 300)), look = stemSafe(line(q.look_alike, 300));
   if (rule) miss.rule = rule;
   if (look) miss.look_alikes = look;
+  Object.assign(miss, causeCols(q, v => stemSafe(v)));
   return { miss, answer };
 }
 
@@ -300,15 +388,35 @@ const EV_FACTS = ['result', 'outcome', 'verdict', 'confidence', 'error_type', 'f
 export const EVIDENCE_COLS = ['user_id', 'obs_key', 'slot', 'topic_id', 'queue_id', 'label_norm', 'category_id', 'kind', 'at', 'day', 'source', 'source_ref',
   'miss_id', 'sitting_id', 'card_id', 'note_id', 'gap_id', 'lesson_id', 'held', ...EV_FACTS, 'detail_json', 'created_by', 'created_at', 'updated_at'];
 
+const heardOf = v => (v === 'partial' || v === 'unclear' ? { heard: v } : {});
+
 export function questionEvidence({ obs_key, answer, at, day, source, source_ref = null, miss_id = null, sitting_id = null, held = 0 }) {
   const detail = { label: answer.label };
+  if (answer.heard) detail.heard = answer.heard;
   if (answer.from_block) detail.from_block = 1;
+  // A tutor-mode block shows the answer after each question (fsrs.js re-exposure).
+  if (answer.tutor) detail.tutor = 1;
   return {
     obs_key, slot: 0, kind: 'question', at, day, source, source_ref, miss_id, sitting_id, held: held ? 1 : 0,
     result: answer.result, outcome: answer.outcome ?? null, verdict: answer.verdict ?? null, confidence: answer.confidence ?? null,
     error_type: answer.error_type ?? null, flaw_kind: answer.flaw_kind ?? null, time_s: answer.time_s ?? null, others_pct: answer.others_pct ?? null,
     detail_json: JSON.stringify(detail),
   };
+}
+
+/**
+ * The miss's judged cause on its own answer's evidence (detail_json.cause), so the right topic's miss counts by cause
+ * (weights.js causeMultOf: a reasoning slip 0.8, a misread 0.3). Only a judged cause is written: one read from the
+ * error type weighs the same as the error type already does. Returns the row (changed in place).
+ */
+export function withCause(ev, miss) {
+  if (!ev || !miss) return ev;
+  const d = (() => { try { return JSON.parse(ev.detail_json || '{}') || {}; } catch { return {}; } })();
+  const cause = CAUSES.includes(miss.cause) ? miss.cause : null;
+  if ((d.cause ?? null) === cause) return ev;
+  if (cause) d.cause = cause; else delete d.cause;
+  ev.detail_json = JSON.stringify(d);
+  return ev;
 }
 
 /** True when a new evidence row changes nothing an existing one says (so the write is skipped). */
@@ -323,7 +431,8 @@ export function sameEvidence(a, b) {
 // A gaps row's source as people read it (gaps.js SOURCE_LABEL keeps the same words). A gap's evidence row
 // is weakness's gapEvidence (weights.js), merged into its card's day with cards.js mergeCardDay.
 export const GAP_SOURCE_LABEL = { chat: 'said to Claude', anki_voice: 'Anki Voice', spoken_cue: 'said aloud while recording', anki_mac: 'Anki review on the Mac',
-  anki_hub: 'Anki review on the hub', anki_phone: 'Anki review on the phone' };
+  anki_hub: 'Anki review on the hub', anki_phone: 'Anki review on the phone', anki_voice_check: 'Anki Voice review, checked',
+  viva: 'said in a viva' };
 
 // ---------------------------------------------------------------- refs
 export function parseRef(ref) {

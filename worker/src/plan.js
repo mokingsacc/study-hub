@@ -1,5 +1,5 @@
 import { HttpError, json, readJson, str, int, uuid, now, londonDay, safeParse } from './util.js';
-import { all, first, run, getSettings, setSetting } from './db.js';
+import { all, first, run, getSettings, setSetting, defaultSettings } from './db.js';
 import { trackHook, isAutoId, SETTINGS_KEY as TRACK_KEY } from './uworld-track.js';
 import { addDays as addDaysIso } from '../../public/js/hub/plan-maths.js';
 
@@ -24,13 +24,13 @@ const ON_UWORLD = 'On UWorld (8 blocks of 20, 30 min each)';
 export const SEED = [
   ext('UWSA 1', '2027-03-29', 'uwsa', { status: 'done', official_score: 238, timing: 'loose' }),
   ext('NBME 10', '2027-05-02', 'nbme'),
-  ext('NBME 11', '2027-05-09', 'nbme'),
-  ext('NBME 12', '2027-05-16', 'nbme'),
-  ext('NBME 13', '2027-05-23', 'nbme'),
-  ext('NBME 14', '2027-05-30', 'nbme', { notes: NOTE_21_NOV }),
+  ext('NBME 11', '2027-05-16', 'nbme'),
+  ext('NBME 12', '2027-05-30', 'nbme', { notes: NOTE_21_NOV }),
+  ext('NBME 13', '2027-06-10', 'nbme'),
+  ext('NBME 14', '2027-06-13', 'nbme'),
   ext('UWSA 2', '2027-06-06', 'uwsa', { external_label: ON_UWORLD, block_size: 20, block_minutes: 30, notes: NOTE_28_NOV }),
   free120(2021, '2027-06-06', NOTE_28_NOV),
-  ext('NBME 15', '2027-06-13', 'nbme'),
+  ext('NBME 15', '2027-06-17', 'nbme'),
   ext('UWSA 3', '2027-06-20', 'uwsa', { external_label: ON_UWORLD, block_size: 20, block_minutes: 30, notes: NOTE_12_DEC }),
   free120(2023, '2027-06-20', NOTE_12_DEC),
   ext('NBME 16', '2027-06-24', 'nbme', { notes: NOTE_16_DEC }),
@@ -41,7 +41,14 @@ export const SEED_V1 = [
   ['Free 120 (2019)', '2027-05-23'], ['NBME 13', '2027-05-30'], ['NBME 14', '2027-06-06'], ['Free 120 (2021)', '2027-06-06'],
   ['UWSA 2', '2027-06-13'], ['NBME 15', '2027-06-20'], ['Free 120 (2023)', '2027-06-20'], ['NBME 16', '2027-06-24'],
 ].map(([name, scheduled_date]) => ({ name, scheduled_date }));
-export const PLAN_VERSION = 3;
+export const PLAN_VERSION = 4;
+
+export const V4_DATES = {
+  'NBME 11': '2027-05-16', 'NBME 12': '2027-05-30', 'UWSA 2': '2027-06-06', 'Free 120 (2021)': '2027-06-06',
+  'NBME 13': '2027-06-10', 'NBME 14': '2027-06-13', 'NBME 15': '2027-06-17', 'UWSA 3': '2027-06-20', 'Free 120 (2023)': '2027-06-20',
+  'NBME 16': '2027-06-24',
+};
+export const V4_UWORLD_FINISH = '2027-06-08';
 const SILENT_FROM = '2027-06-06'; // full practice exams from here suggest confidence only (as hub/util.js)
 
 export const sameName = (a, b) => String(a || '').toLowerCase().replace(/[^a-z0-9]/g, '') === String(b || '').toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -191,8 +198,27 @@ export async function reseedV3(env) {
   return out;
 }
 
+export async function reseedV4(env) {
+  const [sittings, started] = await Promise.all([all(env, 'SELECT * FROM sittings ORDER BY created_at'), startedSet(env)]);
+  const NOT_STARTED = "status = 'scheduled' AND score_pct IS NULL AND official_score IS NULL AND NOT EXISTS (SELECT 1 FROM blocks WHERE blocks.sitting_id = sittings.id)";
+  const out = { updated: 0, settings: 0 };
+  for (const x of sittings) {
+    const name = Object.keys(V4_DATES).find(n => sameName(n, x.name));
+    if (!name || isFixed(x, started) || x.scheduled_date === V4_DATES[name]) continue;
+    const notes = name === 'NBME 12' ? NOTE_21_NOV : (x.notes === NOTE_21_NOV ? null : x.notes);
+    const r = await run(env, `UPDATE sittings SET scheduled_date = ?, notes = ? WHERE id = ? AND ${NOT_STARTED}`, V4_DATES[name], notes, x.id);
+    if (r.meta && r.meta.changes) out.updated++;
+  }
+  await setSetting(env, 'uworld_finish_date', V4_UWORLD_FINISH);
+  const daily = await first(env, "SELECT value FROM settings WHERE key = 'plan_daily'");
+  const d = daily ? safeParse(daily.value, {}) || {} : {};
+  if (Number(d.uworld) !== 80) await setSetting(env, 'plan_daily', { ...defaultSettings().plan_daily, ...d, uworld: 80 });
+  out.settings++;
+  return out;
+}
+
 /**
- * Bring the database to PLAN_VERSION once: reseedV2 from v1, then reseedV3 from v2; skipped when settings.plan_version
+ * Bring the database to PLAN_VERSION once: reseedV2 from v1, reseedV3 from v2, then reseedV4; skipped when settings.plan_version
  * is already current. The version is recorded after the work, so a run cut off half way is finished by the next
  * one. Never throws (the hub must still load).
  */
@@ -203,7 +229,8 @@ export async function ensurePlan(env) {
     if (v >= PLAN_VERSION) return null;
     const r = {};
     if (v < 2) r.v2 = await reseedV2(env);
-    r.v3 = await reseedV3(env);
+    if (v < 3) r.v3 = await reseedV3(env);
+    r.v4 = await reseedV4(env);
     await setSetting(env, 'plan_version', PLAN_VERSION);
     console.log('plan reseed', JSON.stringify(r));
     return r;

@@ -4,6 +4,9 @@ import { ankiCall, AnkiError } from './anki.js';
 import { noteJob } from './job-log.js';
 
 export const MAX_ATTEMPTS = 8;
+/** A row a sender said to wait on is looked at again after this; one waiting longer than WAIT_MAX_MS is skipped. */
+export const WAIT_RETRY_MS = 3600_000, WAIT_MAX_MS = 30 * 86_400_000;
+export const MISS_UNLOGGED = 'That miss is not in the Anki mistake log yet.';
 const SENDING_STALE_MS = 10 * 60_000;
 const backoffMs = attempts => Math.min(6 * 3600_000, 60_000 * 2 ** attempts);
 
@@ -59,7 +62,10 @@ async function sendLinkCard(env, item, payload) {
   const row = await env.DB.prepare('SELECT anki_mistake_id FROM misses WHERE user_id = ? AND id = ?')
     .bind(payload.user || 'mo', String(payload.miss_id)).first();
   if (!row) return { ok: true, skipped: 'The miss is no longer on the hub.' };
-  if (row.anki_mistake_id == null) throw new AnkiError('That miss is not in the Anki mistake log yet; will retry.');
+  if (row.anki_mistake_id == null) {
+    if (now() - Number(item.created_at || 0) >= WAIT_MAX_MS) return { ok: true, skipped: 'The miss never reached the Anki mistake log in 30 days.', gave_up_wait: true };
+    return { wait: MISS_UNLOGGED };
+  }
   const noteIds = (payload.anki_note_ids || []).map(Number).filter(Number.isInteger);
   if (!noteIds.length) return { ok: true, skipped: 'No card note id.' };
   const r = await ankiCall(env, 'update_mistake', { id: Number(row.anki_mistake_id), anki_note_ids: noteIds, remediation: payload.remediation || 'card' }, { timeoutMs: 20_000 });
@@ -94,6 +100,15 @@ async function sendOne(env, item) {
   try {
     if (!sender) throw new AnkiError(`Unknown outbox kind ${item.kind}.`);
     const result = await sender(env, { ...item, attempts: item.attempts }, payload, { ...prev, ambiguous: wasAmbiguous });
+    if (result && result.wait) {
+      // Not yet: back to pending with its attempts as they were, looked at again in an hour.
+      await run(env, "UPDATE outbox SET status = 'pending', last_error = NULL, result_json = ? WHERE id = ?",
+        JSON.stringify({ wait: String(result.wait).slice(0, 200), waiting_since: prev.waiting_since || claimedAt, next_at: claimedAt + WAIT_RETRY_MS, ambiguous: wasAmbiguous }), item.id);
+      return 'waiting';
+    }
+    if (result && result.gave_up_wait) {
+      await noteJob(env, { job: 'outbox', key: `${item.kind}:skip:${londonDay()}`, ref: item.kind, state: 'ok', add: true, counts: { skipped: 1 } });
+    }
     await run(env, "UPDATE outbox SET status = 'done', done_at = ?, result_json = ?, last_error = NULL WHERE id = ?", now(), JSON.stringify(result), item.id);
     return 'sent';
   } catch (e) {
@@ -110,20 +125,22 @@ async function sendOne(env, item) {
 }
 
 export async function flushOutbox(env, { force = false, limit = 25, kinds = null } = {}) {
+  const t = now();
   const only = Array.isArray(kinds) && kinds.length ? JSON.stringify(kinds) : null;
   const rows = await all(env,
-    `SELECT id, kind, status, attempts, result_json, payload_json FROM outbox
+    `SELECT id, kind, status, attempts, result_json, payload_json, created_at FROM outbox
      WHERE status IN ('pending', 'failed', 'sending') AND attempts < ? AND (? IS NULL OR kind IN (SELECT value FROM json_each(?)))
-     ORDER BY created_at, id LIMIT ?`, MAX_ATTEMPTS, only, only, limit);
-  const t = now();
+       AND NOT (? = 0 AND status = 'pending' AND json_extract(result_json, '$.wait') IS NOT NULL AND coalesce(json_extract(result_json, '$.next_at'), 0) > ?)
+     ORDER BY created_at, id LIMIT ?`, MAX_ATTEMPTS, only, only, force ? 1 : 0, t, limit);
   const out = { sent: 0, failed: 0, waiting: 0 };
   for (const item of rows) {
     const prev = safeParse(item.result_json, {}) || {};
     if (item.status === 'sending' && t - (prev.claimed_at || 0) < SENDING_STALE_MS) { out.waiting++; continue; }
-    if (item.status === 'failed' && !force && prev.next_at && prev.next_at > t) { out.waiting++; continue; }
+    if ((item.status === 'failed' || prev.wait) && !force && prev.next_at && prev.next_at > t) { out.waiting++; continue; }
     const r = await sendOne(env, item);
     if (r === 'sent') out.sent++;
     else if (r === 'failed') out.failed++;
+    else if (r === 'waiting') out.waiting++;
   }
   return out;
 }

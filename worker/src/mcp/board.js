@@ -55,20 +55,22 @@ export const BOARD_TOOLS = [
   {
     name: 'board_error_log', title: 'Error log', annotations: readOnly('Error log'), cap: 20000, trim: ['rows:10'],
     moreCall: args => `board_error_log with offset ${(args.offset || 0) + (args.limit || 15)}`,
-    description: 'The Review page\'s error log: misses by system, newest first: label, topic, error type, confidence, slow, card, re-test, band, week. detail: his thinking, look-alikes, learning point.',
+    description: 'Error log: misses by system, newest first: label, topic, error type, confidence, slow, card, band, week. detail: his thinking, look-alikes, learning point.',
     inputSchema: { type: 'object', properties: {
       since_day: DAY, category: { type: 'string', maxLength: 40 }, topic: { type: 'string', maxLength: 120 }, error_type: { type: 'string', enum: ERROR_KEYS },
       confidence: { type: 'string', enum: ['sure', 'lean', 'guess', 'unknown'] }, result: { type: 'string', enum: ['wrong', 'flawed'] }, slow_only: { type: 'boolean' },
-      sure_wrong_only: { type: 'boolean' }, retest_due: { type: 'boolean' }, reviewed: { type: 'boolean' }, query: { type: 'string', maxLength: 80 },
+      sure_wrong_only: { type: 'boolean' }, miss_card_due: { type: 'boolean' }, reviewed: { type: 'boolean' }, query: { type: 'string', maxLength: 80 },
       detail: { type: 'boolean' }, limit: { type: 'integer', minimum: 1, maximum: 40 }, offset: OFFSET }, additionalProperties: false },
+    // miss_card_due was retest_due until 1 Nov 2026; the old name still works.
+    alias: ({ retest_due, ...a }) => (retest_due != null && a.miss_card_due == null ? { ...a, miss_card_due: retest_due } : a),
     run: (env, user, args, ctx) => read('errorLog', env, user, args, ctx),
   },
   {
     name: 'board_tallies', title: 'Topic tally', annotations: readOnly('Topic tally'), cap: 15000, trim: ['units:10', 'rows:10'],
     moreCall: args => `board_tallies with offset ${(args.offset || 0) + (args.limit || 30)}`,
-    description: 'Review page. topics: missed units, lane, rank, band. high_yield: unstudied since missed. calibration: right % by confidence, system, week.',
+    description: 'topics: missed units, lane, rank, band. high_yield: unstudied misses. calibration: sure/lean/guess. forecast: honesty. integrity: data checks.',
     inputSchema: { type: 'object', properties: {
-      kind: { type: 'string', enum: ['topics', 'high_yield', 'calibration'] }, group: { type: 'string', enum: ['checklist', 'category'] },
+      kind: { type: 'string', enum: ['topics', 'high_yield', 'calibration', 'forecast', 'integrity'] }, group: { type: 'string', enum: ['checklist', 'category'] },
       sort: { type: 'string', enum: [...TALLY_ORDERS, ...YIELD_ORDERS] }, since_day: DAY,
       category: { type: 'string', maxLength: 40 }, lane: { type: 'string', enum: LANES }, include_studied: { type: 'boolean' },
       limit: { type: 'integer', minimum: 1, maximum: 60 }, offset: OFFSET }, additionalProperties: false },
@@ -77,7 +79,7 @@ export const BOARD_TOOLS = [
   {
     name: 'board_checklist', title: 'Master checklist', annotations: readOnly('Master checklist'), cap: 15000, trim: ['units:10'],
     moreCall: args => `board_checklist with offset ${(args.offset || 0) + (args.limit || 40)}`,
-    description: 'His Master Checklist: done by lane, each unit\'s five steps, Mehlman rank, misses, band.',
+    description: 'Master Checklist: done by lane, each unit\'s five steps, Mehlman rank, misses, band.',
     inputSchema: { type: 'object', properties: {
       lane: { type: 'string', enum: LANES }, category: { type: 'string', maxLength: 40 }, system: { type: 'string', maxLength: 60 },
       filter: { type: 'string', enum: CHECK_FILTERS }, unit: { type: 'string', maxLength: 40 },

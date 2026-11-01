@@ -1,5 +1,6 @@
 import { LINK_TYPES, TYPE_NAMES, MIXED_UP, FLAGS } from '../../../public/js/shared/link-rank.js';
 import { VERSUS } from '../checks.js';
+import { causeOf, confusionShown } from '../../../public/js/shared/cause.js';
 
 export { LINK_TYPES, TYPE_NAMES, MIXED_UP, FLAGS };
 export const DAY_MS = 86_400_000;
@@ -286,34 +287,9 @@ export function lookAlikeNames(miss) {
   return out;
 }
 
-const PICK = /\b(?:picked|pick|chose|choose|went with|go with|going with|switched to|switch to|called it|thought|put)\b/i;
-const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-export function roleOf(reasoning, names) {
-  const text = lc(reasoning);
-  if (!text) return null;
-  let found = false;
-  for (const n of names || []) {
-    const name = lc(n).trim();
-    if (name.length < 3) continue;
-    const re = new RegExp(`(^|[^a-z0-9])${esc(name)}(?=$|[^a-z0-9])`, 'g');
-    let m;
-    while ((m = re.exec(text))) {
-      found = true;
-      const at = m.index + m[1].length;
-      const win = text.slice(Math.max(0, at - 60), Math.min(text.length, at + name.length + 60));
-      if (PICK.test(win)) return 'picked';
-    }
-  }
-  return found ? 'considered' : null;
-}
-
-/** The role of look-alike B on a miss: picked > title > considered > classic (largest cw wins). */
 export function lookAlikeRole(miss, from, aliases) {
-  const r = roleOf(miss.my_reasoning, aliases);
-  if (r === 'picked') return 'picked';
-  if (from === 'title') return 'title';
-  return r || 'classic';
+  if (!confusionShown(causeOf(miss), aliases)) return 'classic';
+  return from === 'title' ? 'title' : 'picked';
 }
 
 // ------------------------------------------------------------------ gaps (v1.5)
@@ -407,12 +383,12 @@ export const confusion100 = c => Math.round(Math.min(Math.max(c || 0, 0), 2.55) 
 
 /** The links part of map_rules, generated from LINK_TYPES, W and CW so it never drifts from the code. */
 export function linkRules() {
-  const types = Object.entries(LINK_TYPES).map(([t, s]) => `${t} (${s.directed ? 'directed' : 'undirected'}${s.hows ? `; how: ${s.hows.join(', ')}` : ''})`);
+  const types = Object.entries(LINK_TYPES).map(([t, s]) => `${t} (${s.directed ? 'directed' : 'undirected'}${s.hows ? `; how: ${s.hows.filter(h => h !== 'underlies').join(', ')}` : ''})`);
   return [
     `Link types: ${types.join('; ')}. Same mechanism, shared buzzwords and next-step chains are not links.`,
     'A versus pair is "mixed up" while its confusion is 0.5 or more; code computes strength and confusion, nobody sets them.',
     `Strength = 1 − Π(1 − w): Mo ${W.mo}, AnKing HY title ${W.anking_hy}, Claude ${W.claude}, Anki log ${W.anki_log} (classic ${W.anki_log_classic}), hub analysis ${W.hub_analysis}.`,
-    `Confusion adds per mix-up: picked and sure +${CW.picked_sure}, picked +${CW.picked}, stated gap +${CW.gap_stated}, "A vs B" title +${CW.title}, considered +${CW.considered}; a flawed right answer counts half; misreads and test-taking slips add none. It halves every 21 days.`,
+    `Only a confusion (the miss's cause) adds: picked and sure +${CW.picked_sure}, picked +${CW.picked}, stated gap +${CW.gap_stated}, "A vs B" title +${CW.title}; a flawed right answer half. It halves every 21 days.`,
     `Pair test (4 cases, order drawn by code): wrong +${CW.test_wrong} each (at most +${CW.test_wrong_max}); right ${CW.test_right_same_day} on the day of the mix-up or lesson, ${CW.test_right_later} on a later day, so only delayed proof clears a pair. Pair lesson landed ${CW.lesson_landed}, partial ${CW.lesson_partial}, not landed +${CW.lesson_not_landed}.`,
     'map_add_link resolves names at 0.9 or more only, never creates a topic, and for versus takes the fact as "<finding>, so <what you do differently>". A link Mo removed stays removed unless he asks (restore: true). Removing over 5 links asks Mo.',
   ].join('\n');

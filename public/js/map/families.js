@@ -3,6 +3,9 @@ import { familySectors } from './donut.js';
 const NS = 'http://www.w3.org/2000/svg';
 export const RIM_PX = 9, LABEL_PX = 16;   // the arc just outside the outer ring, the name beyond it (screen px)
 export const NAMES_UNTIL = 1.6;
+export const MOON_PX = 42, MOON_PX_NARROW = 34;   // a phone's beads are smaller (orbits/main.js br 11)
+export const moonPx = (narrow = false) => (narrow ? MOON_PX_NARROW : MOON_PX);
+export const arcRadiusPx = (sec, k, narrow = false) => sec.r1 * k + moonPx(narrow) + RIM_PX;
 
 /** An arc of radius r from a0 to a1 round (cx, cy). Pure. */
 export function arcPath(cx, cy, r, a0, a1) {
@@ -26,13 +29,18 @@ export function labelPlace(mid) {
   return { anchor: c > 0.35 ? 'start' : c < -0.35 ? 'end' : 'middle', baseline: s > 0.3 ? 'hanging' : s < -0.3 ? 'alphabetic' : 'middle' };
 }
 
+export const RING_NAME_PX = 5;
+export const ORB_MIN_PX = 16, ORB_MIN_PX_UPRIGHT = 13;   // a phone's rows: smaller, so the donut keeps its size
+/** The room round a foundation galaxy on screen: its dots' reach (world R at zoom k) plus a little, never under the minimum. */
+export const orbPx = (R, k, upright = false) => Math.max(R * k + 4, upright ? ORB_MIN_PX_UPRIGHT : ORB_MIN_PX);
+
 export function createFamilies(root) {
   const svg = document.createElementNS(NS, 'svg');
   svg.setAttribute('class', 'map-families');
   svg.setAttribute('aria-hidden', 'true');
   const sky = root.querySelector('.map-sky');
   if (sky) sky.after(svg); else root.prepend(svg);
-  let key = '', sec = null, secFor = null, els = [], boxes = [], hole = null;
+  let key = '', sec = null, secFor = null, els = [], boxes = [], hole = null, rim = null;
 
   function build(list) {
     svg.textContent = '';
@@ -51,28 +59,31 @@ export function createFamilies(root) {
    * Draws the wedges for the model as the camera shows it: cam {k, x, y} (screen = x + k · world). show: false hides
    * them (an older layout, the first arrange, a spot). moved: the stars moved since the last call (a glide).
    */
-  function update(model, cam, { show = true, moved = false, dim = false, view = null, ratio = 1 } = {}) {
-    if (!show || !model || !cam) { if (!svg.hidden) svg.setAttribute('hidden', ''); key = ''; boxes = []; hole = null; return; }
+  function update(model, cam, { show = true, moved = false, dim = false, view = null, ratio = 1, upright = false } = {}) {
+    if (!show || !model || !cam) { if (!svg.hidden) svg.setAttribute('hidden', ''); key = ''; boxes = []; hole = null; rim = null; return; }
     if (moved || secFor !== model) { sec = familySectors(model); secFor = model; key = ''; if (sec) { const ids = sec.sectors.map(s => s.id).join(); if (ids !== svg.dataset.ids) { build(sec.sectors); svg.dataset.ids = ids; } } }
-    if (!sec) { svg.setAttribute('hidden', ''); boxes = []; hole = null; return; }
+    if (!sec) { svg.setAttribute('hidden', ''); boxes = []; hole = null; rim = null; return; }
     svg.removeAttribute('hidden');
     svg.classList.toggle('is-dim', !!dim);
     const close = ratio > NAMES_UNTIL;
     svg.classList.toggle('is-close', close);
     const narrow = !!view && view.w < 640;
-    const k2 = `${cam.k.toFixed(5)}|${cam.x.toFixed(1)}|${cam.y.toFixed(1)}|${els.length}|${view ? `${view.w}x${view.h}` : ''}|${close ? 1 : 0}`;
+    const k2 = `${cam.k.toFixed(5)}|${cam.x.toFixed(1)}|${cam.y.toFixed(1)}|${els.length}|${view ? `${view.w}x${view.h}` : ''}|${close ? 1 : 0}|${upright ? 1 : 0}`;
     if (k2 === key) return;
     key = k2;
     const cx = cam.x + cam.k * sec.cx, cy = cam.y + cam.k * sec.cy;
-    const r1 = sec.r1 * cam.k + 4;
     hole = sec.r0 > 0 ? { x: cx, y: cy, r: sec.r0 * cam.k } : null;
+    // the arcs' circle less half their stroke: no moon crosses it (orbits/layout.js placeAll)
+    rim = { x: cx, y: cy, r: arcRadiusPx(sec, cam.k, narrow) - 1.5 };
     boxes = [];
     sec.sectors.forEach((s, q) => {
       const e = els[q];
       if (!e) return;
-      // exactly over the family's wedge (v7: the hull of its galaxies, so every one of them sits under its own arc)
-      e.arc.setAttribute('d', arcPath(cx, cy, r1 + RIM_PX, s.a0, s.a1));
-      const mid = (s.a0 + s.a1) / 2, L = labelPlace(mid), rl = r1 + RIM_PX + LABEL_PX;
+      // exactly over the family's wedge (v7: the hull of its galaxies, so every one of them sits under its own arc),
+      // every arc on one circle round the whole donut, past every galaxy and its moons (arcRadiusPx)
+      const ra = arcRadiusPx(sec, cam.k, narrow);
+      e.arc.setAttribute('d', arcPath(cx, cy, ra, s.a0, s.a1));
+      const mid = (s.a0 + s.a1) / 2, L = labelPlace(mid), rl = ra + LABEL_PX;
       // the name's lines (two on a narrow screen when it is long), stacked away from the arc
       const lines = nameLines(e.name, narrow);
       if (lines.join('|') !== e.lines) {
@@ -108,6 +119,8 @@ export function createFamilies(root) {
     /** The donut's empty middle on screen as last drawn, {x, y, r} in canvas px (null when no donut is shown): no
      *  bead and no topic name goes into it. */
     get hole() { return hole; },
+    /** The family arcs' circle on screen as last drawn, {x, y, r} in canvas px (null when none): no moon crosses it. */
+    get rim() { return rim; },
     destroy() { svg.remove(); },
   };
 }

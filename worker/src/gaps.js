@@ -1,9 +1,9 @@
 import { HttpError, json, readJson, now, londonDay, uuid } from './util.js';
-import { all } from './db.js';
+import { all, first } from './db.js';
 import { normError, leaks } from './checks.js';
 import { MO } from './users.js';
-import { gapOrigin, GAP_SOURCE_LABEL, CHECK_SOURCES } from './map/ingest/map-fields.js';
-import { ingestGaps } from './map/ingest/gaps.js';
+import { gapOrigin, GAP_SOURCE_LABEL, CHECK_SOURCES, isBoilerplate } from './map/ingest/map-fields.js';
+import { ingestGaps, retractReview } from './map/ingest/gaps.js';
 import { hook } from './map/ingest/hub.js';
 import { looksLikeQuestionText, gapSafe, cueOwnLooksLikeStem, cueFollowOk, leakIndexFor, scrubStemSentences, READ_QUESTION } from './map/guard.js';
 import { leanPairs } from '../../public/js/conf-words.js';
@@ -37,6 +37,8 @@ export function cleanGap(g) {
   };
   const source = g && g.source != null ? String(g.source) : 'chat';
   if (!SOURCES.includes(source)) problems.push(`source must be one of ${SOURCES.join(', ')}.`);
+  const retract = g && g.retract === true;
+  const wordless = retract || (source === 'anki_voice' && g && g.fallback === true && g.card_id != null && g.card_id !== '');
   const verdict = g && g.verdict != null ? String(g.verdict) : 'gap';
   if (!GAP_VERDICTS.includes(verdict)) problems.push('verdict must be gap or shaky.');
   const pick = (k, allowed) => {
@@ -47,11 +49,19 @@ export function cleanGap(g) {
     return s;
   };
   const gap = {
-    gap: text('gap', GAP_MAX, true), said: text('said', SAID_MAX), topic: text('topic', TOPIC_MAX), ref: text('ref', REF_MAX),
+    gap: text('gap', GAP_MAX, !wordless), said: text('said', SAID_MAX), topic: text('topic', TOPIC_MAX), ref: text('ref', REF_MAX),
     card_id: id('card_id'), note_id: id('note_id'), error_type: normError(g && g.error_type), source, verdict,
     mixed_with: text('mixed_with', TOPIC_MAX), step: pick('step', GAP_STEPS), confidence: pick('confidence', GAP_CONFIDENCE),
+    // at: when the rating happened (epoch ms, the Anki review id); review_id: that rating's Anki review-log id.
+    at: id('at'), review_id: id('review_id'),
   };
+  if (retract) {
+    gap.retract = true;
+    if (!gap.card_id || !gap.review_id) problems.push('A retract needs card_id and review_id.');
+  }
   if (gap.mixed_with && gap.topic && gap.mixed_with.toLowerCase() === gap.topic.toLowerCase()) gap.mixed_with = null;
+  if (gap.said && isBoilerplate(gap.said)) gap.said = null;
+  if (gap.gap && source === 'anki_voice' && gap.card_id && isBoilerplate(gap.gap)) gap.gap = null;
   return { gap, problems };
 }
 
@@ -76,7 +86,7 @@ export async function refLeakProblem(env, user, gap) {
 
 // The map's gaps columns (migration 0010) and the step and confidence columns (0035): probed per database and kept
 // once found, so a hub without them still saves gaps (a miss is checked again after a minute).
-const probes = { map: new WeakMap(), signals: new WeakMap() };
+const probes = { map: new WeakMap(), signals: new WeakMap(), review: new WeakMap(), forms: new WeakMap() };
 async function hasCols(env, kind, sql) {
   const c = probes[kind].get(env.DB);
   if (c && (c.ok || Date.now() - c.at < 60_000)) return c.ok;
@@ -86,17 +96,22 @@ async function hasCols(env, kind, sql) {
 }
 export const hasMapCols = env => hasCols(env, 'map', 'SELECT held, map_state FROM gaps LIMIT 0');
 export const hasSignalCols = env => hasCols(env, 'signals', 'SELECT step, confidence FROM gaps LIMIT 0');
+export const hasFormCols = env => hasCols(env, 'forms', 'SELECT review_id, cause, heard, form_version FROM gaps LIMIT 0');
+export const hasReviewCol = env => { const f = probes.forms.get(env.DB); return f && f.ok ? Promise.resolve(true) : hasCols(env, 'review', 'SELECT review_id FROM gaps LIMIT 0'); };
+const FORM_COLS = ['cause', 'cause_quote', 'cause_inferred', 'cause_detail', 'heard', 'form_version'];
 
 const COLS = ['id', 'at', 'day', 'source', 'card_id', 'note_id', 'ref', 'topic', 'gap', 'said', 'error_type', 'verdict', 'created_at'];
 const UPDATE = ['at', 'day', 'card_id', 'note_id', 'ref', 'topic', 'gap', 'said', 'error_type', 'verdict'];
+const COALESCE = ['card_id', 'note_id', 'ref', 'topic', 'gap', 'said', 'error_type', 'mixed_with', 'step', 'confidence', 'review_id'];
 /**
  * The gaps row for one checked gap, as {row, statement}. A re-save of the same id replaces it and maps it again
  * (map_state back to NULL). hold: {sitting_id} writes the row held (a hub sitting not finished), with map: true
- * when the database has the map's columns.
+ * when the database has the map's columns. coalesce: a re-save fills empty fields and never empties a stored one
+ * (with keep, it only fills them: the stored words win); keepAt: a stored row keeps its time (no event time came).
  */
-export function gapStatement(env, g, { id = null, at = now(), hold = null, map = false, signals = false, keep = false } = {}) {
+export function gapStatement(env, g, { id = null, at = now(), hold = null, map = false, signals = false, keep = false, coalesce = false, keepAt = false, review = false, forms = false } = {}) {
   const row = { id: id || `${g.source}:${uuid()}`, at, day: londonDay(at), source: g.source, card_id: g.card_id ?? null, note_id: g.note_id ?? null,
-    ref: g.ref ?? null, topic: g.topic ?? null, gap: g.gap, said: g.said ?? null, error_type: g.error_type ?? null, verdict: g.verdict || 'gap', created_at: now() };
+    ref: g.ref ?? null, topic: g.topic ?? null, gap: g.gap ?? '', said: g.said ?? null, error_type: g.error_type ?? null, verdict: g.verdict || 'gap', created_at: now() };
   const cols = [...COLS], upd = [...UPDATE];
   if (map) {
     Object.assign(row, { origin: gapOrigin(g), held: hold ? 1 : 0, sitting_id: hold ? hold.sitting_id : null, map_state: null, topic_id: null });
@@ -109,9 +124,20 @@ export function gapStatement(env, g, { id = null, at = now(), hold = null, map =
     Object.assign(row, { step: g.step ?? null, confidence: g.confidence ?? null });
     cols.push('step', 'confidence'); upd.push('step', 'confidence');
   }
-  // keep: a row already saved under this id stays as it is (the Anki Voice server's own note never replaces Claude's).
+  if (review) { row.review_id = g.review_id ?? null; cols.push('review_id'); upd.push('review_id'); }
+  // The answer forms (0067): written only by a form that gave them, so a note without them never empties a stored one.
+  if (forms) for (const c of FORM_COLS) if (g[c] !== undefined) { row[c] = g[c] ?? null; cols.push(c); upd.push(c); }
+  // Without coalesce, keep: a row already saved under this id stays as it is (the Anki Voice server's own note never
+  // replaces Claude's).
+  const set = c => {
+    if (!coalesce) return `${c} = excluded.${c}`;
+    if (c === 'at' || c === 'day') return keepAt ? `${c} = gaps.${c}` : `${c} = excluded.${c}`;
+    if (c === 'verdict' || c === 'origin') return keep ? `${c} = coalesce(gaps.${c}, excluded.${c})` : `${c} = excluded.${c}`;
+    if (!COALESCE.includes(c)) return `${c} = excluded.${c}`;
+    return keep ? `${c} = coalesce(nullif(gaps.${c}, ''), excluded.${c})` : `${c} = coalesce(nullif(excluded.${c}, ''), gaps.${c})`;
+  };
   const statement = env.DB.prepare(`INSERT INTO gaps (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})
-    ON CONFLICT(id) DO ${keep ? 'NOTHING' : `UPDATE SET ${upd.map(c => `${c} = excluded.${c}`).join(', ')}`}`).bind(...cols.map(c => row[c]));
+    ON CONFLICT(id) DO ${keep && !coalesce ? 'NOTHING' : `UPDATE SET ${upd.map(set).join(', ')}`}`).bind(...cols.map(c => row[c]));
   return { row, statement };
 }
 
@@ -122,33 +148,68 @@ export async function mapGaps(env, rows, { user = MO } = {}) {
 }
 
 // One Anki Voice card's gap a day has one id, so Claude's log_gap and the Anki Voice server's own note on the same
-// miss (rate_card forwards wrong or nudged parts itself) are one row, not two.
+// miss (rate_card forwards wrong or nudged parts itself) are one row, not two. The day is the rating's (the note's
+// `at`), so a note sent after midnight still joins its card's review.
 export const voiceGapId = (cardId, at) => `anki_voice:${cardId}:${londonDay(at)}`;
+// The other note on the same rating lands within minutes (Claude's log_gap in the same turn as rate_card, the server's
+// note as it rates); this window finds it even across midnight.
+export const VOICE_NOTE_WINDOW_MS = 6 * 3600_000;
+const SANE_PAST_MS = 7 * 86_400_000;
+
+/** The note's event time (`at`, epoch ms) when it is sane: not ahead of now, not older than 7 days. Else null. */
+export function noteAt(g, t = now()) {
+  const a = Number(g && g.at);
+  return Number.isSafeInteger(a) && a <= t + 60_000 && a >= t - SANE_PAST_MS ? Math.min(a, t) : null;
+}
 
 /**
  * Save one checked gap, then put it on the map. id: a fixed id makes a re-save replace the row instead of adding
- * another. keep: when a row with that id is already saved, leave it (and the map) alone.
+ * another. keep: when a row with that id is already saved, only its empty fields are filled (its words win).
+ * An Anki Voice note on a card joins the other note on the same rating; a later note never empties a stored field.
  */
 export async function addGap(env, g, { id = null, at = now(), user = MO, keep = false } = {}) {
-  const [map, signals] = await Promise.all([hasMapCols(env), hasSignalCols(env)]);
-  const gid = id || (g.source === 'anki_voice' && g.card_id ? voiceGapId(g.card_id, at) : null);
-  const { row, statement } = gapStatement(env, g, { id: gid, at, map, signals, keep });
-  const r = await statement.run();
-  if (keep && r && r.meta && r.meta.changes === 0) return row.id;
-  if (map) await mapGaps(env, [row], { user });
+  const [map, signals, review] = await Promise.all([hasMapCols(env), hasSignalCols(env), hasReviewCol(env)]);
+  const real = noteAt(g, at);
+  const when = real ?? at;
+  let gid = id;
+  // One gap per card and rating (wave 2 B.4): a note naming the rating's review id joins the row already made for it.
+  if (!gid && review && g.card_id && g.review_id) {
+    const same = await first(env, 'SELECT id, source FROM gaps WHERE user_id = ? AND card_id = ? AND review_id = ? ORDER BY at LIMIT 1', user, g.card_id, g.review_id).catch(() => null);
+    if (same) gid = same.id;
+    // The hub's check of that Anki Voice rating came first (wave 2 F): its words win; a late note only fills its gaps.
+    if (same && CHECK_SOURCES.includes(same.source)) keep = true;
+  }
+  if (!gid && g.source === 'anki_voice' && g.card_id) {
+    const near = await first(env, `SELECT id FROM gaps WHERE user_id = ? AND source = 'anki_voice' AND card_id = ? AND at BETWEEN ? AND ?
+        ORDER BY abs(at - ?) LIMIT 1`, user, g.card_id, when - VOICE_NOTE_WINDOW_MS, when + VOICE_NOTE_WINDOW_MS, when).catch(() => null);
+    gid = near ? near.id : voiceGapId(g.card_id, when);
+  }
+  const { row, statement } = gapStatement(env, g, { id: gid, at: when, map, signals, keep, review, coalesce: true, keepAt: real == null });
+  await statement.run();
+  if (!map) return row.id;
+  // The row as stored (the other note's fields kept), so the map places what is saved, not this note's empty fields;
+  // a fresh id (no fixed id, not a card's) is new, so it is the row itself.
+  const stored = gid ? await first(env, 'SELECT * FROM gaps WHERE id = ?', row.id).catch(() => null) : null;
+  await mapGaps(env, [stored || row], { user });
   return row.id;
 }
 
-// POST /api/gaps {gap, said?, topic?, card_id?, note_id?, ref?, source?, error_type?, mixed_with?, step?, confidence?,
-// origin?, fallback?}: one gap from a client. fallback: true (the Anki Voice server's own note on a missed part) never
-// replaces a gap Claude already logged for that card today.
 export async function post(request, env) {
   const body = await readJson(request, 20_000);
   const { gap, problems } = cleanGap(body);
   if (problems.length) throw new HttpError(400, problems[0]);
+  if (gap.retract) {
+    const r = await retractReview(env, MO, { card_id: gap.card_id, review_id: gap.review_id });
+    return json({ retracted: true, ...r });
+  }
   const leak = await refLeakProblem(env, MO, gap);
   if (leak) throw new HttpError(400, leak);
   if (body && ['stated', 'review'].includes(body.origin)) gap.origin = body.origin;
+  if (body && body.fallback === true && gap.source === 'anki_voice' && gap.card_id) {
+    const had = await first(env, `SELECT id FROM gaps WHERE user_id = ? AND card_id = ? AND day = ? AND source IN (${CHECK_SOURCES.map(() => '?').join(', ')}) LIMIT 1`,
+      MO, gap.card_id, londonDay(noteAt(gap) ?? now()), ...CHECK_SOURCES).catch(() => null);
+    if (had) return json({ saved: false, deduped: true, id: had.id });
+  }
   const id = await addGap(env, gap, { keep: body && body.fallback === true });
   return json({ saved: true, id });
 }
@@ -270,7 +331,7 @@ export { gapOrigin };
 
 export function gapsText(r) {
   if (!r.gaps.length) return `No gaps logged in the last ${r.days} days.`;
-  const line = g => `${g.day} (${SOURCE_LABEL[g.source] || g.source}${g.verdict === 'shaky' ? ', shaky' : ''}${g.card_id ? `, card ${g.card_id}` : ''}${g.ref ? `, ${g.ref}` : ''}): ${g.topic ? `[${g.topic}] ` : ''}${g.gap}${g.said ? ` — he said: "${g.said}"` : ''}${g.step ? ` (broke at: ${g.step}${g.mixed_with ? `, mixed up with ${g.mixed_with}` : ''})` : g.mixed_with ? ` (mixed up with ${g.mixed_with})` : ''}`;
+  const line = g => `${g.day} (${SOURCE_LABEL[g.source] || g.source}${g.verdict === 'shaky' ? ', shaky' : ''}${g.card_id ? `, card ${g.card_id}` : ''}${g.ref ? `, ${g.ref}` : ''}): ${g.topic ? `[${g.topic}] ` : ''}${g.gap || '(no words)'}${g.said ? ` — he said: "${g.said}"` : ''}${g.step ? ` (broke at: ${g.step}${g.mixed_with ? `, mixed up with ${g.mixed_with}` : ''})` : g.mixed_with ? ` (mixed up with ${g.mixed_with})` : ''}`;
   return [`${r.gaps.length} gap${r.gaps.length === 1 ? '' : 's'} in the last ${r.days} days, newest first. Gaps Mo stated himself (said to Claude, said aloud) matter most.`,
     ...r.gaps.map(line),
     r.topics.length ? `\nTopics with more than one gap: ${r.topics.filter(t => t.n > 1).map(t => `${t.topic} (${t.n})`).join('; ') || 'none'}.` : ''].join('\n').trim();

@@ -5,6 +5,7 @@ import { restoreRow } from './undo.js';
 import { norm } from '../../../public/js/shared/names.js';
 import { getPrefs } from '../users.js';
 import { phaseFor, daysLeft } from './teach-priority.js';
+import { readExamDay } from '../exam-day.js';
 
 export const SCOPES = ['global', 'category', 'topic', 'kind', 'surface'];
 export const TACTIC_VOCAB = ['analogy', 'picture', 'mnemonic', 'contrast_pair', 'mechanism_first', 'worked_example', 'socratic', 'rule_then_cases'];
@@ -40,6 +41,50 @@ export const quotesMo = text => /["“‘'][^"”’']{3,}["”’']/.test(Strin
 // The event kind for misconception rows: realtime's own once it lists one, else the teaching-memory kind.
 export const miscKind = () => (EVENT_KINDS.includes('misconception.saved') ? 'misconception.saved' : 'teach_memory.saved');
 
+export const CORRECTION_PREFIX = 'Correction:';
+export const CORRECTION_MAX = 300, CORRECTION_PARTS = { right: 140, wrong: 90, source: 40 }, CORRECTIONS_PER_SAVE = 3, BRIEF_CORRECTIONS = 5;
+export const isCorrection = r => !!r && r.tactic === 'other' && /^correction:/i.test(String(r.note || '').trim());
+const clip = s => String(s || '').replace(/\s+/g, ' ').trim().replace(/[.\s]+$/, '');
+/** "Correction: <right>. Not: <wrong>. (<source>)" from {right, wrong, source} (pure); a missing source reads as not checked. */
+export function correctionNote({ right, wrong, source } = {}) {
+  const src = clip(source) || 'from memory, not checked';
+  return `${CORRECTION_PREFIX} ${clip(right)}. Not: ${clip(wrong)}. (${src})`.slice(0, CORRECTION_MAX);
+}
+/** {right, wrong, source} from a correction note (pure); a note written by hand without "Not:" keeps all its text as right. */
+export function parseCorrection(note) {
+  let t = String(note || '').trim().replace(/^correction:\s*/i, '');
+  let source = null;
+  const m = /\(([^()]{1,60})\)\s*\.?$/.exec(t);
+  if (m) { source = m[1].trim(); t = t.slice(0, m.index).trim(); }
+  const parts = t.split(/\s*\bNot:\s*/i);
+  return { right: clip(parts[0]) || null, wrong: parts.length > 1 ? clip(parts.slice(1).join(' ')) || null : null, source };
+}
+/** One correction's fields, checked (pure); {fix} names the one thing to change. */
+export function checkCorrection(c, where = 'corrections') {
+  if (!isObj(c)) return { fix: `${where} entries are {wrong, right, source}.` };
+  const bad = Object.keys(c).find(k => !['wrong', 'right', 'source'].includes(k));
+  if (bad) return { fix: `${where} has no field ${bad}: send {wrong, right, source}.` };
+  for (const k of ['wrong', 'right']) if (typeof c[k] !== 'string' || !c[k].trim()) return { fix: `${where}.${k} is needed: ${k === 'wrong' ? 'what you said that was wrong' : 'the correct line'}, in one short sentence.` };
+  for (const [k, n] of Object.entries(CORRECTION_PARTS)) if (c[k] != null && (typeof c[k] !== 'string' || c[k].length > n)) return { fix: `${where}.${k} is text of at most ${n} characters. Say it shorter.` };
+  return null;
+}
+/**
+ * The brief's corrections (pure): the live correction notes on the given topics, newest first, at most max, each one
+ * line "Do not repeat: <wrong>. Say: <right> (<source>)." with the topic's name first when it is not the lesson's own.
+ * topics: [{id, name, own?}].
+ */
+export function briefCorrections(rows, topics, max = BRIEF_CORRECTIONS) {
+  const byId = new Map((topics || []).filter(t => t && t.id).map(t => [t.id, t]));
+  if (!byId.size) return [];
+  return (rows || []).filter(r => (r.status === 'active' || r.status === 'pinned') && r.scope === 'topic' && byId.has(r.scope_ref) && isCorrection(r))
+    .sort((a, b) => (b.created_at || 0) - (a.created_at || 0)).slice(0, max)
+    .map(r => {
+      const c = parseCorrection(r.note), t = byId.get(r.scope_ref);
+      const line = `${c.wrong ? `Do not repeat: ${c.wrong}. Say: ` : 'Say: '}${c.right}${c.source ? ` (${c.source})` : ''}.`;
+      return t.own ? line : `${t.name || t.id}: ${line}`;
+    });
+}
+
 const byScore = (a, b) => (b.score ?? 0.5) - (a.score ?? 0.5) || (b.updated_at || 0) - (a.updated_at || 0);
 export const scoreOf = (wins, losses) => round3((1 + wins) / (2 + wins + losses));
 
@@ -51,7 +96,8 @@ export const scoreOf = (wins, losses) => round3((1 + wins) / (2 + wins + losses)
  * and 1,600 characters of note text. at: {topic_id, category_id, kind, surface}.
  */
 export function selectMemory(rows, at = {}) {
-  const live = rows.filter(r => r.status === 'active' || r.status === 'pinned');
+  // Corrections go up front in the brief's own field (briefCorrections), never among the notes.
+  const live = rows.filter(r => (r.status === 'active' || r.status === 'pinned') && !isCorrection(r));
   const groups = [
     live.filter(r => r.status === 'pinned').sort(byScore).slice(0, MEMORY_MAX.pinned),
     live.filter(r => r.status !== 'pinned' && r.scope === 'topic' && at.topic_id && r.scope_ref === at.topic_id),
@@ -125,7 +171,8 @@ export function checkNote(n, { partial = false } = {}) {
   if ((!partial || n.tactic != null) && !TACTICS.includes(n.tactic)) return { fix: `tactic is one of ${TACTICS.join(', ')}.` };
   if (!partial || n.note != null) {
     if (typeof n.note !== 'string' || !n.note.trim()) return { fix: 'note is the teaching note in one line.' };
-    if (n.note.length > NOTE_MAX) return { fix: `note is ${n.note.length} characters; the limit is ${NOTE_MAX}. Say it shorter.` };
+    const max = isCorrection({ tactic: n.tactic ?? 'other', note: n.note }) ? CORRECTION_MAX : NOTE_MAX;
+    if (n.note.length > max) return { fix: `note is ${n.note.length} characters; the limit is ${max}. Say it shorter.` };
   }
   return null;
 }
@@ -200,11 +247,13 @@ export async function planMemorySave(env, user, args, ctx) {
     const twin = (await memoryRows(env, user)).find(n => n.scope === args.scope && (n.scope_ref ?? null) === ref && similar(n.note, args.note));
     if (twin && !(status === 'pinned' && twin.status !== 'pinned')) return { noop: true, summary: `That note is already there (${twin.id}).` };
     const id = newId();
+    const corr = isCorrection(args);
     const after = { scope: args.scope, scope_ref: ref, tactic: args.tactic, note: args.note.trim(), status,
-      uses: 0, wins: 0, losses: 0, evidence_json: JSON.stringify([audit]), source: ctx.actor, created_by: status === 'pinned' ? 'mo' : ctx.actor, created_at: now, updated_at: now };
+      uses: 0, wins: 0, losses: 0, evidence_json: JSON.stringify([audit]), source: corr ? 'correction' : ctx.actor, created_by: status === 'pinned' ? 'mo' : ctx.actor, created_at: now, updated_at: now };
+    const said = corr ? `Logged a correction: ${cap(parseCorrection(args.note).right, 120)}` : `Saved a teaching note (${args.tactic.replace(/_/g, ' ')})`;
     return { rows: [{ table: 'teach_memory', op: 'insert', key: { id }, after }],
-      events: [{ target_type: 'teach_memory', target_id: id, summary: `Saved a teaching note (${args.tactic.replace(/_/g, ' ')})` }],
-      reply: { id, status }, summary: 'Saved a teaching note' };
+      events: [{ target_type: 'teach_memory', target_id: id, summary: said }],
+      reply: { id, status, ...(corr ? { correction: true } : {}) }, summary: corr ? said : 'Saved a teaching note' };
   }
 
   if (typeof args.id !== 'string' || args.id.length > 40) return { refuse: 'id is a note id from teach_memory_list.', field: 'id' };
@@ -755,11 +804,18 @@ export const misconceptionTier = (args, plan, ctx) => (plan && plan.closing_by_c
  */
 export async function misconceptionSave(env, user, m = {}, ctx = {}) {
   const op = m.id == null ? 'misconception.add' : m.status === 'targeted' ? 'misconception.target' : m.status === 'closed' ? 'misconception.close' : 'misconception.update';
-  const args = { ...m };
+  // The foundation concept a new belief rests on (the viva's grader names one; concepts.js): kept beside the store as a
+  // pending tag, never a column of the belief itself.
+  const { concept = null, concept_discipline = null, concept_quote = null, ...args } = { ...m };
   if (op === 'misconception.target' || op === 'misconception.close') delete args.status;
   const r = await applyChange(env, user, { actor: ctx.actor || 'claude', surface: ctx.surface || 'chat', op, args, mo_said: ctx.mo_said,
     confirm_token: ctx.confirm_token, request_id: ctx.request_id, via: ctx.via || 'mcp:teach_memory_save' });
   if (!r.ok || r.nothing) return r;
+  if (concept && op === 'misconception.add' && r.id) {
+    const { noteConcepts } = await import('./concepts.js');
+    await noteConcepts(env, user, [{ id: `misc:${r.id}`, source: 'misconception', misconception_id: r.id, concept, concept_discipline, concept_quote, belief: true,
+      clinical_name: typeof m.topic === 'string' ? m.topic.replace(/\s*\(map:[^)]*\)\s*$/, '') : null, ref: m.ref || null }]);
+  }
   return { id: r.id, status: r.status, ...(r.merged != null ? { merged: r.merged } : {}), ...(r.topic !== undefined ? { topic: r.topic } : {}), ...(r.note ? { note: r.note } : {}),
     batch_id: r.batch_id, seq: r.seq, summary: r.summary, undo: { batch_id: r.batch_id, say: "Say 'undo that' to reverse it." } };
 }
@@ -871,9 +927,8 @@ export async function teachProfile(env, user, { now = Date.now() } = {}) {
   try {
     res = await env.DB.batch([
       q(`SELECT content_type, tactic, wins, losses, uses, clicked_n, last_used_at FROM tactic_scores WHERE user_id = ? LIMIT 100`, user),
-      q(`SELECT l.id, l.day, l.topic_id, coalesce(t.name, l.topic_name) AS topic, l.kind, l.outcome, l.blend, l.blend_json, l.mo_rating, l.mo_rating_why, l.what_clicked,
-           l.claude_view_json, l.minutes, l.questions_asked, l.tactics_json, l.content_type, l.final_result, l.teach_back_json, l.final_explain_json, l.stick_json,
-           l.facts_json, l.ended_at, l.surface
+      // Every column (the viva-first lesson's scores, 0065, when the database has them) and the topic's name.
+      q(`SELECT l.*, coalesce(t.name, l.topic_name) AS topic
          FROM lessons l LEFT JOIN topics t ON t.user_id = l.user_id AND t.id = l.topic_id
          WHERE l.user_id = ? AND l.status = 'done' ORDER BY l.ended_at DESC LIMIT 40`, user),
       q(`SELECT id, topic_id, topic_name, belief, words, ref, status, first_seen, last_seen, seen_n, targeted_at, closed_at, closed_by, lesson_ids_json, note
@@ -903,11 +958,13 @@ export async function teachProfile(env, user, { now = Date.now() } = {}) {
   }
   const [tactics, lessons, miscs, notes, taught, weeks, topics, seq] = res.map(r => r.results || []);
   const prefs = await getPrefs(env, user).catch(() => ({}));
-  return profileFrom({ tactics, lessons, miscs, notes, taught, weeks, topics, prefs: (prefs && prefs.teach) || {}, now, seq: (seq[0] || {}).seq || 0 });
+  const effects = await (await import('./lesson-effect.js')).lessonEffects(env, user, lessons.slice(0, 30)).catch(() => new Map());
+  const examDay = await readExamDay(env).catch(() => null);   // the default lesson length follows the exam_date setting
+  return profileFrom({ tactics, lessons, miscs, notes, taught, weeks, topics, prefs: (prefs && prefs.teach) || {}, now, seq: (seq[0] || {}).seq || 0, effects, examDay });
 }
 
 /** The page's shape from the read rows (pure, for the tests). */
-export function profileFrom({ tactics = [], lessons = [], miscs = [], notes = [], taught = [], weeks = [], topics = [], prefs = {}, now = Date.now(), seq = 0 }) {
+export function profileFrom({ tactics = [], lessons = [], miscs = [], notes = [], taught = [], weeks = [], topics = [], prefs = {}, now = Date.now(), seq = 0, effects = new Map(), examDay = null }) {
   const favourites = Array.isArray(prefs.favourites) && prefs.favourites.length ? prefs.favourites.filter(t => TACTIC_VOCAB.includes(t)) : FAVOURITES;
   const byType = Object.fromEntries(CONTENT_TYPES.map(c => [c, posteriors(tactics, c, favourites)]));
   // Overall: each tactic's posterior with every content type's lessons pooled.
@@ -935,7 +992,9 @@ export function profileFrom({ tactics = [], lessons = [], miscs = [], notes = []
       mo_rating: l.mo_rating ?? null, mo_rating_why: l.mo_rating_why || null, what_clicked: l.what_clicked || null,
       claude_view: view ? { verdict: view.verdict || null, reasons: view.reasons || null } : null, minutes: l.minutes ?? null, questions_asked: l.questions_asked ?? null,
       tactics: parse(l.tactics_json, []), content_type: l.content_type || null, final_result: l.final_result || null,
-      teach_back: (parse(l.teach_back_json, null) || {}).judgement || null, stick: stick ? { ...stick, line: stickLine(stick) } : null };
+      teach_back: (parse(l.teach_back_json, null) || {}).judgement || null, stick: stick ? { ...stick, line: stickLine(stick) } : null,
+      // The viva-first lesson (1 Nov): how well it worked, by code, never asked.
+      effect: (effects && effects.get(l.id)) || null };
   };
   const live = miscs.filter(m => m.status !== 'closed').map(shapeMisc), closed = miscs.filter(m => m.status === 'closed').map(shapeMisc);
   const done = lessons.slice(0, 40);
@@ -947,10 +1006,12 @@ export function profileFrom({ tactics = [], lessons = [], miscs = [], notes = []
     misconceptions: { open: live, closed: closed.slice(0, 50), counts: { open: live.filter(m => m.status === 'open').length, targeted: live.filter(m => m.status === 'targeted').length, closed: closed.length } },
     pacing: {
       // 0 is the phase's own length; the page names it ("Default (10 min)") rather than showing 0 (DES4-12).
-      lesson_minutes: Number(prefs.lesson_minutes) || 0, default_minutes: phaseFor(daysLeft(londonDay(now))).lesson_minutes, turn_words: Number(prefs.turn_words) || 90,
+      lesson_minutes: Number(prefs.lesson_minutes) || 0, default_minutes: phaseFor(daysLeft(londonDay(now), examDay)).lesson_minutes, turn_words: Number(prefs.turn_words) || 90,
       notes: notes.filter(n => n.tactic === 'pacing').map(n => ({ id: n.id, note: n.note, status: n.status })),
       stats: { lessons: taughtDone.length, median_minutes: median(taughtDone.map(l => l.minutes)), median_questions: median(taughtDone.map(l => l.questions_asked)),
-        median_rating: median(taughtDone.map(l => l.mo_rating)) },
+        median_rating: median(taughtDone.map(l => l.mo_rating)),
+        // The viva-first lesson: the median rise from the opening viva to the closing one, in points of 100.
+        median_gain: median(taughtDone.filter(l => l.viva_before != null && l.viva_after != null).map(l => Math.round((Number(l.viva_after) - Number(l.viva_before)) * 100))) },
     },
     notes: notes.map(n => ({ id: n.id, scope: n.scope, scope_ref: n.scope_ref, scope_name: n.scope_name ?? null, tactic: n.tactic, note: n.note, status: n.status, uses: n.uses, score: n.score, created_by: n.created_by })),
     lessons: done.slice(0, 30).map(shapeLesson),

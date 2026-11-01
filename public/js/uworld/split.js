@@ -250,7 +250,7 @@ export function claudeText(segments, { manual = [], results = {}, count = 0, dat
   out.push(`Below is what I said, transcribed by Whisper (expect misheard medical words), with times from the start. Do not copy or quote any question text from UWorld. ${anyMarks ? 'My results are below.' : 'If my UWorld results are on screen, use them only to see which questions I got right or wrong and the correct letters; otherwise work from what I said.'}`);
   out.push(`1. Split the transcript into ${count ? `Q1 to Q${count}` : 'questions (Q1, Q2 and so on)'}, in order. A new question usually starts with a new patient (new age, sex, complaint or topic), often after a long pause, and ends when I name my pick.${cues ? ' Where the transcript marks a cue in brackets ("said: next question", "said: question 12", "end of question 11"), that is a sure boundary.' : ''} Use my picked letters to line them up. Some questions may have no speech. If my UWorld results are on screen, use each question's topic name there to settle unclear boundaries and my picks (only to match, never copy it out). Show me the split in a short list (question, start time, first few words) and wait for my OK or corrections.`);
   out.push('2. Then, for each question, check whether my answer and what I said hold up, and log as a mistake (log only, no card, the same as "log this"): every wrong answer, and every right answer where I was guessing or what I said was wrong (say which: lucky guess, right answer for a wrong fact, ruled an option out wrongly, misread). Use the question ID if I gave one. Finish with a short summary: how many wrong, how many right for a flawed reason, the main error types and the systems that came up most. I will say "make flashcards" at the end of the day.');
-  if (blockId) out.push(`3. If you have my Practice Hub connector, once I OK the split also call save_uworld_questions with block "${blockId}" and one entry per question: its start time in the transcript, what my UWorld results screen shows (question ID, right or wrong, my letter, the correct letter, subject, system, topic label, time spent, % of others right) and your check (verdict, error type, one-line note in your own words). Labels and numbers only, never question text. If you don't have the connector, skip this step.`);
+  if (blockId) out.push(`3. If you have my Practice Hub connector, once I OK the split call teach_debrief {judge: true, block: "${blockId}", items} with one row per question: q, its start time in the transcript, and what my UWorld results screen shows (uworld_id, result, picked, answer, subject, system, topic, time_s, others_pct). Labels and numbers only, never question text. Then judge the block as its reply says instead of step 2: it logs on the hub. If you don't have the connector, skip this step.`);
   if (anyMarks) {
     out.push('', 'My results:');
     for (const n of ns) {
@@ -264,4 +264,10 @@ export function claudeText(segments, { manual = [], results = {}, count = 0, dat
   const lines = timeline(segments, manual);
   out.push(...(lines.length ? lines : ['(nothing was heard)']));
   return out.join('\n');
+}
+
+export function recordedMs(S0, live, t = Date.now()) {
+  if (!S0.t0) return 0;
+  const pausedNow = live && live.paused && live.pausedAt ? t - live.pausedAt : 0;
+  return Math.max(0, (S0.stoppedAt || t) - S0.t0 - (S0.pausedMs || 0) - pausedNow);
 }

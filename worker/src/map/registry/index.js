@@ -37,10 +37,17 @@ import * as notes from './notes.js';
 import * as uk from './uk.js';
 import * as mnemonics from './mnemonics.js';
 import * as history from './history.js';
+import * as anking from './anking.js';
+import * as honesty from './honesty.js';
+import * as viva from './viva.js';
+import * as concepts from './concepts.js';
+import * as forecast from './forecast.js';
+import * as plan from './plan.js';
+import * as debug from './debug.js';
+import * as cardFix from './card-fix.js';
 import * as platform from './platform.js';
-
 // Area name -> module, in merge order (the first owner of a key wins).
-const AREAS = { family, subscription, realtime, ingest, weakness, taxonomy, teach, mcp, panel, links, look, review, onenote, media, morning, 'uworld-track': uworldTrack, library, cards, learn, notes, uk, mnemonics, history, platform };
+const AREAS = { family, subscription, realtime, ingest, weakness, taxonomy, teach, mcp, panel, links, look, review, onenote, media, morning, 'uworld-track': uworldTrack, library, cards, learn, notes, uk, mnemonics, history, anking, honesty, viva, concepts, forecast, plan, debug, 'card-fix': cardFix, platform };
 export const KEYS = ['ROUTES', 'CHANGE_KINDS', 'UNDO', 'EXPORT', 'EXPORT_SKIP', 'PREFS', 'QUEUE_HANDLERS', 'MINUTE'];
 export const METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
 AREAS['uk-labs'] = ukLabs;

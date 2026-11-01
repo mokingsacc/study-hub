@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "deploy": "wrangler d1 migrations apply DB --remote && wrangler deploy",
+    "deploy": "node scripts/ensure-search-index.mjs && wrangler d1 migrations apply DB --remote && wrangler deploy",
     "dev": "wrangler d1 migrations apply DB --local && wrangler dev --local",
     "test": "node --test --test-timeout=180000 \"tests/**/*.test.mjs\""
   },

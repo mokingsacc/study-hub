@@ -1,5 +1,5 @@
 import { get, post, del, ApiError, DEMO, uploadHeaders } from './api.js';
-import { h, icon, btn, linkBtn, sheet, confirmSheet, toast, field, input, pageHead, loading, errorState, state, busy, bytes, plural } from './kit.js';
+import { h, icon, btn, linkBtn, sheet, confirmSheet, toast, field, input, pageHead, loading, errorState, state, busy, bytes, plural, askClaude } from './kit.js';
 
 const API = '/api/p/library';
 const POLL_MS = 4000;
@@ -398,7 +398,7 @@ export function addPhotos(files, name, collection = null) {
 // ------------------------------------------------------------------ the screen
 
 export function render(root, { app }) {
-  const S = { docs: [], quota: null, q: '', seq: 0, alive: true, timer: 0, lastMove: new Map(), nudged: 0, ready: false, unsupported: false };
+  const S = { docs: [], folders: [], quota: null, q: '', seq: 0, alive: true, timer: 0, lastMove: new Map(), nudged: 0, ready: false, unsupported: false };
   if (!leaving) { leaving = true; window.addEventListener('beforeunload', e => { if (JOBS.size) { e.preventDefault(); e.returnValue = ''; } }); }
 
   const addB = btn('Add', () => addSheet(), 'primary', 'plus');
@@ -431,12 +431,21 @@ export function render(root, { app }) {
       return;
     }
     const mine = localJobs().map(j => row({ id: j.key, title: j.title, status: '' }, j));
-    const docs = S.docs.map(d => row(d, jobFor(d)));
-    if (!mine.length && !docs.length) {
+    if (!mine.length && !S.docs.length) {
       listBox.replaceChildren(state('library', 'Your library is empty',
-        'Add your notes, mark schemes and past papers as PDFs, or take photos of them. Study Hub reads them so you and your Claude can search them and cite the page. Only you can see them.',
+        'Add your notes, mark schemes and past papers as PDFs, or take photos of them, even a sheet from class to write on. Study Hub reads them so you and your Claude can search them and cite the page. Only you can see them.',
         btn('Add something', () => addSheet(), 'tinted', 'plus')));
-    } else listBox.replaceChildren(h('div', { class: 'list' }, mine, docs));
+    } else {
+      // Their folders, A to Z, then everything not in one.
+      const groups = [...S.folders.map(f => [f, S.docs.filter(d => d.folder === f)]), [null, S.docs.filter(d => !d.folder)]].filter(([, list]) => list.length);
+      listBox.replaceChildren(mine.length ? h('div', { class: 'list' }, mine) : '',
+        ...groups.map(([f, list]) => h('section', null,
+          S.folders.length ? h('div', { class: 'section-title' }, icon(f ? 'list' : 'file'), f || 'Not in a folder',
+            f ? h('button', { type: 'button', class: 'linkish foot aside', onclick: () => renameFolder(f) }, 'Rename') : null) : null,
+          h('div', { class: 'list' }, list.map(d => row(d, jobFor(d)))))),
+        h('div', { class: 'row', style: 'margin-top:16px;gap:8px;flex-wrap:wrap' },
+          askClaude('Sort my Study Hub library into folders by subject and topic.', 'Ask my Claude to sort it into folders')));
+    }
     const q = S.quota;
     meter.textContent = q ? `${plural(q.docs, 'file')} · ${bytes(q.bytes)} of ${bytes(q.max_bytes)} used` : '';
   }
@@ -454,7 +463,7 @@ export function render(root, { app }) {
     }
     if (!S.alive) return;
     if (!Array.isArray(r.docs)) { S.unsupported = true; draw(); return; }
-    S.docs = r.docs; S.quota = r.quota || null; S.ready = true;
+    S.docs = r.docs; S.folders = r.folders || []; S.quota = r.quota || null; S.ready = true;
     draw();
     const busyNow = S.docs.some(d => (BUSY.has(d.status) && !(d.status === 'uploading' && !jobFor(d))) || d.ocr_pending);
     if (busyNow) { nudge(); schedule(POLL_MS); }
@@ -510,7 +519,7 @@ export function render(root, { app }) {
     const sh = sheet({ title: 'Add to your library', sub: 'Study Hub reads the text, so you can search it and your Claude can cite the page.', body: [
       field('Name', name, 'optional'),
       h('button', { type: 'button', class: 'pick', onclick: () => pdfIn.click() }, icon('upload'), h('b', null, 'Choose PDFs'), h('span', { class: 'foot' }, 'Notes, mark schemes and past papers')),
-      h('button', { type: 'button', class: 'pick', onclick: () => picIn.click() }, icon('photo'), h('b', null, 'Add photos'), h('span', { class: 'foot' }, 'Take or choose pictures of paper notes or papers, up to 30 at a time')),
+      h('button', { type: 'button', class: 'pick', onclick: () => picIn.click() }, icon('photo'), h('b', null, 'Add photos'), h('span', { class: 'foot' }, 'Take or choose pictures of notes, papers or a sheet from class (you can write on it after), up to 30 at a time')),
       h('p', { class: 'foot' }, 'Add only what you are allowed to use for your own study, not paid question-bank questions. Only you, your AI and your own Claude can read your library.'),
       pdfIn, picIn] });
     pdfIn.addEventListener('change', () => { const files = [...pdfIn.files]; sh.close(); addPdfs(files, name.value.trim()); });
@@ -529,6 +538,8 @@ export function render(root, { app }) {
     const server = ['uploaded', 'extracting', 'failed'].includes(d.status) ? btn('Read it on the server', e => busy(e.currentTarget, async () => {
       try { await post(`${docPath(d.id)}/extract`, {}); toast('The server is reading it.'); sh.close(); load(); } catch (err) { toast(err.message); }
     }), 'gray', 'bolt') : null;
+    const write = d.page_count && ['ready', 'indexing', 'uploaded', 'extracting'].includes(d.status) ? btn('Write on it', () => { sh.close(); writeOn(d); }, 'primary', 'pencil') : null;
+    const move = btn(d.folder ? `Folder: ${d.folder}` : 'Move to a folder', () => { sh.close(); moveSheet([d]); }, 'gray', 'list');
     const remove = btn('Delete', async () => {
       sh.close();
       if (!(await confirmSheet({ title: `Delete ${d.title}?`, sub: 'The file and what Study Hub read from it are removed for good.', ok: 'Delete', danger: true }))) return;
@@ -539,8 +550,54 @@ export function render(root, { app }) {
       h('p', { class: 'foot' }, facts),
       d.status === 'refused' || d.status === 'failed' ? h('p', null, d.status_note || 'No reason was given.') : null,
       d.ocr_pending ? h('p', { class: 'foot' }, `${plural(d.ocr_pending, 'picture')} still being read into text. This takes a few minutes.`) : null,
-      h('div', { class: 'row', style: 'flex-wrap:wrap;gap:8px' }, read, open, again, server));
+      h('div', { class: 'row', style: 'flex-wrap:wrap;gap:8px' }, write, read, open, move, again, server));
     sh.setActions(remove);
+  }
+
+  // ---------- folders: move, rename (one undoable change each)
+  async function fileTo(body, done) {
+    try {
+      const r = await post(`${API}/folders`, body);
+      done();
+      if (r.moved) toast(body.rename ? 'Folder renamed' : `Moved to ${r.folder || 'no folder'}`, { undo: async () => { await post('/api/p/undo', { batch_id: r.batch_id }); load(); } });
+      load();
+    } catch (e) { toast(e.message); }
+  }
+  function moveSheet(docs) {
+    const name = input({ placeholder: 'A new folder, e.g. Biology: cells', maxLength: 60, 'aria-label': 'New folder name' });
+    const ids = docs.map(d => d.id);
+    const s = sheet({ title: 'Move to a folder', sub: docs.length === 1 ? docs[0].title : plural(docs.length, 'file'), body: h('div', { class: 'stack' },
+      S.folders.length ? h('div', { class: 'chips' }, S.folders.map(f => h('button', { type: 'button', class: 'chip', onclick: () => fileTo({ ids, folder: f }, () => s.close()) }, h('span', { class: 'nm' }, f)))) : null,
+      field('New folder', name),
+      docs.some(d => d.folder) ? h('button', { type: 'button', class: 'linkish foot', onclick: () => fileTo({ ids, folder: null }, () => s.close()) }, 'Take it out of its folder') : null),
+      actions: [btn('Cancel', () => s.close(), 'gray'), btn('Move', () => { if (!name.value.trim()) { name.focus(); toast('Pick a folder or name a new one.'); return; } fileTo({ ids, folder: name.value.trim() }, () => s.close()); }, 'primary', 'check')] });
+  }
+  function renameFolder(f) {
+    const name = input({ value: f, maxLength: 60, 'aria-label': 'Folder name' });
+    const s = sheet({ title: 'Rename the folder', body: field('Name', name),
+      actions: [btn('Cancel', () => s.close(), 'gray'), btn('Rename', () => fileTo({ rename: { from: f, to: name.value.trim() } }, () => s.close()), 'primary', 'check')] });
+  }
+
+  // ---------- write on a document with the pencil (a sheet from class, notes): full screen, saved as they write
+  async function writeOn(d) {
+    const [{ pdfPane }, { inkBoard }] = await Promise.all([import('./pdfpane.js'), import('./ink.js')]);
+    let ink = { pages: [], extra: 0 };
+    try { ink = await get(`${docPath(d.id)}/ink`); } catch { /* none yet */ }
+    const board = inkBoard(`${docPath(d.id)}/ink/`, { written: ink.pages });
+    const pane = pdfPane(d.id, { extra: ink.extra, onPage: (n, el, c) => board.attach(n, el, c) });
+    pane.el.classList.add('exam-write');
+    const blank = btn('Blank page', () => { if (!pane.addBlank()) toast('Ten extra pages at most.'); }, 'gray', 'note', { cls: 'btn-sm' });
+    let closed = false;
+    const close = async () => { if (closed) return; closed = true; removeEventListener('keydown', esc); removeEventListener('hashchange', close); await board.flush(); board.close(); pane.close(); wrap.remove(); };
+    const esc = e => { if (e.key === 'Escape') close(); };
+    const wrap = h('div', { class: 'ink-full', role: 'dialog', 'aria-modal': 'true', 'aria-label': `Write on ${d.title || 'the sheet'}` },
+      h('div', { class: 'ink-head' }, h('b', { class: 'clip grow' }, d.title || 'Sheet'), blank, btn('Done', close, 'primary', 'check', { cls: 'btn-sm' })),
+      h('div', { class: 'ink-bar' }, board.tools), pane.el,
+      h('div', { class: 'row', style: 'gap:8px;flex-wrap:wrap' }, askClaude(`Check what I wrote on "${d.title || 'my sheet'}" in my Study Hub library. Tell me what is right and what is wrong, and log my results so my map updates.`, 'Check it with my Claude'),
+        h('span', { class: 'foot' }, 'It saves as you write. A finger scrolls.')));
+    document.body.append(wrap);
+    addEventListener('keydown', esc);
+    addEventListener('hashchange', close);
   }
 
   // ---------- one page of text, with the found passage and words marked

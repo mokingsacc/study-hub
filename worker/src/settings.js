@@ -1,18 +1,20 @@
 // Settings and the hub's start-up state. validateSettings is the one validator for hub settings: PUT
 // /api/settings and the map's change op setting.set (Claude's hub_settings) both use it, with the same messages.
 import { HttpError, json, readJson, str } from './util.js';
-import { CHECK_MODES, PUBLIC_SETTINGS, all, cardsToday, getSettings, usageToday, usageMonth, hardCap } from './db.js';
+import { CHECK_MODES, BLOCK_JUDGES, PUBLIC_SETTINGS, all, cardsToday, getSettings, usageToday, usageMonth, hardCap } from './db.js';
 import { VOICE_MODES } from './sittings.js';
 import { ensurePlan } from './plan.js';
 import { MO, currentUser, userRow, meOf, getPrefs } from './users.js';
 import { isInternalSetting } from './map/guard.js';
 import { prefsSchema } from './map/prefs.js';
 import { jobsNow } from './map/recent.js';
+import { costWeek } from './ai-cost.js';
+import { _resetSwitch } from './debug/trace.js';
 
 export async function state(request, env) {
   await ensurePlan(env); // once: a database on an older Saturday plan moves to the current one before anything is shown
   const user = await currentUser(env, request);
-  const [exams, sittings, usage, settings, cards, month, me, jobs] = await Promise.all([
+  const [exams, sittings, usage, settings, cards, month, me, jobs, week] = await Promise.all([
     all(env, 'SELECT id, name, question_count, created_at FROM exams ORDER BY created_at DESC'),
     all(env, 'SELECT * FROM sittings ORDER BY COALESCE(scheduled_date, \'9999\'), created_at'),
     usageToday(env),
@@ -22,13 +24,17 @@ export async function state(request, env) {
     userRow(env, user).catch(e => { console.error('state: user row', e && e.message); return null; }),
     // The bar's background-job chip (Recents, 27 Oct): one batch; never blocks the hub.
     jobsNow(env, user).then(j => j.summary, e => { console.error('state: jobs', e && e.message); return null; }),
+    // The spend sheet's last 7 days per role, with the cache hit ratio (ai-cost.js); never blocks the hub.
+    costWeek(env).catch(e => { console.error('state: ai week', e && e.message); return null; }),
   ]);
   // prefs: the user's ui_prefs over every registered default; me: who is using the hub (plan §14, §15).
   const prefs = await getPrefs(env, user, me || { prefs_json: {} }).catch(() => ({}));
-  const features = { learn: env.LEARN === 'on', notes: env.NOTES === 'on', uk: env.UK === 'on', mnemonics: env.MNEMONICS === 'on' };
+  const features = { learn: env.LEARN === 'on', notes: env.NOTES === 'on', uk: env.UK === 'on', mnemonics: env.MNEMONICS === 'on', anking: env.ANKING === 'on' };
   return json({ features, exams, sittings, usage_today: { usd: Math.round(usage.usd * 10000) / 10000, calls: usage.calls },
     usage_month: { usd: Math.round(month.usd * 10000) / 10000, since: month.since }, settings, cards_today: cards,
-    prefs, jobs, map_features: { orbits: env.MAP_ORBITS === 'on', due_orbs: env.DUE_ORBS === 'on', mnemonics: env.MNEMONICS === 'on' }, me: meOf(me) || { id: user, name: user === MO ? 'Mo' : user, role: user === MO ? 'admin' : 'student', profile: 'step2' } });
+    usage_week: week ? { usd: week.usd, calls: week.calls, hit: week.hit, batch_calls: week.batch_calls, batch_usd: week.batch_usd,
+      roles: week.roles.slice(0, 6).map(r => ({ words: r.words, usd: r.usd, calls: r.calls, hit: r.hit })) } : null,
+    prefs, jobs, map_features: { orbits: env.MAP_ORBITS === 'on', due_orbs: env.DUE_ORBS === 'on', mnemonics: env.MNEMONICS === 'on', anking: env.ANKING === 'on' }, me: meOf(me) || { id: user, name: user === MO ? 'Mo' : user, role: user === MO ? 'admin' : 'student', profile: 'step2' } });
 }
 
 export async function get(request, env) {
@@ -57,6 +63,10 @@ export function validateSettings(body, env) {
     if (!CHECK_MODES.includes(body.check_mode)) throw new HttpError(400, 'Checks run in the desktop app or through the API.');
     writes.push(['check_mode', body.check_mode]);
   }
+  if ('block_judge' in body) {
+    if (!BLOCK_JUDGES.includes(body.block_judge)) throw new HttpError(400, 'UWorld blocks are judged in the chat (chat) or by the hub (hub).');
+    writes.push(['block_judge', body.block_judge]);
+  }
   if ('default_voice_mode' in body) {
     if (!VOICE_MODES.includes(body.default_voice_mode)) throw new HttpError(400, 'Voice mode must be quick, full or silent.');
     writes.push(['default_voice_mode', body.default_voice_mode]);
@@ -84,8 +94,10 @@ export function validateSettings(body, env) {
   };
   if ('target_score' in body) writes.push(['target_score', whole('target_score', 'The target score', 200, 300)]);
   if ('uworld_total_left' in body) writes.push(['uworld_total_left', whole('uworld_total_left', 'UWorld questions left', 0, 5000)]);
+  const noExam = 'exam_date' in body && (body.exam_date === '' || body.exam_date === null);
   for (const k of ['uworld_as_of', 'exam_date', 'plan_start', 'uworld_finish_date', 'phase2_end', 'cms_early_by']) {
     if (!(k in body)) continue;
+    if (k === 'exam_date' && noExam) { writes.push(['exam_date', '']); continue; }
     if (!ISO.test(String(body[k] || ''))) throw new HttpError(400, 'Dates must look like 2027-06-30.');
     writes.push([k, body[k]]);
   }
@@ -102,6 +114,14 @@ export function validateSettings(body, env) {
   }
   if ('cms_weak_pct' in body) writes.push(['cms_weak_pct', whole('cms_weak_pct', 'The CMS weak bar', 0, 100)]);
   if ('cards_minutes' in body) writes.push(['cards_minutes', whole('cards_minutes', 'The Cards time box', 5, 120)]);
+  if ('scoring_auto_switch' in body) {
+    if (typeof body.scoring_auto_switch !== 'boolean') throw new HttpError(400, 'Switching to a better scoring rule by itself is on (true) or off (false).');
+    writes.push(['scoring_auto_switch', body.scoring_auto_switch]);
+  }
+  if ('debug_capture' in body) {
+    if (typeof body.debug_capture !== 'boolean') throw new HttpError(400, 'Capturing what went wrong for problem reports is on (true) or off (false).');
+    writes.push(['debug_capture', body.debug_capture]);
+  }
   if ('plan_daily' in body) {
     const v = body.plan_daily || {};
     const u = Number(v.uworld), c = Number(v.cms), i = Number(v.incorrects ?? 40);
@@ -113,11 +133,22 @@ export function validateSettings(body, env) {
   return writes;
 }
 
+export async function catchup(request, env) {
+  const b = await readJson(request);
+  const name = String(b.name || ''), version = String(b.version ?? '');
+  if (!/^[a-z][a-z0-9_-]{0,40}$/.test(name) || !/^[\w.-]{1,40}$/.test(version)) throw new HttpError(400, 'Say which catch-up: a name and a version.');
+  const key = `catchup_done:${name}:${version}`;
+  if (b.done === true) await env.DB.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').bind(key, JSON.stringify(Date.now())).run();
+  const row = await env.DB.prepare('SELECT 1 AS done FROM settings WHERE key = ?').bind(key).first();
+  return json({ name, version, done: !!row });
+}
+
 const UPSERT = 'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value';
 
 export async function put(request, env) {
   const writes = validateSettings(await readJson(request), env);
   await env.DB.batch(writes.map(([k, v]) => env.DB.prepare(UPSERT).bind(k, JSON.stringify(v)))); // one query, all or none
+  if (writes.some(([k]) => k === 'debug_capture')) _resetSwitch();   // this isolate reads the switch again at once
   return json(await getSettings(env));
 }
 
@@ -130,14 +161,19 @@ export const SETTING_LABELS = {
   uworld_total_left: 'UWorld questions left', uworld_as_of: 'UWorld count date', exam_date: 'Exam date', rest_days: 'Rest days',
   light_days: 'Light days', off_weekdays: 'Days off each week', plan_daily: 'Daily numbers', plan_start: 'Plan start',
   uworld_finish_date: 'UWorld finish date', phase2_end: 'Phase 2 end', cms_early_by: 'Early CMS forms by', cms_weak_pct: 'CMS weak bar',
-  cards_minutes: 'Cards time box (minutes)',
+  cards_minutes: 'Cards time box (minutes)', scoring_auto_switch: 'Switch to a better scoring rule by itself',
+  debug_capture: 'Capture for problem reports',
+  block_judge: 'Who judges UWorld blocks',
 };
 const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 function settingText(key, v) {
+  if (key === 'exam_date') return v || 'no exam set';
   if (v == null) return 'default';
   if (key.endsWith('_usd')) return `$${v}`;
   if (key === 'off_weekdays') return v.map(d => WEEKDAYS[d]).join(', ') || 'none';
   if (Array.isArray(v)) return v.length > 3 ? `${v.length} dates` : v.join(', ') || 'none';
+  if (typeof v === 'boolean') return v ? 'on' : 'off';
+  if (key === 'block_judge') return v === 'hub' ? 'the hub (API)' : 'Claude in the chat';
   if (key === 'plan_daily') return `UWorld ${v.uworld}, CMS ${v.cms}, incorrects ${v.incorrects}`;
   return String(v);
 }

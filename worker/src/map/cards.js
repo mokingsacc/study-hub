@@ -132,13 +132,16 @@ const REVIEW_DETAIL = ['type', 'ms', 'by', 'parts'];
 
 /**
  * The evidence row for one card's review on one day, on one topic slot (pure). review: {card_id, note_id?, ease 1..4,
- * at, day, source, type?, ms?, by?, parts?}. Null for an ease outside 1..4.
+ * at, day, source, type?, ms?, by?, parts?, reviews?: [[at, ease], ...] (each rating that day)}. Null for an ease
+ * outside 1..4.
  */
 export function reviewEvidence(review, { topic_id, slot = 0 }) {
   const ease = Number(review && review.ease);
   if (!(ease >= 1 && ease <= 4) || review.card_id == null || !review.day || topic_id == null) return null;
   const detail = { ease };
   for (const k of REVIEW_DETAIL) if (review[k] != null && review[k] !== '') detail[k] = review[k];
+  const own = [[Number(review.at), ease]];
+  detail.reviews = unionReviews(own, Array.isArray(review.reviews) ? reviewList({ detail_json: JSON.stringify({ reviews: review.reviews }) }) : []);
   return {
     obs_key: reviewKey(review.card_id, review.day), slot, topic_id, kind: 'card_review', at: Number(review.at), day: review.day,
     source: review.source || 'anki', card_id: Number(review.card_id), note_id: review.note_id != null ? Number(review.note_id) : null,
@@ -146,9 +149,20 @@ export function reviewEvidence(review, { topic_id, slot = 0 }) {
   };
 }
 
+// The Mac add-on and Anki's log report one press at slightly different times (the add-on's click, Anki's review id):
+// the same ease within two minutes is one rating.
+export const SAME_PRESS_MS = 120_000;
+/** Two lists of ratings as one, in time order, each press once (pure). */
+export function unionReviews(a, b) {
+  const out = [...(a || [])];
+  for (const x of b || []) if (!out.some(y => y[1] === x[1] && Math.abs(y[0] - x[0]) <= SAME_PRESS_MS)) out.push(x);
+  return out.sort((p, q) => p[0] - q[0]).slice(-REVIEWS_KEPT);
+}
+
 /**
- * Two reports of one card's review day as one row (pure): the lower ease wins (with its rating and details), the
- * earlier time stays, and so does the first report's source (the stored row's; plan §5.3). prev may be null.
+ * Two reports of one card's review day as one row (pure): every rating of both, each press once (detail.reviews); the
+ * lowest ease names the row (with its details), the earliest time dates it, and the first report's source stays (the
+ * stored row's; plan §5.3). prev may be null.
  */
 export function mergeReviewRow(prev, next) {
   if (!prev) return next;
@@ -157,10 +171,42 @@ export function mergeReviewRow(prev, next) {
   const worse = en && (!ep || en < ep) ? next : prev;
   const dp = detailOf(prev), dn = detailOf(next);
   const detail = worse === next ? { ...dp, ...dn } : { ...dn, ...dp };
-  return { ...next, note_id: next.note_id ?? prev.note_id ?? null, rating: worse.rating, amount: worse.amount, detail_json: JSON.stringify(detail),
+  const merged = { ...next, note_id: next.note_id ?? prev.note_id ?? null, rating: worse.rating, amount: worse.amount, detail_json: JSON.stringify(detail),
     at: Math.min(Number(prev.at) || Infinity, Number(next.at) || Infinity), source: prev.source || next.source };
+  return rowWithReviews(merged, unionReviews(reviewList(prev), reviewList(next))) || merged;
 }
 const gradeOfRating = r => ({ again: 1, hard: 2, good: 3, easy: 4 })[String(r || '').toLowerCase()] || 0;
+
+export const REVIEWS_KEPT = 20;
+export function reviewList(row) {
+  if (!row) return [];
+  const d = detailOf(row);
+  const list = (Array.isArray(d.reviews) ? d.reviews : [])
+    .filter(x => Array.isArray(x) && Number.isFinite(Number(x[0])) && Number(x[1]) >= 1 && Number(x[1]) <= 4)
+    .map(x => [Number(x[0]), Number(x[1])]);
+  if (list.length) return list.sort((a, b) => a[0] - b[0]);
+  const ease = Number(row.amount) || gradeOfRating(row.rating);
+  return ease >= 1 && ease <= 4 && Number.isFinite(Number(row.at)) ? [[Number(row.at), ease]] : [];
+}
+
+/** A review row carrying `list` as its ratings: the lowest ease names it, the earliest time dates it. Null when empty. */
+export function rowWithReviews(row, list) {
+  const l = [...list].sort((a, b) => a[0] - b[0]).slice(-REVIEWS_KEPT);
+  if (!l.length) return null;
+  const ease = Math.min(...l.map(x => x[1]));
+  return { ...row, rating: REVIEW_RATING[ease], amount: ease, at: l[0][0], detail_json: JSON.stringify({ ...detailOf(row), ease, reviews: l }) };
+}
+
+/**
+ * The row without one rating (an undo or a changed rating in Anki Voice, by its review id): null when that was its only
+ * rating, the row unchanged when it never had it.
+ */
+export function dropReview(row, reviewId) {
+  const list = reviewList(row);
+  const left = list.filter(x => x[0] !== Number(reviewId));
+  if (left.length === list.length) return row;
+  return rowWithReviews(row, left);
+}
 
 /** Whether a stored review row would change by being written as `next` (only its facts are compared). */
 export const reviewChanged = (prev, next) => !prev || ['topic_id', 'rating', 'amount', 'at', 'detail_json', 'note_id']

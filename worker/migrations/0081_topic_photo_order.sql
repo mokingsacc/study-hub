@@ -1,0 +1,1 @@
+ALTER TABLE topic_photos ADD COLUMN sort INTEGER;

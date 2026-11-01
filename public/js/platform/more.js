@@ -16,11 +16,13 @@ export function render(root, { app }) {
       app.on('mnemonics') ? row('#mnemonics', 'teach', 'Mnemonics', 'Memory hooks with their own test') : null,
       row('#subjects', 'grid', 'Subjects and galaxies', 'Boards, tiers, topics and your own galaxies'),
       (app.myPages || []).map(p => row(`#page/${encodeURIComponent(p.id)}`, 'sparkle', p.title, 'Your page')),
+      h('button', { type: 'button', class: 'li', onclick: () => import('./pictures.js').then(m => m.photoInboxSheet(app)) }, inner('photo', 'Photo inbox', 'Photos for your Claude to put on topics'), icon('chevron', 'chev')),
       row('#chats', 'chat', 'Chat notes', 'What you and your Claude covered'),
       row('#progress', 'calendar', 'Your study days', 'Every day you studied, and your streak'),
       recentRow(app),
       row('#settings', 'settings', 'Settings', 'Your Claude, Make it mine, sharing'),
       row('#learn', 'teach', 'Why it works', 'The science behind the hub, in five minutes'),
+      h('button', { type: 'button', class: 'li', onclick: () => import('./report.js').then(m => m.openReport(app)) }, inner('bug', 'Report a problem', 'Copies what went wrong, ready for Claude')),
       h('button', { type: 'button', class: 'li', onclick: () => location.reload() }, inner('refresh', 'Refresh', 'Get the newest of everything')),
     ),
   );

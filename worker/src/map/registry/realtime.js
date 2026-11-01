@@ -28,7 +28,9 @@ export const EXPORT = {
       'uworld_q', 'anki_mistake_id', 'result', 'outcome', 'flaw_kind', 'confidence', 'confidence_source', 'error_type', 'time_s', 'slow', 'others_pct',
       'time_source', 'topic_raw', 'condition_raw', 'system_raw', 'label_norm', 'topic_id', 'category_id', 'queue_id', 'match_status', 'match_method',
       'rule', 'my_reasoning', 'reasoning_source', 'right_reasoning', 'look_alikes', 'look_alike_names_json', 'learning_point', 'retests_json',
-      'next_retest_day', 'anki_note_ids_json', 'held', 'reviewed_at', 'reviewed_by', 'src_hash', 'gen', 'created_by', 'created_at', 'updated_at', 'deleted_at', 'step'],
+      'next_retest_day', 'anki_note_ids_json', 'held', 'reviewed_at', 'reviewed_by', 'src_hash', 'gen', 'created_by', 'created_at', 'updated_at', 'deleted_at', 'step',
+      'cause', 'cause_quote', 'cause_inferred', 'cause_detail', 'cause_version', 'merged_into',
+      'his_words', 'his_words_at', 'his_words_src', 'mo_corrected_json', 'cause_disputed'],
     required: ['id', 'user_id', 'source', 'label', 'day', 'at', 'result', 'created_at', 'updated_at'],
     types: {
       id: T, user_id: T, source: ['hub', 'uworld', 'anki', 'claude', 'onenote'], source_ref: T, label: T,
@@ -39,6 +41,10 @@ export const EXPORT = {
       match_method: T, rule: T, my_reasoning: T, reasoning_source: T, right_reasoning: T, look_alikes: T, look_alike_names_json: 'ja',
       learning_point: T, retests_json: 'ja', next_retest_day: D, anki_note_ids_json: 'ja', held: [0, 1], reviewed_at: I, reviewed_by: T,
       src_hash: T, gen: I, created_by: T, created_at: I, updated_at: I, deleted_at: I, step: FIVE_STEPS,
+      cause: ['confusion', 'missing_fact', 'reasoning', 'ignored_clue', 'misread', 'guess'], cause_quote: T, cause_inferred: [0, 1], cause_detail: T, cause_version: I, cause_disputed: [0, 1],
+      // The miss a duplicate was merged into by the clean-up (0054; map/hygiene.js).
+      merged_into: T,
+      his_words: T, his_words_at: I, his_words_src: ['uworld', 'exam', 'mo', 'none'], mo_corrected_json: 'jo',
     },
   },
   evidence: {

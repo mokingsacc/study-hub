@@ -6,7 +6,7 @@
 //   GET    /api/p/topics/:id/pictures        {pictures: [...], max}
 //   PUT    /api/p/pictures?topic=&caption=   a photo, the raw image as the body (JPEG, PNG or WebP, up to 5 MB)
 //   POST   /api/p/pictures                   {topic, doc_id, page, crop?, caption?}: a library page
-//   PATCH  /api/p/pictures/:id               {caption}
+//   PATCH  /api/p/pictures/:id               {caption?, covers?: [{x, y, w, h}]}  (covers: the boxes over its labels, to recall)
 //   DELETE /api/p/pictures/:id               undoable (POST /api/p/undo)
 //   GET    /api/p/pictures/:id/file          the photo itself
 //   tool   topic_picture                     pins a library page to a topic, or lists a topic's pictures
@@ -15,12 +15,13 @@ import { writeBatch, rand } from '../map/events.js';
 import { LEARNER, requireModule } from './modules.js';
 import { Plan, resolveTopic } from './subjects.js';
 import * as store from '../library/store.js';
+import * as inbox from '../map/photo-inbox.js';
 
-export const LIMITS = { per_topic: 12, per_user: 400, bytes: 5 * 1024 * 1024, caption: 120 };
+export const LIMITS = { per_topic: 12, per_user: 400, bytes: 5 * 1024 * 1024, caption: 120, covers: 30 };
 const LIVE = "('proposed','confirmed')";
 const st = (env, sql, ...b) => env.DB.prepare(sql).bind(...b);
 const oneLine = (s, n) => String(s ?? '').replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, n);
-const COLS = 'id, topic_id, kind, mime, bytes, doc_id, page, crop_json, caption, status, sort, created_by, created_at';
+const COLS = 'id, topic_id, kind, mime, bytes, doc_id, page, crop_json, caption, covers_json, status, sort, created_by, created_at';
 
 /** The kind of image the bytes are, by their first bytes (the name and the header are not trusted), or null. */
 export function imageType(buf) {
@@ -40,7 +41,7 @@ function cleanCrop(c) {
 }
 
 const shape = r => ({ id: r.id, topic_id: r.topic_id, kind: r.kind, caption: r.caption || null, doc_id: r.doc_id || null, page: r.page ?? null,
-  crop: r.crop_json ? JSON.parse(r.crop_json) : null, url: r.kind === 'photo' ? `/api/p/pictures/${encodeURIComponent(r.id)}/file` : null,
+  crop: r.crop_json ? JSON.parse(r.crop_json) : null, covers: r.covers_json ? JSON.parse(r.covers_json) : [], url: r.kind === 'photo' ? `/api/p/pictures/${encodeURIComponent(r.id)}/file` : null,
   doc_title: r.doc_title || null, created_by: r.created_by, created_at: r.created_at });
 
 async function ownTopic(env, user, topicId) {
@@ -79,6 +80,51 @@ async function addRow(env, user, topic, row, { actor, surface, via }) {
     { kind: 'picture.added', target_type: 'study_pictures', target_id: id, topic_id: topic.id, summary: `Added a ${row.kind === 'photo' ? 'photo' : 'page'} to ${topic.name}` });
   const w = await writeBatch(env, user, { actor, surface, via, rows: plan.rows, events: plan.events, undoable: true });
   return { picture: shape({ id, ...after }), batch_id: w.batch_id };
+}
+
+
+export async function fileFromInbox(env, user, items, { actor = 'claude', surface = 'chat', via = 'platform:photo_inbox' } = {}) {
+  if (!Array.isArray(items) || !items.length || items.length > inbox.ITEMS_MAX) throw new HttpError(400, `Send 1 to ${inbox.ITEMS_MAX} photos, each {id, topic}.`);
+  const rows = (await st(env, `SELECT id, r2_key, mime, bytes, filed_at, deleted_at FROM photo_inbox WHERE user_id = ?1 AND id IN (SELECT value FROM json_each(?2))`,
+    user, JSON.stringify(items.map(i => String(i && i.id)))).all()).results || [];
+  const byId = new Map(rows.map(r => [r.id, r]));
+  const plan = new Plan(), filed = [], unclear = [], next = new Map();
+  for (const it of items) {
+    const r = byId.get(String(it && it.id));
+    if (!r || r.deleted_at != null) throw new HttpError(404, `There is no photo ${String(it && it.id).slice(0, 40)} in the inbox.`);
+    if (r.filed_at != null) throw new HttpError(400, `Photo ${r.id} is already filed.`);
+    const ref = await resolveTopic(env, user, String(it.topic || '')).catch(() => null);
+    if (!ref || !ref.id) { unclear.push({ id: r.id, topic: it.topic, candidates: (ref && ref.candidates) || [] }); continue; }
+    const topic = await ownTopic(env, user, ref.id);
+    const sort = next.has(topic.id) ? next.get(topic.id) : await roomFor(env, user, topic.id);
+    next.set(topic.id, sort + 1);
+    if (sort >= LIMITS.per_topic) throw new HttpError(400, `${topic.name} already has ${LIMITS.per_topic} pictures. Remove one first.`);
+    const id = `pic_${rand().slice(0, 12)}`, t = nowMs();
+    plan.add({ table: 'study_pictures', op: 'insert', key: { id }, before: null, after: { topic_id: topic.id, kind: 'photo', r2_key: r.r2_key, mime: r.mime, bytes: Number(r.bytes) || 1,
+      doc_id: null, page: null, crop_json: null, caption: null, status: 'active', sort, created_by: actor, created_at: t, updated_at: t } },
+      { kind: 'picture.added', target_type: 'study_pictures', target_id: id, topic_id: topic.id, summary: `Photo from the inbox added to ${topic.name}` });
+    plan.add({ table: 'photo_inbox', op: 'update', key: { id: r.id }, before: { filed_at: null, topic_id: null, photo_id: null }, after: { filed_at: t, topic_id: topic.id, photo_id: id } },
+      { kind: 'picture.added', target_type: 'photo_inbox', target_id: r.id, topic_id: topic.id, summary: `Filed from the photo inbox on ${topic.name}` });
+    filed.push({ id: r.id, topic: topic.name, picture_id: id });
+  }
+  if (unclear.length) return { filed: [], unclear, next_step: 'Nothing filed yet: one topic was not clear. Pick from the candidates (ask them if two fit), then file again.' };
+  const w = await writeBatch(env, user, { actor, surface, via, rows: plan.rows, events: plan.events, undoable: true });
+  return { filed, batch_id: w.batch_id, note: 'Filed. They can say "undo that".' };
+}
+
+const P_PATH = id => `/api/p/photo-inbox/${encodeURIComponent(id)}`;
+async function inboxList(request, env, ctx, params, url, user) {
+  if (url.searchParams.get('count') === '1') return json({ count: await inbox.waitingCount(env, user) });
+  const rows = await inbox.waitingRows(env, user);
+  return json({ count: await inbox.waitingCount(env, user), photos: inbox.shapeInbox(rows).map(ownPaths) });
+}
+const ownPaths = p => ({ ...p, src: P_PATH(p.id), thumb: `${P_PATH(p.id)}?size=thumb` });
+async function inboxAdd(...a) {
+  const r = await inbox.addRoute(...a);
+  if (!r.ok || !String(r.headers.get('content-type') || '').includes('json')) return r;
+  const b = await r.json();
+  if (b.photo) b.photo = ownPaths(b.photo);
+  return json(b, r.status);
 }
 
 /** A photo they took or chose: the raw image bytes. */
@@ -142,11 +188,30 @@ async function fileRoute(request, env, ctx, params, url, user) {
     'X-Content-Type-Options': 'nosniff', 'Content-Security-Policy': "default-src 'none'", 'Content-Disposition': 'inline' } });
 }
 
+/** The boxes over a picture's labels (pure): up to LIMITS.covers boxes, each inside the picture, in fractions. */
+export function cleanCovers(v) {
+  if (!Array.isArray(v) || v.length > LIMITS.covers) throw new HttpError(400, `Up to ${LIMITS.covers} boxes.`);
+  const f = n => Math.round(Math.min(1, Math.max(0, Number(n))) * 1e4) / 1e4;
+  return v.map(b => {
+    if (!b || ![b.x, b.y, b.w, b.h].every(n => Number.isFinite(Number(n)))) throw new HttpError(400, 'Each box is x, y, w and h.');
+    const x = f(b.x), y = f(b.y), w = f(Math.min(Number(b.w), 1 - x)), h = f(Math.min(Number(b.h), 1 - y));
+    if (w < 0.005 || h < 0.005) throw new HttpError(400, 'A box is too small.');
+    return { x, y, w, h };
+  });
+}
+
 async function captionRoute(request, env, ctx, params, url, user) {
   const r = await ownPicture(env, user, params.id);
-  const caption = oneLine((await readJson(request, 2_000)).caption, LIMITS.caption) || null;
-  await st(env, 'UPDATE study_pictures SET caption = ?3, updated_at = ?4 WHERE user_id = ?1 AND id = ?2', user, r.id, caption, nowMs()).run();
-  return json({ picture: shape({ ...r, caption }) });
+  const b = await readJson(request, 8_000);
+  const caption = 'caption' in b ? oneLine(b.caption, LIMITS.caption) || null : r.caption;
+  const covers = 'covers' in b ? cleanCovers(b.covers) : null;
+  if (b.first === true) {
+    const top = await st(env, "SELECT COALESCE(MIN(sort), 0) AS m FROM study_pictures WHERE user_id = ?1 AND topic_id = ?2 AND status = 'active'", user, r.topic_id).first();
+    await st(env, 'UPDATE study_pictures SET sort = ?3, updated_at = ?4 WHERE user_id = ?1 AND id = ?2', user, r.id, Number(top.m) - 1, nowMs()).run();
+  }
+  await st(env, `UPDATE study_pictures SET caption = ?3, covers_json = CASE WHEN ?4 IS NULL THEN covers_json ELSE ?4 END, updated_at = ?5 WHERE user_id = ?1 AND id = ?2`,
+    user, r.id, caption, covers ? JSON.stringify(covers) : null, nowMs()).run();
+  return json({ picture: shape({ ...r, caption, ...(covers ? { covers_json: JSON.stringify(covers) } : {}) }) });
 }
 
 export const ROUTES = [
@@ -156,11 +221,41 @@ export const ROUTES = [
   ['PATCH', '/api/p/pictures/:id', gate(captionRoute)],
   ['DELETE', '/api/p/pictures/:id', gate((rq, env, ctx, params, url, user) => removePicture(env, user, params.id).then(json))],
   ['GET', '/api/p/pictures/:id/file', gate(fileRoute)],
+  ['GET', '/api/p/photo-inbox', gate(inboxList)],
+  ['POST', '/api/p/photo-inbox', gate(inboxAdd)],
+  ['DELETE', '/api/p/photo-inbox/:id', gate(inbox.discardRoute)],
+  ['GET', '/api/p/photo-inbox/:id', gate(inbox.imageRoute)],
 ];
 
 // ------------------------------------------------------------------ the tool
 
-export const TOOLS = [{
+const b64 = bytes => { let x = ''; for (let i = 0; i < bytes.length; i += 0x8000) x += String.fromCharCode(...bytes.subarray(i, i + 0x8000)); return btoa(x); };
+const photoInboxTool = {
+  name: 'photo_inbox', module: 'library',
+  description: 'Photos the student put in their Study Hub\'s Photo inbox (More, Photo inbox), to file on topics. list: a few as images (cursor for more); file {items: [{id, topic}]}; discard {ids}. Photos pasted into a chat cannot reach the hub: ask them to add them to the Photo inbox.',
+  inputSchema: { type: 'object', additionalProperties: false, required: ['action'], properties: {
+    action: { type: 'string', enum: ['list', 'file', 'discard'] }, cursor: { type: 'string' },
+    items: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['id', 'topic'], properties: { id: { type: 'string' }, topic: { type: 'string' } } } },
+    ids: { type: 'array', items: { type: 'string' } } } },
+  async run(env, user, a) {
+    if (a.action === 'file') return fileFromInbox(env, user, a.items);
+    if (a.action === 'discard') {
+      const { applyChange } = await import('../map/change.js');
+      const r = await applyChange(env, user, { actor: 'claude', surface: 'chat', via: 'platform:photo_inbox', op: 'photo_inbox.discard', args: { ids: a.ids || [] } });
+      if (!r.ok && !r.nothing) throw new HttpError(400, r.reason || 'Those photos could not be taken out.');
+      return { discarded: (r.reply && r.reply.discarded) || [], batch_id: r.batch_id || null };
+    }
+    const r = await inbox.inboxPage(env, user, { cursor: a.cursor || null, limit: 4 });
+    const head = r.waiting ? { waiting: r.waiting, photos: r.photos.map((p, i) => ({ n: i + 1, id: p.id, ...(p.data ? {} : { note: 'Too large to show here.' }) })),
+      ...(r.next_cursor ? { next_cursor: r.next_cursor } : {}), next_step: 'Look at each picture, pick its topic (ask them when two fit), then file {items: [{id, topic}]}.' }
+      : { waiting: 0, photos: [], next_step: 'The inbox is empty. Ask them to add photos in their Study Hub: More, Photo inbox.' };
+    const content = [{ type: 'text', text: JSON.stringify(head) }];
+    r.photos.forEach((p, i) => { if (p.data) content.push({ type: 'text', text: `Photo ${i + 1}: ${p.id}` }, { type: 'image', data: b64(p.data), mimeType: p.mime }); });
+    return { __mcp: { content, structuredContent: head } };
+  },
+};
+
+export const TOOLS = [photoInboxTool, {
   name: 'topic_picture',
   module: 'library',
   description: 'Pictures on one of the student\'s topics (up to 12): pins a page of a PDF in THEIR OWN library to a topic, for example "put the heart diagram from my notes on Cardiac cycle" (library_search finds the doc_id and page). '

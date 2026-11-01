@@ -3,7 +3,7 @@
 // categorySummary, from the payload) at alpha 0.05 + 0.15·coverage, and its title's counts line, "6 weak · 14 not
 // seen yet". The sky below paints the haze, nebulae and dust from them.
 import { BANDS } from './scale.js';
-import { DONUT } from './donut.js';
+import { DONUT, galaxyFootprints } from './donut.js';
 
 export const HALO_GROW = 1.15, HALO_PAD = 30;
 export const UNSEEN_ALPHA = 0.05;
@@ -47,24 +47,20 @@ export function mapTitle(cat) {
  * colourOf(t1000) and unseenHex come from the palette, so the halo uses the same scale as the nodes.
  */
 export function buildHalos(model, { colourOf, unseenHex }) {
-  const members = new Map();
-  for (let i = 0; i < model.n; i++) {
-    if (!model.placed[i] || model.cat[i] < 0) continue;
-    const c = model.cat[i];
-    if (!members.has(c)) members.set(c, []);
-    members.get(c).push(i);
-  }
   const out = [];
-  for (const [c, list] of members) {
-    const cat = model.cats[c];
+  // each galaxy's main cluster (donut.js galaxyFootprints, the same the family arcs use): a topic saved away from its
+  // galaxy (moved to another system since the layout) neither drags the glow and the name off its stars nor widens them
+  for (const g of galaxyFootprints(model)) {
+    const c = g.c, list = g.list;
+    const cat = c >= 0 ? model.cats[c] : null;
     if (!cat) continue;
-    let sx = 0, sy = 0, top = Infinity, bottom = -Infinity;
-    for (const i of list) { sx += model.x[i]; sy += model.y[i]; top = Math.min(top, model.y[i] - model.r[i]); bottom = Math.max(bottom, model.y[i] + model.r[i]); }
-    const cx = sx / list.length, cy = sy / list.length;
+    let top = Infinity, bottom = -Infinity;
+    for (const i of list) { top = Math.min(top, model.y[i] - model.r[i]); bottom = Math.max(bottom, model.y[i] + model.r[i]); }
+    const cx = g.x, cy = g.y;
     const R = HALO_GROW * p90(list.map(i => Math.hypot(model.x[i] - cx, model.y[i] - cy) + model.r[i])) + HALO_PAD;
     const seen = cat.t1000 != null;
     out.push({
-      c, cx, cy, R, top, bottom, n: list.length, name: cat.name, short: cat.short, line2: countsLine(cat), title: mapTitle(cat),
+      c, cx, cy, R, top, bottom, n: g.n, list, name: cat.name, short: cat.short, line2: countsLine(cat), title: mapTitle(cat),
       colour: seen ? colourOf(cat.t1000) : unseenHex,
       alpha: seen ? 0.05 + 0.15 * Math.max(0, Math.min(1, cat.coverage)) : UNSEEN_ALPHA,
     });

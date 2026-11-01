@@ -1,5 +1,7 @@
 import { similarityGraph } from './similarity.js';
-import { seatCategories, placeSeats, familyOf, DONUT } from './donut.js';
+import { familyOf, DONUT } from './donut.js';
+// The foundation systems go on a ring round the donut (foundations-ring.js); without any, these are donut.js's own.
+import { seatWithRing, placeWithRing } from './foundations-ring.js';
 
 export const V3 = Object.freeze({
   // 2. categories
@@ -427,10 +429,10 @@ export async function semanticLayout(model, { sim = [], f, v3 = V3, onProgress =
   await pause();
   const rel = categoryRelatedness(model, graph, f);
   const ids = rel.ks.map(c => (c >= 0 && model.cats[c] ? model.cats[c].id : null));
-  const seating = seatCategories(ids, rel.S, { current, d: donut });
+  const seating = seatWithRing(ids, rel.S, { current, d: donut });
   // the seats at the galaxies' estimated sizes: where each galaxy's ties point while its units are turned
   const fam = ids.map(id => familyOf(id).id);
-  const P = placeSeats(seating.seats, seating.seatOf, rel.R, { gap: donut.gap, familyGap: donut.familyGap, holeBand: donut.holeBand, fam });
+  const P = placeWithRing(seating, rel.R, { gap: donut.gap, familyGap: donut.familyGap, holeBand: donut.holeBand, fam });
   const members = new Map();
   for (let i = 0; i < model.n; i++) { const c = model.cat[i]; if (!members.has(c)) members.set(c, []); members.get(c).push(i); }
   const gals = [];
@@ -471,7 +473,7 @@ export async function semanticLayout(model, { sim = [], f, v3 = V3, onProgress =
     for (let i = 0; i < g.n; i++) { g.x[i] -= cx; g.y[i] -= cy; reach = Math.max(reach, Math.hypot(g.x[i], g.y[i]) + model.r[g.list[i]]); }
     R[g.k] = reach;
   }
-  const at = placeSeats(seating.seats, seating.seatOf, R, { gap: donut.gap, familyGap: donut.familyGap, holeBand: donut.holeBand, fam });
+  const at = placeWithRing(seating, R, { gap: donut.gap, familyGap: donut.familyGap, holeBand: donut.holeBand, fam });
   if (onProgress) onProgress(1);
 
   const topics = [], categories = [];

@@ -1,4 +1,4 @@
-import { json, HttpError } from '../util.js';
+import { json, HttpError, readJson } from '../util.js';
 import { summaryOf, rand } from './events.js';
 import { applyChange, changeResponse } from './change.js';
 
@@ -18,9 +18,11 @@ export const photoPath = id => `/api/map/photos/${encodeURIComponent(id)}`;
 
 // ---------------------------------------------------------------- reads (topicDetail's batch)
 
+export const PHOTO_ORDER = 'sort IS NULL, sort, created_at, id';
+
 export function photoStatement(env, user, topicId) {
   return env.DB.prepare(`SELECT id, mime, width, height, source, created_at FROM topic_photos WHERE user_id = ? AND topic_id = ? AND deleted_at IS NULL
-    ORDER BY created_at, id LIMIT ${MAX_PHOTOS}`).bind(user, topicId);
+    ORDER BY ${PHOTO_ORDER} LIMIT ${MAX_PHOTOS}`).bind(user, topicId);
 }
 
 /** Rows as the panel's d.photos: [{id, src, w, h, source, at}]. */
@@ -30,7 +32,8 @@ export function shapePhotos(rows) {
 
 // ---------------------------------------------------------------- changes (registry media.js)
 
-async function topicName(env, user, topicId) {
+/** A live topic's name, or null (retired, merged or not there). The photo inbox files on it too. */
+export async function topicName(env, user, topicId) {
   const t = await env.DB.prepare(`SELECT name, status FROM topics WHERE user_id = ? AND id = ?`).bind(user, topicId).first();
   return t && !['retired', 'merged'].includes(t.status) ? t.name : null;
 }
@@ -75,6 +78,33 @@ export async function planPhotoRemove(env, user, args, ctx) {
   };
 }
 
+export async function planPhotoReorder(env, user, args, ctx) {
+  const a = args || {};
+  for (const k of Object.keys(a)) if (!['topic_id', 'ids'].includes(k)) return { refuse: `Unknown argument ${k}.` };
+  const topicId = typeof a.topic_id === 'string' ? a.topic_id.trim() : '';
+  if (!topicId || topicId.length > 120) return { refuse: 'topic_id is the topic whose photos move.' };
+  const ids = Array.isArray(a.ids) ? a.ids : null;
+  if (!ids || !ids.length || ids.length > MAX_PHOTOS || ids.some(id => typeof id !== 'string' || !ID.test(id)) || new Set(ids).size !== ids.length) {
+    return { refuse: 'ids is every photo on the topic, once each, first first.' };
+  }
+  const name = await topicName(env, user, topicId);
+  if (!name) return { refuse: 'There is no topic with that id on the map.' };
+  const res = await env.DB.prepare(`SELECT id, sort FROM topic_photos WHERE user_id = ? AND topic_id = ? AND deleted_at IS NULL ORDER BY ${PHOTO_ORDER}`)
+    .bind(user, topicId).all();
+  const live = (res && res.results) || [];
+  const have = new Set(live.map(r => r.id));
+  if (live.length !== ids.length || ids.some(id => !have.has(id))) return { refuse: 'The photos on this topic changed. Reload and move them again.' };
+  const sortOf = new Map(live.map(r => [r.id, r.sort == null ? null : Number(r.sort)]));
+  const moved = ids.map((id, i) => ({ id, i })).filter(x => sortOf.get(x.id) !== x.i);
+  if (!moved.length) return { noop: true, summary: 'The photos are already in that order.' };
+  const summary = summaryOf(`Photos put in a new order on ${name}`);
+  return {
+    rows: moved.map(x => ({ table: 'topic_photos', op: 'update', key: { id: x.id }, before: { sort: sortOf.get(x.id) }, after: { sort: x.i } })),
+    events: moved.map(x => ({ target_type: 'topic_photos', target_id: x.id, topic_id: topicId, summary })),
+    summary, reply: { order: ids },
+  };
+}
+
 // ---------------------------------------------------------------- routes
 
 // POST /api/map/topic/:id/photos (multipart: file, source, width, height). One photo a request: the page sends a
@@ -97,6 +127,13 @@ export async function addRoute(request, env, ctx, params, url, user) {
   const source = SOURCES.includes(form.get('source')) ? form.get('source') : 'file';
   return changeResponse(await applyChange(env, user, { actor: 'mo', surface: 'web', op: 'topic_photo.add', via: 'api:POST /api/map/topic/:id/photos',
     args: { topic_id: topicId, id, mime, width: dim(form.get('width')), height: dim(form.get('height')), bytes: data.byteLength, source } }));
+}
+
+// POST /api/map/topic/:id/photos/order {ids}
+export async function orderRoute(request, env, ctx, params, url, user) {
+  const body = await readJson(request, 20_000);
+  return changeResponse(await applyChange(env, user, { actor: 'mo', surface: 'web', op: 'topic_photo.reorder', via: 'api:POST /api/map/topic/:id/photos/order',
+    args: { topic_id: String(params.id || ''), ids: Array.isArray(body && body.ids) ? body.ids : [] } }));
 }
 
 // DELETE /api/map/topic/:id/photos/:photo_id

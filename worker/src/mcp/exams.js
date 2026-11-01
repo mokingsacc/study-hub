@@ -12,13 +12,13 @@ import { listQueue } from '../map/topics.js';
 import { legacy } from './reply.js';
 import { readOnly, additive, ALWAYS_LOAD } from './annotations.js';
 
-// Sources Claude itself logs from; spoken_cue and the Anki check's (anki_mac, anki_hub, anki_phone) are written by the hub's own code.
-const CODE_SOURCES = ['spoken_cue', 'anki_mac', 'anki_hub', 'anki_phone'];
+// Sources Claude itself logs from; spoken_cue and the Anki check's (anki_mac, anki_hub, anki_phone, anki_voice_check) are written by the hub's own code.
+const CODE_SOURCES = ['spoken_cue', 'anki_mac', 'anki_hub', 'anki_phone', 'anki_voice_check'];
 export const CLAUDE_GAP_SOURCES = SOURCES.filter(s => !CODE_SOURCES.includes(s));
 export const GAP_ORIGINS = ['stated', 'review'];
 export const ANKI_WORDS_MAX = 60;
 const CARD_STYLE = 'in his card style: a NEW short case under 30 words (never the exam\'s own question), one or two questions, one full sentence per answer, then "Versus <look-alike>: <finding that tells them apart>, so <what you do differently>.", notes starting "Why: "';
-export const FLASHCARD_STEP = `Suggest at most 15 cards ranked by what will most raise his Step 2 score (confident errors, topics missed before, weakest systems first), ${CARD_STYLE}. Mo keeps any number; add only the ones he keeps, with his Anki connector, to the deck "Step 2 — My Cards". Misreads and test-taking slips get no card.`;
+export const FLASHCARD_STEP = `Suggest at most 15 cards, ranked by marks at stake: map_weakest {purpose: "cards", since_day: the sitting's day} gives each miss its marks (the planner's value of the topic; lane, then exam yield, when it has none). Cards only for the top ones; say in one line which you skipped and why. Write each one ${CARD_STYLE}. Mo keeps any number; add only the ones he keeps, with his Anki connector, to the deck "Step 2 — My Cards". Misreads and test-taking slips get no card.`;
 
 // Only sittings that have ended (CONTRACT hard rule): a sitting still running shows Claude no score, mistakes or
 // questions to check, as Smart review stays closed until then.
@@ -166,7 +166,7 @@ export const EXAM_TOOLS = [
   {
     name: 'exam_mistakes', title: 'Mistakes in one exam', legacy: true, annotations: readOnly('Mistakes in one exam'),
     // The card rules ride in the reply's next_step (FLASHCARD_STEP, in full), so the description names them only.
-    description: 'For "make flashcards from <exam>" (a hub sitting, e.g. "NBME 10"; default the latest): his wrong and flawed-right answers, most useful first: system, error type, his words, gap, rule, look-alike, Mehlman note, earlier misses. Then follow its next_step: at most 15 cards in his card style for "Step 2 — My Cards"; misreads and test-taking slips get none. The day\'s UWorld and Anki misses: map_weakest {purpose: "cards"}.',
+    description: 'For "make flashcards from <exam>" (a hub sitting, e.g. "NBME 10"; default the latest): his wrong and flawed-right answers, most useful first: system, error type, his words, gap, rule, look-alike, Mehlman note, earlier misses. Then follow its next_step: at most 15 cards in his style for "Step 2 — My Cards"; none for misreads or test-taking slips. The day\'s UWorld and Anki misses: map_weakest {purpose: "cards"}.',
     inputSchema: { type: 'object', properties: { sitting: { type: 'string', description: 'Sitting id or name' } }, additionalProperties: false },
     run: async (env, user, args) => {
       const s = await findSitting(env, args.sitting);
@@ -183,13 +183,13 @@ export const EXAM_TOOLS = [
   },
   {
     name: 'next_to_check', title: 'Next question to check', legacy: true, annotations: readOnly('Next question to check'),
-    description: 'The next question to check: pictures, question, his answer (marked by code), confidence, time, clicks, highlights, earlier mistakes, transcript. A sitting id or name stays in one exam; else the oldest anywhere. done with a queue: unplaced topics wait: map_queue then map_resolve, 25 at a time.',
+    description: 'The next question to check: pictures, question, his answer (marked by code), confidence, time, clicks, highlights, earlier mistakes, transcript. A sitting id or name stays in one exam; else the oldest anywhere. done with a queue: place its topics (map_queue, map_resolve).',
     inputSchema: { type: 'object', properties: { sitting: { type: 'string', description: 'Sitting id or name' } }, additionalProperties: false },
     run: (env, user, args) => nextToCheck(env, user, args),
   },
   {
     name: 'uworld_blocks', title: 'UWorld recordings', legacy: true, annotations: readOnly('UWorld recordings'),
-    description: 'His UWorld recorder blocks, newest first: date, mode, minutes, transcript (his words with times, split into questions with results-screen details when saved). Up to 20 a call; page with before = the oldest date seen. Habits: read page by page for repeated patterns (anchoring on the first clue, stopping at the first fitting diagnosis, answering a different question, changing right answers, long hesitation, by system); give his top 3, each with examples (time, his words) and one fix.',
+    description: 'His UWorld recorder blocks, newest first: date, mode, minutes, transcript (his timed words, per question when saved). 20 a call; page with before = the oldest date. Habits: read every page for repeats (anchoring, first fit, another question answered, right answers changed, hesitation, by system); top 3 with examples and a fix.',
     inputSchema: { type: 'object', properties: {
       since: { type: 'string', description: 'Only blocks on or after this day, YYYY-MM-DD' },
       before: { type: 'string', description: 'Only blocks before this day, YYYY-MM-DD (for paging)' },
@@ -204,7 +204,7 @@ export const EXAM_TOOLS = [
   },
   {
     name: 'uworld_words', title: 'His words on a UWorld question', legacy: true, annotations: readOnly('His words on a UWorld question'),
-    description: 'What he said aloud in a recorded UWorld block, with times (his words only); the latest, or a block or date. With a question: its part when its start is saved, else the whole block. A UWorld review: teach_debrief (his words per question).',
+    description: 'What he said aloud in a recorded UWorld block, with times; the latest, or a block or date. With a question: its part when its start is saved, else the whole block.',
     inputSchema: { type: 'object', properties: {
       question: { type: 'integer', minimum: 1, maximum: 60, description: 'The question\'s number in the block (shown on the UWorld screen)' },
       block: { type: 'string', description: 'A block id, if you have one' },
@@ -213,15 +213,18 @@ export const EXAM_TOOLS = [
       const r = await blockWords(env, args);
       if (!r.found) return legacy(r, 'No UWorld block is recorded on the hub yet. Carry on without his words.');
       const head = `Block ${r.block}, ${r.date}, ${r.mode}${r.minutes != null ? `, ${r.minutes} min` : ''}${r.count ? `, ${r.count} questions` : ''}.${r.saved_questions.length ? ` Questions already saved: ${r.saved_questions.join(', ')}.` : ''}`;
-      const what = r.whole_block ? (r.question ? `Q${r.question} has no saved start yet, so here is the whole block: find his words for Q${r.question}, then save its start with save_uworld_questions.` : 'The whole block:')
+      const what = r.whole_block ? (r.question ? `Q${r.question} has no saved start yet, so here is the whole block: find his words for Q${r.question}.` : 'The whole block:')
         : `Q${r.question} only:`;
-      const details = r.details ? `\nResults screen: ${r.details}.${r.time_s ? ` Pass time_s ${r.time_s} to debrief_question.` : ''}` : '';
-      return legacy(r, `${head}${details}\n${what}\n${r.transcript}`);
+      const details = r.details ? `\nResults screen: ${r.details}.` : '';
+      const rv = r.review;
+      const review = !rv ? '' : rv.transcript ? `\n\nHis review afterwards${rv.cause ? ` (cause in his words: ${rv.cause})` : ''}:\n${rv.transcript}`
+        : rv.said ? `\n\nHis review afterwards (${rv.at || '?'}): "${rv.said}"` : `\n\nHis review: ${rv.note || rv.line || rv.status}`;
+      return legacy(r, `${head}${details}\n${what}\n${r.transcript}${review}`);
     },
   },
   {
     name: 'uworld_times', title: 'UWorld timing', legacy: true, annotations: readOnly('UWorld timing'),
-    description: 'His UWorld timing (results screenshots): average, how many over the 90 s pace, the slow ones over 2 min (right ones too, slowest first), slowest systems; default the last 7 days. A slow topic is weak even when right (flashcards, timing). Also his UWorld progress (blocks and screenshots): first pass left, pace, finish, incorrects.',
+    description: 'His UWorld timing: average, how many over the 90 s pace, those over 2 min (right ones too, slowest first), slowest systems; default the last 7 days. A slow topic is weak even when right. Also his UWorld progress: first pass left, pace, finish, incorrects.',
     inputSchema: { type: 'object', properties: {
       since: { type: 'string', description: 'Only blocks on or after this day, YYYY-MM-DD' },
       before: { type: 'string', description: 'Only blocks before this day, YYYY-MM-DD' } }, additionalProperties: false },
@@ -232,8 +235,9 @@ export const EXAM_TOOLS = [
     },
   },
   {
-    name: 'save_uworld_questions', title: 'Save UWorld questions', legacy: true, annotations: additive('Save UWorld questions', { idempotent: true }),
-    description: 'Save questions onto a recorded UWorld block: start time, his results screen and your check. Saving again updates the fields given. Labels and numbers only, never question text. The hub judges blocks itself: a UWorld review never needs this.',
+    // Unlisted (the Claude audit, 1 Nov 2026): teach_debrief {judge: true, block, items} saves the same rows; still callable.
+    name: 'save_uworld_questions', title: 'Save UWorld questions', legacy: true, unlisted: true, annotations: additive('Save UWorld questions', { idempotent: true }),
+    description: 'Save questions onto a recorded UWorld block: start time, results screen, your check. Labels and numbers only, never question text. Not for a block review.',
     inputSchema: { type: 'object', properties: {
       block: { type: 'string', description: 'The block id from the paste' },
       questions: { type: 'array', minItems: 1, maxItems: 60, items: { type: 'object', properties: {
@@ -256,17 +260,17 @@ export const EXAM_TOOLS = [
   },
   {
     name: 'log_gap', title: 'Log a gap', legacy: true, annotations: additive('Log a gap'), _meta: ALWAYS_LOAD,
-    description: '"gap: ..." (or "gap, why ...") from Mo, anywhere: call with his words and the topic, reply only "Logged." and carry on; don\'t teach unless he asks. Anki Voice: whenever you rate a card with any part wrong or nudged, call it beside rate_card in the same turn (source anki_voice, origin review, card_id, note_id, topic, gap in your words, said = his, mixed_with, step); say nothing. Never question-bank or card text.',
+    // No Anki Voice clause (audit, 31 Oct 2026): rate_card's gap reaches the hub from the Anki server itself.
+    description: '"gap: ..." (or "gap, why ...") from Mo, anywhere: call with his words and the topic, reply only "Logged." and carry on; don\'t teach unless he asks. Never question-bank or card text. Missed cards in an Anki Voice review need no call: rate_card sends them.',
     inputSchema: { type: 'object', properties: {
-      gap: { type: 'string', description: `What he doesn't get, one plain line (his words for "gap:", yours for a missed card), ≤${GAP_MAX} chars` },
+      gap: { type: 'string', description: `What he doesn't get, one plain line, his words, ≤${GAP_MAX} chars` },
       topic: { type: 'string', description: `One condition or approach as an AMBOSS article names it, singular, no "vs" ("Rh alloimmunization"), ≤${TOPIC_MAX} chars` },
       said: { type: 'string', description: `His own words, shortened, ≤${SAID_MAX} chars (not when gap is his words)` },
-      card_id: { type: 'integer', description: 'The Anki card id (Anki Voice: the one you rated)' },
-      note_id: { type: 'integer', description: 'The Anki note id, if known' },
+      card_id: { type: 'integer', description: 'The Anki card on screen, if any' },
+      note_id: { type: 'integer' },
       ref: { type: 'string', description: 'Context: "UW 12345", or "NBME 10 Q22" / "NBME 10 B2 Q22" as next_to_check names it' },
-      source: { type: 'string', enum: CLAUDE_GAP_SOURCES, description: 'anki_voice in an Anki Voice review, else chat (default)' },
-      origin: { type: 'string', enum: GAP_ORIGINS, description: 'stated: Mo said it; review: a card you rated wrong or nudged' },
-      verdict: { type: 'string', enum: ['gap', 'shaky'], description: 'gap (default), or shaky: right only after a nudge or unsure' },
+      source: { type: 'string', enum: CLAUDE_GAP_SOURCES, description: 'chat (default), or anki_voice in a voice review' },
+      origin: { type: 'string', enum: GAP_ORIGINS },
       error_type: { type: 'string', enum: ERROR_TYPES },
       mixed_with: { type: 'string', description: 'The look-alike he mixed it up with (AMBOSS name)' },
       step: { type: 'string', enum: GAP_STEPS },
@@ -275,7 +279,7 @@ export const EXAM_TOOLS = [
   },
   {
     name: 'list_gaps', title: 'His logged gaps', legacy: true, annotations: readOnly('His logged gaps'),
-    description: 'His logged gaps, newest first: stated ("gap: ..."), said aloud while recording, shaky or missed cards from Anki reviews, each with topic, his words, card or question; plus repeated topics. For "what are my gaps"; "teach me" is teach_next.',
+    description: 'His logged gaps, newest first: stated ("gap: ..."), said aloud while recording, shaky or missed cards from Anki reviews, each with topic, his words, card or question; plus repeated topics. For "what are my gaps".',
     inputSchema: { type: 'object', properties: {
       since_days: { type: 'integer', minimum: 1, maximum: 120, description: 'How many days back, default 14' },
       limit: { type: 'integer', minimum: 1, maximum: 100, description: 'How many, default 30' },
@@ -284,7 +288,7 @@ export const EXAM_TOOLS = [
   },
   {
     name: 'anki_words', title: 'His words in Anki reviews', legacy: true, annotations: readOnly('His words in Anki reviews'),
-    description: `What he said aloud reviewing Anki, card by card (before and after the answer), with rating, time and the hub's check (sound, shaky, gap). Latest review, or a session or day; card_id: one card's history. At most ${ANKI_WORDS_MAX} cards, spoken and flagged first (more: how many left out). Shaky and missed cards are in list_gaps too. Card text: the Anki connector.`,
+    description: `What he said aloud reviewing Anki, card by card, before and after the answer, with rating, time and the hub's check (sound, shaky, gap). Latest review, or a session or day; card_id: one card's history. At most ${ANKI_WORDS_MAX} cards, spoken and flagged first. Card text: the Anki connector.`,
     inputSchema: { type: 'object', properties: {
       session: { type: 'string', description: 'A review session id' },
       date: { type: 'string', description: 'A day, YYYY-MM-DD (its latest review)' },
@@ -297,7 +301,7 @@ export const EXAM_TOOLS = [
   },
   {
     name: 'save_check', title: 'Save a check', legacy: true, annotations: additive('Save a check', { idempotent: true }),
-    description: 'Save your check of the next_to_check question. Code checks it (verdict vs the code marking, the If/then rule, nothing copied from the question); fix the problems it lists and call again. Correcting a saved check (only when Mo asks): the whole check, overwrite true.',
+    description: 'Save your check of the next_to_check question. Code checks it (verdict vs code marking, the If/then rule, nothing copied); fix the problems it lists and call again. Correcting a saved check (only when Mo asks): the whole check, overwrite true.',
     inputSchema: {
       type: 'object',
       properties: {

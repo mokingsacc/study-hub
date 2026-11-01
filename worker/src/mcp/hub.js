@@ -4,6 +4,9 @@ import { readOnly, additive, destructive } from './annotations.js';
 import { claudeChange, MO_SAID, CONFIRM } from './map.js';
 import { changeReply } from './reply.js';
 import { uworldReview } from '../uworld-review.js';
+import { captureReply } from '../uworld-capture.js';
+import { judgeMode } from '../uworld-review.js';
+import { chatJudgeRead, chatJudgeSubmit, chatReviewSubmit } from '../uworld-chat-judge.js';
 
 const ACTORS = ['claude', 'mo', 'code', 'anki', 'extractor', 'cron', 'any'];
 
@@ -15,13 +18,19 @@ async function hubUndo(env, user, args, ctx) {
 
 export const HUB_TOOLS = [
   {
-    name: 'teach_debrief', title: 'UWorld review', annotations: additive('UWorld review', { idempotent: true }), cap: 30000, trim: ['packs:4'],
-    description: 'UWorld review. No id (once a chat, beside get_page_text): the block\'s list, every question\'s pack; answer the one on the page. uworld_id: its pack, marked reviewed (not with peek). log: true logs it to Anki (error_type, confidence word, said).',
+    name: 'teach_debrief', title: 'UWorld review', annotations: additive('UWorld review', { idempotent: true }), cap: 30000, trim: ['packs:4', 'history:2'],
+    description: 'UWorld review. No id (once a chat, beside get_page_text): the list, every pack. uworld_id: its pack, marked reviewed (not with peek). log: true logs it ("log this"; error_type, confidence word, said). "Send the block": judge: true, then steps; items: judged questions; review: a save per review message.',
     inputSchema: { type: 'object', properties: {
       uworld_id: { type: 'string', maxLength: 12 }, q: { type: 'integer', minimum: 1, maximum: 60 }, block: { type: 'string', maxLength: 40 },
       log: { type: 'boolean' }, error_type: { type: 'string' }, confidence: { type: ['integer', 'string'] },
-      said: { type: 'string' }, peek: { type: 'boolean' } }, additionalProperties: false },
-    run: (env, user, args, ctx) => uworldReview(env, args, ctx),
+      said: { type: 'string' }, peek: { type: 'boolean' }, send: { type: 'boolean' },
+      judge: { type: 'boolean' }, script: { type: 'boolean' }, items: { type: 'array', maxItems: 60 }, review: { type: 'object' } }, additionalProperties: false },
+    run: async (env, user, args, ctx) => {
+      if (args.review != null) return chatReviewSubmit(env, args, ctx);
+      if (args.judge === true || (args.send === true && (await judgeMode(env)) === 'chat')) return chatJudgeRead(env, args, ctx);
+      if (args.items != null) return chatJudgeSubmit(env, args, ctx);
+      return args.send ? captureReply(env) : uworldReview(env, args, ctx);
+    },
   },
   {
     name: 'hub_changes', title: 'What changed', annotations: readOnly('What changed'), cap: 6000, trim: ['changes:5'],
@@ -33,7 +42,7 @@ export const HUB_TOOLS = [
   },
   {
     name: 'hub_undo', title: 'Undo a change', annotations: destructive('Undo a change'), cap: 1500,
-    description: '"Undo that": reverse a whole change. last: your latest 1-5 (default 1); seq: the change holding it (hub_changes). Older ones ask Mo first. Undoing an undo redoes it. Cards: the Anki connector.',
+    description: '"Undo that": reverse a whole change. last: your latest 1-5 (default 1); seq: the change holding it (hub_changes). Older ones ask Mo first. Undoing an undo redoes it.',
     inputSchema: { type: 'object', properties: {
       seq: { type: 'integer', minimum: 1 }, last: { type: 'integer', minimum: 1, maximum: 5 }, mo_said: MO_SAID, confirm_token: CONFIRM }, additionalProperties: false },
     run: (env, user, args, ctx) => hubUndo(env, user, args, ctx),

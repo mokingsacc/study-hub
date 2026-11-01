@@ -3,6 +3,7 @@ import { chunks } from '../map/events.js';
 import { embedTexts } from '../map/embed.js';
 import { EMBED_MODEL, dequantise, normalise } from '../../../public/js/shared/similarity.js';
 import { namedIn } from '../../../public/js/shared/names.js';
+import { ROOT_LIKE, notRootTopic } from '../map/card-roots.js';
 
 export const HOME_MAX = 300, HOME_Z = 3, CANDIDATES = 8, VOTES = 5, TEXT_MAX = 480;
 export const LABEL_BATCH = 25, LABEL_DAY_USD = 1, LABEL_RESERVE_USD = 0.3, LABEL_SOURCE = 'cards.home.label';
@@ -12,7 +13,8 @@ const LIVE = "('proposed', 'confirmed')";
 
 const LINK_OK = `ct.removed_at IS NULL AND (ct.strong = 1 OR ct.created_by <> 'auto') AND t.status <> 'retired'
   AND (t.status <> 'merged' OR (t2.id IS NOT NULL AND t2.status NOT IN ('retired', 'merged')))
-  AND CASE WHEN t.status = 'merged' THEN t2.category_id ELSE t.category_id END IS NOT NULL`;
+  AND CASE WHEN t.status = 'merged' THEN t2.category_id ELSE t.category_id END IS NOT NULL
+  AND CASE WHEN t.status = 'merged' THEN t2.category_id ELSE t.category_id END NOT LIKE '${ROOT_LIKE}'`;
 const LINK_FROM = `card_topics ct JOIN topics t ON t.user_id = ct.user_id AND t.id = ct.topic_id
   LEFT JOIN topics t2 ON t2.user_id = t.user_id AND t2.id = t.merged_into`;
 
@@ -30,6 +32,7 @@ export function codeHomeStatements(env, user, now) {
         (via IN ('embed', 'label') AND NOT EXISTS (SELECT 1 FROM card_topics ct JOIN topics t ON t.user_id = ct.user_id AND t.id = ct.topic_id
           WHERE ct.user_id = ?1 AND ct.card_id = card_home.card_id AND ct.topic_id = card_home.topic_id AND ct.removed_at IS NULL AND t.status IN ${LIVE}))
         OR (via = 'nearest' AND NOT EXISTS (SELECT 1 FROM topics t WHERE t.user_id = ?1 AND t.id = card_home.topic_id AND t.status IN ${LIVE}))
+        OR EXISTS (SELECT 1 FROM topics t WHERE t.user_id = ?1 AND t.id = card_home.topic_id AND t.category_id LIKE '${ROOT_LIKE}')
         OR (via = 'weak' AND NOT EXISTS (SELECT 1 FROM ${LINK_FROM} WHERE ct.user_id = ?1 AND ct.card_id = card_home.card_id AND ${LINK_OK}
           AND ${RESOLVED} = card_home.topic_id))
         OR (via = 'strong' AND NOT EXISTS (SELECT 1 FROM ${LINK_FROM} WHERE ct.user_id = ?1 AND ct.card_id = card_home.card_id AND ct.strong = 1 AND ${LINK_OK})))`).bind(user),
@@ -149,7 +152,8 @@ function homeUpsert(env, user, rows, now) {
     .bind(user, now, JSON.stringify(part.map(r => ({ ...r, candidates: r.candidates ? JSON.stringify(r.candidates) : null, label_at: r.label_at ?? null })))));
 }
 const autoLinks = (env, user, rows, now) => chunks(rows, 200).map(part => env.DB.prepare(`INSERT INTO card_topics (user_id, card_id, topic_id, match, strong, created_by, created_at)
-    SELECT ?1, json_extract(value, '$.card_id'), json_extract(value, '$.topic_id'), 'search', 0, 'auto', ?2 FROM json_each(?3) WHERE true
+    SELECT ?1, json_extract(value, '$.card_id'), json_extract(value, '$.topic_id'), 'search', 0, 'auto', ?2 FROM json_each(?3)
+    WHERE ${notRootTopic('?1', "json_extract(value, '$.topic_id')")}
     ON CONFLICT (user_id, card_id, topic_id) DO NOTHING`).bind(user, now, JSON.stringify(part.map(r => ({ card_id: r.card_id, topic_id: r.topic_id })))));
 
 /**
@@ -186,7 +190,7 @@ export async function assignHomes(env, user, ids, { now = Date.now(), ai = env.A
     try {
       topics = ((await env.DB.prepare(`SELECT e.topic_id AS id, t.category_id, e.vec, e.scale FROM topic_embeddings e
           JOIN topics t ON t.user_id = e.user_id AND t.id = e.topic_id AND t.status IN ${LIVE}
-          WHERE e.user_id = ?1 AND e.model = ?2 AND t.category_id IS NOT NULL ORDER BY e.topic_id`).bind(user, EMBED_MODEL).all()).results || [])
+          WHERE e.user_id = ?1 AND e.model = ?2 AND t.category_id IS NOT NULL AND t.category_id NOT LIKE '${ROOT_LIKE}' ORDER BY e.topic_id`).bind(user, EMBED_MODEL).all()).results || [])
         .map(r => ({ id: r.id, category_id: r.category_id, vec: dequantise(r.vec, r.scale) })).filter(t => t.vec);
     } catch (e) { if (!noTable(e)) throw e; }
   }
@@ -320,7 +324,8 @@ export async function labelLeftovers(env, user, ids, { now = Date.now(), call = 
   const spent = cur.day === day ? Number(cur.usd) || 0 : 0;
   if (spent >= LABEL_DAY_USD) return { skipped: 'daily card labeller limit' };
   const asked = new Map(rows.map(r => { let c = []; try { c = JSON.parse(r.candidates) || []; } catch { c = []; } return [Number(r.card_id), c.map(String)]; }));
-  const names = new Map(((await env.DB.prepare(`SELECT id, name, category_id FROM topics WHERE user_id = ?1 AND status IN ${LIVE} AND id IN (SELECT value FROM json_each(?2))`)
+  const names = new Map(((await env.DB.prepare(`SELECT id, name, category_id FROM topics WHERE user_id = ?1 AND status IN ${LIVE}
+      AND coalesce(category_id, '') NOT LIKE '${ROOT_LIKE}' AND id IN (SELECT value FROM json_each(?2))`)
     .bind(user, JSON.stringify([...new Set([...asked.values()].flat())])).all()).results || []).map(r => [r.id, r]));
   const texts = await cardTexts(env, [...asked.keys()]);
   const blocks = [];
@@ -342,10 +347,16 @@ export async function labelLeftovers(env, user, ids, { now = Date.now(), call = 
         throw e;
       }
       try {
-        ({ data, usd } = await callJson(env, { role: 'labeller', system: LABEL_SYSTEM, schema: LABEL_SCHEMA, effort: 'high', maxTokens: 8000,
+        ({ data, usd } = await callJson(env, { role: 'labeller', use: 'cards', system: LABEL_SYSTEM, schema: LABEL_SCHEMA, effort: 'high', maxTokens: 8000,
           messages: [{ role: 'user', content: `${blocks.length} cards:\n\n${blocks.join('\n\n')}` }] }));
       } catch (e) {
         await release(0);
+        // Waiting for its Message Batch: nothing written, so the same cards are asked again (and answered) next time.
+        if (e && e.pending === true && e.batch === true) {
+          const { noteJob } = await import('../job-log.js');
+          await noteJob(env, { job: 'labeller', user, key: `batch:cards:${day}`, ref: 'cards', state: 'held', at: now, counts: { batch: 1 } });
+          return { waiting: 'batch' };
+        }
         usd = Number(e && e.usd) || 0;
         data = null;
         console.error('orbits: card labeller', e && e.message);

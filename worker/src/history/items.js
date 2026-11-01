@@ -2,6 +2,12 @@ import { londonDay } from '../util.js';
 import { splitByStarts } from '../../../public/js/uworld/split.js';
 
 export const KINDS = ['miss', 'gap', 'uworld_words', 'anki_words', 'lesson', 'teach_note', 'misconception', 'retest', 'mnemonic'];
+// What Claude calls a kind (1 Nov 2026: the words Claude reads never say "re-test", so the stored kind 'retest' goes out as
+// 'miss_card'); hub_history takes either name.
+export const KIND_SHOWN = Object.freeze({ retest: 'miss_card' });
+export const SHOWN_KINDS = KINDS.map(k => KIND_SHOWN[k] || k);
+export const kindStored = k => Object.keys(KIND_SHOWN).find(s => KIND_SHOWN[s] === k) || k;
+export const kindShown = k => KIND_SHOWN[k] || k;
 // Where an item came from, in the few words hub_history filters by.
 export const SOURCES = ['uworld', 'exam', 'anki', 'chat', 'lesson', 'notes'];
 export const TEXT_MAX = 3000, CHUNK_CHARS = 1200;
@@ -92,7 +98,9 @@ export function gapItem(r) {
 }
 export const gapLive = r => !Number(r.held);
 /** A stored open as it is answered: a gap's list_gaps with the days that reach back to its day. */
-export const openAt = (open, day, now = Date.now()) => (open === 'list_gaps' ? call('list_gaps', { since_days: daysBack(day, now) }) : open);
+// A row indexed before 1 Nov 2026 still names map_weakest's old purpose; it goes out under the new name.
+export const openAt = (open, day, now = Date.now()) => (open === 'list_gaps' ? call('list_gaps', { since_days: daysBack(day, now) })
+  : typeof open === 'string' ? open.replace('{"purpose":"retest"}', '{"purpose":"miss_cards"}') : open);
 
 const LESSON_DONE = ['done', 'abandoned'];
 export function lessonItem(r) {
@@ -139,10 +147,10 @@ export function retestItem(r) {
   const done = r.result ? `${RETEST_WORD[r.result] || r.result}${r.done_at ? ` on ${dayOf(r.done_at)}` : ''}${r.done_by ? ` (${r.done_by})` : ''}` : 'not done yet';
   return {
     key: `retest:${r.id}`, kind: 'retest', src_id: r.id, day: r.result ? dayOf(r.done_at, r.due) : r.due, at: r.done_at || r.created_at,
-    source: r.rkind === 'lesson' ? 'lesson' : missSource({ qbank: r.qbank, source: r.miss_source }), label: `Re-test of ${r.miss_label || what}`,
+    source: r.rkind === 'lesson' ? 'lesson' : missSource({ qbank: r.qbank, source: r.miss_source }), label: `Card from ${r.miss_label || what}`,
     topic_id: r.topic_id || null, topic: r.topic_name || null, category_id: r.category_id || null, system: null,
-    text: joinText([`Re-test of ${what}${r.topic_name && r.rkind !== 'lesson' ? ` (${r.topic_name})` : ''}, due ${r.due}: ${done}`]),
-    open: r.miss_label ? call('board_error_log', { query: r.miss_label, since_day: r.miss_day || r.due, detail: true }) : call('map_weakest', { purpose: 'retest' }),
+    text: joinText([`Card from ${what}${r.topic_name && r.rkind !== 'lesson' ? ` (${r.topic_name})` : ''}, due ${r.due}: ${done}`]),
+    open: r.miss_label ? call('board_error_log', { query: r.miss_label, since_day: r.miss_day || r.due, detail: true }) : call('map_weakest', { purpose: 'miss_cards' }),
   };
 }
 export const retestLive = r => (r.rkind !== 'miss' || (r.miss_label != null && !Number(r.miss_held) && r.miss_deleted == null));

@@ -45,7 +45,7 @@ export const NO_DELETE_TABLES = ['misses', 'evidence', 'gaps'];
 export const NO_USER_ID_TABLES = ['settings', 'users', 'outbox'];
 
 // Settings the hub keeps for itself (exact keys or prefixes ending in ':').
-export const INTERNAL_SETTINGS = ['onenote_page:', 'mcp_seen', 'changes_seen', 'sync_state', 'plan_version', 'plan_seeded'];
+export const INTERNAL_SETTINGS = ['onenote_page:', 'mcp_seen', 'changes_seen', 'sync_state', 'plan_version', 'plan_seeded', 'catchup_done:'];
 export const isInternalSetting = key => INTERNAL_SETTINGS.some(k => (k.endsWith(':') ? String(key).startsWith(k) : key === k));
 
 // Error types that never earn a lesson, card or link (teach's NO_LESSON_ERRORS; keys as in misses.error_type).
@@ -83,7 +83,9 @@ export const WRITABLE = {
     'probe_json', 'steps_json', 'items_json', 'gap_ids_json', 'final_result', 'final_conf', 'weak_spot', 'card_note_id',
     'card_id', 'card_action', 'miss_ids_json', 'media_shown_json', 'memory_used_json', 'memory_written_json', 'mo_feedback', 'method_version',
     'content_type', 'tactics_suggested_json', 'misc_ids_json', 'final_explain_json', 'teach_back_json', 'mo_rating', 'mo_rating_why', 'what_clicked',
-    'claude_view_json', 'questions_asked', 'tactics_json', 'facts_json', 'blend', 'blend_json', 'tactic_delta_json', 'stick_json'],
+    'claude_view_json', 'questions_asked', 'tactics_json', 'facts_json', 'blend', 'blend_json', 'tactic_delta_json', 'stick_json',
+    // A lesson on an error cluster (0071, clusters.js): the cluster it teaches.
+    'cluster_id'],
   ['lesson.request', 'lesson.start', 'lesson.save', 'lesson.close']),
   teach_memory: W('iu', ['scope', 'scope_ref', 'tactic', 'note', 'status', 'uses', 'wins', 'losses', 'evidence_json', 'retired_reason'],
     ['teach_memory.save', 'lesson.save']),

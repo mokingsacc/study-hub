@@ -604,7 +604,7 @@ export async function readTopic(env, user, topicId) {
     statement(env, TOPIC_SQL, user, topicId),
     statement(env, 'SELECT day, kind, result, source, detail_json FROM evidence_live WHERE user_id = ?1 AND topic_id = ?2 ORDER BY at DESC LIMIT 10', user, topicId),
     statement(env, 'SELECT COUNT(*) AS n FROM cards WHERE user_id = ?1 AND topic_id = ?2 AND deleted_at IS NULL', user, topicId),
-    statement(env, 'SELECT at, gap FROM gaps WHERE user_id = ?1 AND topic_id = ?2 AND held = 0 ORDER BY at DESC LIMIT 10', user, topicId),
+    statement(env, 'SELECT id, at, gap, origin FROM gaps WHERE user_id = ?1 AND topic_id = ?2 AND held = 0 ORDER BY at DESC LIMIT 10', user, topicId),
     // The galaxy of their own it sits in (galaxies.js), if any.
     statement(env, `SELECT g.id, g.title FROM galaxy_topics m JOIN galaxies g ON g.user_id = m.user_id AND g.id = m.galaxy_id AND g.status = 'active'
       WHERE m.user_id = ?1 AND m.topic_id = ?2`, user, topicId),
@@ -615,7 +615,7 @@ export async function readTopic(env, user, topicId) {
     topic: topicShape(row),
     recent: (recent.results || []).map(e => ({ day: e.day, kind: e.kind, result: e.result ?? null, source: e.source, label: ((safeParse(e.detail_json, {}) || {}).label ?? null) })),
     cards_n: Number(((cards.results || [])[0] || {}).n) || 0,
-    gaps: (gaps.results || []).map(g => ({ at: g.at, gap: g.gap })),
+    gaps: (gaps.results || []).map(g => ({ id: g.id, at: g.at, gap: g.gap })),
     galaxy: (gal.results || [])[0] || null,
   };
 }

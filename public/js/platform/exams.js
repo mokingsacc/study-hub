@@ -10,7 +10,9 @@ const ASK = [
   ['Add an exam from a photo', 'Add these photos of my exam paper to my Study Hub.', 'Then send the photos in the same chat. Claude gives you a link: tap it and choose the photos.'],
   ['Find an exam online', 'Find the AQA A-level Biology Paper 1 June 2023 question paper and mark scheme and add them to my Study Hub.', 'Change the board, subject, paper and year to the one you want.'],
   ['Make it an exam I can sit', 'Make my exam paper into an exam I can sit on my Study Hub, with the mark scheme.', 'Claude reads the paper and sets up every question with its marks and page.'],
-  ['Mark my exam', 'Mark my latest exam on my Study Hub with me.', 'Claude goes through each answer with you and saves the marks.'],
+  ['Mark my exam', 'Mark my latest exam on my Study Hub with me.', 'Claude goes through each answer with you and saves the marks. Written with your pencil? It reads your writing first.'],
+  ['Predict my grade', 'Predict my A-level Biology grade from my Study Hub. Use every marked past paper there, look up the real grade boundaries for each paper\'s board and year, and turn each score into a grade. Weight recent papers more, give a likely grade with a range, say how sure you can be from this many papers, and name the three topics that would raise it most. Save how you worked it out as a chat note, so next time we use the same method.',
+    'Change the subject. The more marked past papers, the closer it gets: real past papers with their mark schemes work best.'],
   ['Look at my thinking', 'Analyse my thinking from my Study Hub recordings.', 'After you have pressed Record while answering.'],
 ];
 

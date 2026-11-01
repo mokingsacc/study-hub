@@ -18,7 +18,7 @@ import { LEARN_SYSTEM, LEARN_SCHEMA, learnPrompt } from './prompt.js';
 import { shapeAnswer, checkAnswer, dropFields, saveStatements } from './store.js';
 
 export const ROLE = 'learner';
-export const LEARN_DAILY_USD = 5, FILL_USD = 25, RESERVE_USD = 0.3;
+export const LEARN_DAILY_USD = Infinity, FILL_USD = 25, RESERVE_USD = 0.3;
 export const SETTLE_MS = 20 * 60_000, MIN_GAP_MS = 12 * 3600_000, SWEEP_MAX = 3, LOCK_MS = 10 * 60_000;
 const FILL_KEY = 'learn_fill_usd';
 const dayKey = (now = Date.now()) => `learn_usd:${londonDay(now)}`;

@@ -156,10 +156,38 @@ export function validExam(args, pageCount = null) {
     if (!isObj(s)) continue;
     const n = s.n != null ? Number(s.n) : byLabel.get(String(s.label || '').toLowerCase().trim());
     if (!questions.some(q => q.n === n)) throw new HttpError(400, `The mark scheme names a question that is not in the list (${String(s.label ?? s.n).slice(0, 16)}).`);
-    const points = (Array.isArray(s.points) ? s.points : []).filter(p => typeof p === 'string' && p.trim()).map(p => clean(p, 300)).slice(0, 20);
-    if (points.length) scheme.push({ n, points });
+    const points = (Array.isArray(s.points) ? s.points : []).filter(p => typeof p === 'string' && p.trim()).map(p => clean(p, 600)).slice(0, 30);
+    // A level-marked answer (a 6-, 9- or 16-marker): each level's marks and words as the scheme prints them.
+    const levels = (Array.isArray(s.levels) ? s.levels : []).filter(l => isObj(l) && typeof l.text === 'string' && l.text.trim()).slice(0, 6).map(l => {
+      const m = String(l.marks ?? '').replace(/[\u2013\u2014]/g, '-').replace(/\s+/g, '');
+      if (!/^\d{1,2}(-\d{1,2})?$/.test(m)) throw new HttpError(400, `A level's marks should be like 7-9 (question ${String(s.label ?? s.n).slice(0, 16)}).`);
+      return { marks: m, text: clean(l.text, 1200) };
+    });
+    if (points.length || levels.length) scheme.push({ n, points, ...(levels.length ? { levels } : {}) });
   }
   return { questions, scheme };
+}
+
+const TOTAL_RES = [/maximum mark for this paper is\s*(\d{1,3})/i, /total mark for this paper is\s*(\d{1,3})/i, /total for paper\s*(?:is|=)?\s*(\d{1,3})\s*marks/i];
+const MARK_STYLES = [['aqa', /\[\s*(\d{1,2})\s*marks?\s*\]/gi], ['ocr', /\[\s*(\d{1,2})\s*\]/g], ['edexcel', /^\s*\((\d{1,2})\)\s*$/gm]];
+/** {listed, printed?, sure?, ok?, style?, pages_off?} for the parts against the paper's page texts [{n, text}] (pure). */
+export function markCheck(pages, questions) {
+  const listed = questions.reduce((a, q) => a + q.marks, 0);
+  let printed = null;
+  for (const p of pages) { for (const re of TOTAL_RES) { const m = re.exec(String(p.text || '')); if (m) { printed = Number(m[1]); break; } } if (printed) break; }
+  if (!printed) return { listed };
+  for (const [style, re] of MARK_STYLES) {
+    const by = {};
+    let sum = 0;
+    for (const p of pages) for (const m of String(p.text || '').matchAll(re)) { const k = Number(m[1]); by[p.n] = (by[p.n] || 0) + k; sum += k; }
+    if (sum !== printed) continue;
+    const mine = {};
+    for (const q of questions) if (q.page) mine[q.page] = (mine[q.page] || 0) + q.marks;
+    const pages_off = [...new Set([...Object.keys(by), ...Object.keys(mine)].map(Number))].sort((a, b) => a - b)
+      .filter(n => (by[n] || 0) !== (mine[n] || 0)).map(n => ({ page: n, printed: by[n] || 0, listed: mine[n] || 0 }));
+    return { listed, printed, sure: true, ok: listed === printed, style, pages_off };
+  }
+  return { listed, printed, sure: false, ok: listed === printed };
 }
 
 async function topicIds(env, user, subjectId, questions) {
@@ -184,6 +212,12 @@ export async function makeExam(env, user, args) {
     if (!schemeDoc) throw new HttpError(404, 'The mark scheme document is not in their library.');
   }
   const { questions, scheme } = validExam(args, doc.page_count);
+  const { results: texts } = await env.DB.prepare('SELECT n, text FROM library_pages WHERE user_id = ? AND doc_id = ? ORDER BY n').bind(user, doc.id).all();
+  const check = markCheck(texts || [], questions);
+  if (check.sure && !check.ok) {
+    const off = check.pages_off.slice(0, 4).map(p => `page ${p.page} prints ${p.printed}, the list has ${p.listed}`).join('; ');
+    throw new HttpError(400, `These parts add up to ${check.listed} mark${check.listed === 1 ? "" : "s"}, but the paper's total is ${check.printed} and its printed marks agree. A part is missing or has the wrong marks${off ? ` (${off})` : ''}. Fix the list and call again.`);
+  }
   await topicIds(env, user, subject.id, questions);
   const minutes = args.minutes == null ? null : Math.round(Number(args.minutes));
   if (minutes != null && !(minutes >= 5 && minutes <= 240)) throw new HttpError(400, 'minutes is the time allowed, 5 to 240.');
@@ -198,7 +232,8 @@ export async function makeExam(env, user, args) {
     .bind(user, id, subject.id, title, JSON.stringify({ from: 'document' }), JSON.stringify({ questions, source, ...(minutes ? { minutes } : {}) }),
       JSON.stringify({ scheme }), t).run();
   return { paper_id: id, title, subject: subject.name, questions: questions.length, out_of: questions.reduce((s, q) => s + q.marks, 0),
-    minutes, with_mark_scheme: scheme.length, on_topics: questions.filter(q => q.topic_id).length };
+    minutes, with_mark_scheme: scheme.length, on_topics: questions.filter(q => q.topic_id).length,
+    ...(check.printed ? { marks_check: check.ok ? `The marks add up to the paper's total of ${check.printed}.` : `The parts add up to ${check.listed}, the cover says ${check.printed}: optional questions, or a part missing. Check with them.` } : {}) };
 }
 
 // GET /api/p/exams: exams made from her papers, other papers, and exam PDFs in her library not made into exams yet.
@@ -365,7 +400,7 @@ export const TOOLS = [
     description: 'Turns an exam paper PDF in the student\'s library into an exam they sit on screen in their Study Hub (Exams): the PDF pages, a timer and an answer box for every question. '
       + 'First library_read the paper (and its mark scheme if they have it) to list every question part that earns marks: its label as printed (e.g. 1(a), 3(b)(ii)), its marks and its page. '
       + 'text is a few words saying what the part asks (the PDF shows the real question). topic is the topic it tests, in their topic names when you can. '
-      + 'When there is a mark scheme, add scheme: the marking points for each part in short, one point per mark where the scheme allows. Then tell them it is ready under Exams.',
+      + 'With a mark scheme add scheme: its points for each part copied word for word, never rewritten; a level-marked part also gets levels (each level\'s marks, e.g. 7-9, and its words). The hub checks the marks against the paper\'s printed total. Then tell them it is ready under Exams.',
     inputSchema: { type: 'object', additionalProperties: false, required: ['doc_id', 'subject', 'questions'], properties: {
       doc_id: { type: 'string', description: 'The exam paper in their library (library_read lists documents).' },
       subject: { type: 'string', description: 'Their subject, by name.' },
@@ -376,7 +411,8 @@ export const TOOLS = [
         label: { type: 'string', maxLength: 16 }, marks: { type: 'integer' }, page: { type: 'integer', description: 'The PDF page the part is on.' },
         text: { type: 'string', maxLength: 300 }, topic: { type: 'string', maxLength: 80 } } } },
       scheme: { type: 'array', maxItems: MAX_QUESTIONS, items: { type: 'object', additionalProperties: false, required: ['label', 'points'], properties: {
-        label: { type: 'string' }, points: { type: 'array', items: { type: 'string', maxLength: 300 }, maxItems: 20 } } } },
+        label: { type: 'string' }, points: { type: 'array', items: { type: 'string', maxLength: 600 }, maxItems: 30 },
+        levels: { type: 'array', maxItems: 6, items: { type: 'object', required: ['marks', 'text'], properties: { marks: { type: 'string' }, text: { type: 'string' } } } } } } },
     } },
     annotations: { readOnlyHint: false, destructiveHint: false },
     async run(env, user, args, ctx) {

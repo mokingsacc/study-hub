@@ -1,5 +1,5 @@
-import { get } from './api.js';
-import { h, icon, btn, sheet, dot, bandText, fmtDay, plural, state, errorState, loading } from './kit.js';
+import { get, post } from './api.js';
+import { h, icon, btn, sheet, dot, bandText, fmtDay, plural, state, errorState, loading, input, field, toast, askClaude } from './kit.js';
 import { teachLink } from './teach.js';
 
 const enc = encodeURIComponent;
@@ -47,7 +47,7 @@ export function openTopicSheet(hint, ctx = {}) {
     // Pictures (pictures.js), drawn after the rest.
     const pics = h('div');
     import('./pictures.js').then(m => { if (pics.isConnected) pics.replaceWith(m.picturesPart(full, ctx.app)); }).catch(() => {});
-    sh.setBody(head(full), knowledge(know, k.reason, full, id => { const r = arr(know && know.related).find(x => x.id === id); show({ id, name: r ? r.name : 'Topic', subject_name: t.subject_name, band: r && BANDS[r.band] }); if (ctx.onTopic) ctx.onTopic(id); }),
+    sh.setBody(head(full), checkRow(full, ctx.app), knowledge(know, k.reason, full, id => { const r = arr(know && know.related).find(x => x.id === id); show({ id, name: r ? r.name : 'Topic', subject_name: t.subject_name, band: r && BANDS[r.band] }); if (ctx.onTopic) ctx.onTopic(id); }),
       pics, evidence(detail, full, ctx.app, sh));
   }
   fill(hint);
@@ -60,6 +60,28 @@ function head(t) {
   return h('div', { class: 'tp-head' },
     h('div', { class: 'tp-band' }, dot(t.t1000, true), h('b', null, t.band || bandText(t))),
     teachLink(t));
+}
+
+function checkRow(t, app) {
+  const viva = h('div', { class: 'foot' });
+  const sure = h('div', { class: 'chips tp-sure', role: 'group', 'aria-label': 'How sure are you on this topic today?' });
+  let level = null;
+  const drawSure = () => sure.replaceChildren(h('span', { class: 'foot' }, 'How sure today?'), ...[['guess', 'Guess'], ['lean', 'Lean'], ['sure', 'Sure']].map(([k, w]) =>
+    h('button', { type: 'button', class: 'chip', 'aria-pressed': String(level === k), onclick: async () => {
+      try { level = (await post(`/api/p/topics/${enc(t.id)}/sure`, { level: level === k ? null : k })).level; drawSure(); } catch (e) { toast(e.message); }
+    } }, w)));
+  drawSure();
+  get(`/api/p/topics/${enc(t.id)}/sure`).then(r => { level = r.level; drawSure(); }).catch(() => {});
+  get(`/api/p/topics/${enc(t.id)}/viva`).then(r => {
+    const l = r.last;
+    viva.textContent = l ? `Last "Tell me what you know" (${fmtDay(l.day)}): ${l.said} of ${l.of} key points.${l.missed.length ? ` Missed: ${l.missed.slice(0, 2).map(m => m.replace(/^\w+: /, '')).join('; ')}.` : ''}` : '';
+  }).catch(() => {});
+  const google = `https://www.google.com/search?tbm=isch&q=${encodeURIComponent([t.name, t.subject_name].filter(Boolean).join(' '))}`;
+  return h('section', { class: 'tp-check' },
+    h('div', { class: 'row', style: 'flex-wrap:wrap;gap:8px' },
+      askClaude(`Tell me what you know: give me a viva on ${t.name}`, 'Tell me what you know', { app, ico: 'chat' }),
+      h('a', { class: 'btn btn-gray btn-sm', href: google, target: '_blank', rel: 'noopener' }, icon('search'), 'Pictures on Google')),
+    sure, viva);
 }
 
 // ------------------------------------------------------------------ What you know
@@ -99,7 +121,7 @@ function knowledge(k, err, t, openRelated) {
   }
   if (met.length || closed.length) {
     blocks.push(group('Mix-ups', h('ul', { class: 'tp-list' },
-      met.map(m => h('li', null, h('span', { class: 'status warn' }, 'Still mixing up'), ' ', m.belief)),
+      met.map(m => h('li', null, h('span', { class: 'status warn' }, 'Still mixing up'), ' ', m.belief, ' ', notRight('misconception', m.id, m.belief))),
       closed.map(m => h('li', null, h('span', { class: 'status ok' }, 'Sorted'), ' ', m.belief)))));
   }
   const lessonRows = lessons.filter(l => l.outcome || l.mo_rating != null).slice(0, 4);
@@ -121,6 +143,26 @@ function knowledge(k, err, t, openRelated) {
     empty ? h('p', { class: 'foot' }, `Nothing from a lesson on ${t.name} yet. Tap Teach me: what you explain in your own words and what clicked will show up here.`) : null,
     tiles, ...blocks);
 }
+function notRight(kind, id, text) {
+  if (!id) return null;
+  return h('button', { type: 'button', class: 'linkish foot', onclick: e => { e.stopPropagation(); correctSheet(kind, id, text); } }, 'Not right?');
+}
+function correctSheet(kind, id, text) {
+  const words = input({ value: text || '', maxLength: 200, 'aria-label': 'How it really is' });
+  const send = async (action, s) => {
+    try {
+      const r = await post('/api/p/correct', { kind, id, action, ...(action === 'words' ? { words: words.value } : {}) });
+      s.close();
+      toast(action === 'not_mine' ? 'Taken off your map' : 'Corrected', r.batch_id ? { undo: async () => { await post('/api/p/undo', { batch_id: r.batch_id }); toast('Undone'); } } : undefined);
+    } catch (e) { toast(e.message); }
+  };
+  const mix = kind === 'misconception';
+  const s = sheet({ title: 'Not right?', sub: mix ? 'Your Claude noted this as something you mix up. Your word counts over it.' : 'A gap note about you. Your word counts over it.',
+    body: h('div', { class: 'form' }, h('blockquote', { class: 'tp-quote' }, h('p', null, text || '')),
+      btn(mix ? "That's not what I think" : "That's not right: take it off", () => send('not_mine', s), 'tinted', 'close', { cls: 'btn-block' }),
+      field('Or write it the way it really is', words)),
+    actions: [btn('Cancel', () => s.close(), 'gray'), btn('Save the words', () => send('words', s), 'primary')] });
+}
 const group = (label, ...kids) => h('div', { class: 'tp-group' }, h('div', { class: 't-micro' }, label), ...kids);
 const stat = (ico, big, small) => h('div', { class: 'tp-stat' }, h('span', { class: 'tile-label' }, icon(ico), big), h('span', { class: 'foot' }, small));
 
@@ -135,7 +177,7 @@ function evidence(d, t, app, sh) {
     recent.length
       ? h('ul', { class: 'list' }, recent.slice(0, 6).map(r => h('li', null, ...resultCells(r))))
       : h('p', { class: 'foot' }, 'Nothing logged on this topic yet.'),
-    gaps.length ? h('div', null, h('div', { class: 't-micro', style: 'margin:14px 0 8px' }, 'Gap notes'), h('ul', { class: 'list' }, gaps.map(g => h('li', null, h('span', { class: 'grow' }, g.gap), h('span', { class: 'foot' }, fmtDay(g.at)))))) : null,
+    gaps.length ? h('div', null, h('div', { class: 't-micro', style: 'margin:14px 0 8px' }, 'Gap notes'), h('ul', { class: 'list' }, gaps.map(g => h('li', null, h('span', { class: 'grow' }, g.gap), h('span', { class: 'foot' }, fmtDay(g.at)), g.id ? notRight('gap', g.id, g.gap) : null)))) : null,
     h('div', { class: 'row-acts' },
       btn(d.galaxy ? `In ${d.galaxy.title}` : 'Put in a galaxy', () => import('./galaxies.js').then(m => m.chooseGalaxySheet(t, d.galaxy, () => { sh.close(); if (app && app.route) app.route(); })), 'tinted', 'sparkle'),
       cardsOn ? btn(d.cards_n ? `Cards (${d.cards_n})` : 'Make cards', () => { sh.close(); import('./cards.js').then(m => m.draftSheet({ topic_id: t.id, subject_id: t.subject_id, about: t.name })); }, 'tinted', 'cards') : null,

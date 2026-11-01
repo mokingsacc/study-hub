@@ -2,7 +2,7 @@ import { now as nowMs, londonDay } from '../../util.js';
 import { ankiCall } from '../../anki.js';
 import {
   missFromAnki, mergeMiss, ANKI_COPY_COLS, questionEvidence, sameEvidence, ankiKey, uwKey, uwLabel, ankiLabel,
-  userKey, rawKey, dayDiff, isDay, normLabel, STICKY_METHODS, wordsChanged, CODE_PLACED,
+  userKey, rawKey, dayDiff, isDay, normLabel, STICKY_METHODS, wordsChanged, CODE_PLACED, withCause, sameQuestion,
 } from './map-fields.js';
 import { placeTopics, lookups, commit, finishMiss, missStatement, missSummary, lookAlikeParts, lookAlikeFollowUp, evidenceStatements, learnStatements,
   staleSupportParts } from './hub.js';
@@ -103,9 +103,11 @@ async function ingestChunk(env, user, recs, via) {
       if (hits.length > 1) continue;
       if (hits.length === 1) existing = hits[0];
     }
+    // A duplicate the clean-up merged into another miss (map/hygiene.js) stays deleted: its record is the other's now.
+    if (existing && existing.merged_into) continue;
     if (existing && existing.block_id) { plans.push({ rec, fields, copy: existing }); continue; }
     if (!existing && fields.uw_qid && fields.day) {
-      existing = byUw.results.filter(r => !r.block_id && r.uw_qid === fields.uw_qid && r.day && dayDiff(r.day, fields.day) <= 2)
+      existing = byUw.results.filter(r => !r.block_id && sameQuestion(r, fields))
         .sort((a, b) => dayDiff(a.day, fields.day) - dayDiff(b.day, fields.day))[0] || null;
     }
     if (!fields.day) continue; // a record with no day cannot be dated; the next full pass tries again
@@ -185,6 +187,7 @@ async function ingestChunk(env, user, recs, via) {
         result: prev.result === 'wrong' || prev.result === 'flawed' ? prev.result : ev.result, time_s: prev.time_s ?? ev.time_s,
         topic_id: row.topic_id, queue_id: row.topic_id ? null : row.queue_id, label_norm: row.topic_id ? null : row.label_norm, category_id: row.category_id }
         : { ...ev, topic_id: row.topic_id, queue_id: row.topic_id ? null : row.queue_id, label_norm: row.topic_id ? null : row.label_norm, category_id: row.category_id };
+      withCause(merged, row);   // a judged cause weighs the miss on its topic (wave 2)
       if (!row.held && !sameEvidence(merged, prev)) {
         upsert.push(evidenceRow(merged));
         if (row.topic_id) recompute.push(row.topic_id);

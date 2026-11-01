@@ -3,6 +3,7 @@ import { leaks } from '../checks.js';
 import { leakIndexFor, stemSafe, questionSafe } from './guard.js';
 import { tablesPresent, laneOf, yieldOf } from './teach-priority.js';
 import { rankJoin, RANK_COLS, examRankText } from '../exam-ranks.js';
+import { testableStatements, testableSource, testablePoints, objectivesOf } from './testable.js';
 
 export const CAPS = { words: 5, clicked: 5, lessons: 20, cards: 10, mehlman: 5, related: 8, misconceptions: 10 };
 export const TEXT = { words: 600, clicked: 200, short: 200, front: 240 };
@@ -15,7 +16,7 @@ const num = v => (v == null || v === '' ? null : Number(v));
 /** Every read the page needs, in one D1 batch. */
 export async function knowledgeReads(env, user, topicId) {
   const q = (sql, ...a) => env.DB.prepare(sql).bind(...a);
-  const has = await tablesPresent(env, user, ['misconceptions', 'card_cache', 'resource_links', 'resources', 'topic_embeddings']);
+  const has = await tablesPresent(env, user, ['misconceptions', 'card_cache', 'resource_links', 'resources', 'topic_embeddings', 'viva_rubrics', 'viva_results']);
   const none = () => q(`SELECT NULL AS id WHERE 0 AND ? = ?`, user, topicId);
   const res = await env.DB.batch([
     q(`SELECT t.id, t.name, t.kind, t.status, t.merged_into, t.category_id, c.name AS category, t.yield, u.num AS unit_num, u.name AS unit_name, u.lane,
@@ -51,9 +52,11 @@ export async function knowledgeReads(env, user, topicId) {
        LEFT JOIN topic_scores s ON s.user_id = o.user_id AND s.topic_id = o.id
        WHERE e.user_id = ? AND e.topic_id = ? ORDER BY j.key LIMIT 8`, user, topicId) : none(),
     q(`SELECT coalesce(max(seq), 0) AS seq FROM map_events WHERE user_id = ?`, user),
+    ...testableStatements(env, user, topicId, { rubric: has.has('viva_rubrics') && has.has('viva_results'), cards: has.has('card_cache') }),
   ]);
-  const [topic, lessons, miscs, cards, mehlman, links, similar, seq] = res.map(r => r.results || []);
-  return { topic: topic[0] || null, lessons, misconceptions: miscs, cards, mehlman, links, similar, seq: (seq[0] || {}).seq || 0 };
+  const all = res.map(r => r.results || []);
+  const [topic, lessons, miscs, cards, mehlman, links, similar, seq] = all;
+  return { topic: topic[0] || null, lessons, misconceptions: miscs, cards, mehlman, links, similar, seq: (seq[0] || {}).seq || 0, testable: all.slice(8) };
 }
 
 export function safeText(text, max, index, { stem = true } = {}) {
@@ -125,6 +128,7 @@ export function knowledgePage(r, { index = null, now = Date.now() } = {}) {
       mo_rating: l.mo_rating ?? null, why: safeText(l.mo_rating_why, TEXT.short, index), minutes: l.minutes ?? null, final_result: l.final_result || null,
       goal: safeText(l.goal, TEXT.short, index), weak_spot: safeText(l.weak_spot, TEXT.short, index), tactics: parse(l.tactics_json, []) })),
     related,
+    points: testablePoints(testableSource(r.testable || [], r.objectives || []), { safe: t => safeText(t, 220, index, { stem: false }) }),
   };
 }
 
@@ -153,11 +157,12 @@ export function knowledgeBrief(page) {
 }
 
 /** The page for a topic, merged names followed once; null when it is not on the map; {ready: false} before 0015. */
-export async function topicKnowledge(env, user, topicId, { now = Date.now() } = {}) {
+export async function topicKnowledge(env, user, topicId, { now = Date.now(), points = false } = {}) {
   try {
     let reads = await knowledgeReads(env, user, topicId);
     if (reads.topic && reads.topic.status === 'merged' && reads.topic.merged_into) reads = await knowledgeReads(env, user, reads.topic.merged_into);
     if (!reads.topic) return null;
+    if (points) reads.objectives = await objectivesOf(env, user, reads.topic.id);
     const index = await leakIndexFor(env, user, { topicIds: [reads.topic.id] }).catch(() => null);
     return knowledgePage(reads, { index, now });
   } catch (e) {
@@ -177,7 +182,7 @@ export async function knowledgeBriefFor(env, user, topicId) {
 export async function knowledgeRoute(request, env, ctx, params, url, user) {
   const id = decodeURIComponent(params.id || '');
   if (!id || id.length > 120) return json({ error: 'Which topic?' }, 400);
-  const page = await topicKnowledge(env, user, id);
+  const page = await topicKnowledge(env, user, id, { points: true });
   if (!page) return json({ error: 'That topic is not on the map.' }, 404);
   return json(page);
 }

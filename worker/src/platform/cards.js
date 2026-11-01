@@ -157,9 +157,10 @@ export async function dueCount(env, user) {
  * Rates one card: ts-fsrs schedules it, the card row and a card_reviews row are written, and the card's topic
  * (when it has one) gets evidence, all in one writeBatch. Replies {card, next, due_n}.
  */
-export async function reviewCard(env, user, idRaw, ratingRaw, { duration_ms = null, surface = 'web', via = 'web' } = {}) {
+export async function reviewCard(env, user, idRaw, ratingRaw, { duration_ms = null, surface = 'web', via = 'web', confidence = null } = {}) {
   const id = cardIdOf(idRaw);
   const rating = parseRating(ratingRaw);
+  if (confidence != null && !SURE_WORDS.includes(confidence)) throw new HttpError(400, 'How sure is guess, lean or sure.');
   const t = now();
   const [cardRes, nextRes, countRes] = await env.DB.batch([
     env.DB.prepare('SELECT * FROM cards WHERE id = ?1 AND user_id = ?2 AND deleted_at IS NULL').bind(id, user),
@@ -193,6 +194,7 @@ export async function reviewCard(env, user, idRaw, ratingRaw, { duration_ms = nu
     const prev = { schedule: scheduleText(row.state, before.scheduled_days, row.lapses), lapses: row.lapses };
     const nextSt = { card_id: id, schedule: scheduleText(after.state, after.scheduled_days, after.lapses), lapses: after.lapses };
     const rows = cardEvidence(prev, nextSt, { topic_ids: [row.topic_id], at: t, day: londonDay(t), source: 'hub_cards' });
+    if (confidence) rows.push(sureReviewRow({ id, topic_id: row.topic_id, subject_id: row.subject_id }, rating, confidence, t));
     if (rows.length) evidence = { upsert: rows };
   }
   const word = ['', 'again', 'hard', 'good', 'easy'][rating];
@@ -206,6 +208,56 @@ export async function reviewCard(env, user, idRaw, ratingRaw, { duration_ms = nu
     next: next ? dueShape(next, t) : null,
     due_n: dueN, new_n: counts.new_n || 0, learning_n: counts.learning_n || 0, review_n: counts.review_n || 0,
   };
+}
+
+export const SURE_WORDS = ['guess', 'lean', 'sure'];
+export function sureGrade(rating, confidence) {
+  const g = ['', 'again', 'hard', 'good', 'easy'][rating];
+  return confidence === 'guess' && rating >= 3 ? 'hard' : g;
+}
+export function sureReviewRow(card, rating, confidence, t) {
+  return { obs_key: `cardsure:${card.id}:${t}`, slot: 0, topic_id: card.topic_id, category_id: card.subject_id || null, kind: 'card_review',
+    rating: sureGrade(rating, confidence), confidence, card_id: Number(card.id), at: t, day: londonDay(t), source: 'hub_cards', held: 0, created_by: 'code',
+    detail_json: JSON.stringify({ label: 'card', confidence, rated: rating, ...(confidence === 'sure' && rating === 1 ? { sure_wrong: true } : {}) }) };
+}
+
+
+export const FIX_REASONS = { badly_worded: 'Badly worded', wrong: 'Wrong', low_value: 'Not worth learning', duplicate: 'A duplicate' };
+export const FIX = { leech_lapses: 4, slow_ms: 30_000, slow_reviews: 3, list: 20, recheck_days: 30 };
+const tomorrow = t => { const d = new Date(t); d.setUTCHours(28, 0, 0, 0); return +d; };   // about 4am the next day, London
+
+/** Skip on review: the card goes away until tomorrow, and with a reason (not "just not now") waits for their Claude. undo puts both back. */
+export async function skipCard(env, user, idRaw, { reason = null, undo = null } = {}) {
+  const id = cardIdOf(idRaw);
+  const row = await env.DB.prepare('SELECT id, due_at, fix_reason, fix_at FROM cards WHERE id = ?1 AND user_id = ?2 AND deleted_at IS NULL').bind(id, user).first();
+  if (!row) throw noCard();
+  const t = now();
+  if (undo) {
+    const due = Number(undo.due_at);
+    if (!Number.isFinite(due)) throw new HttpError(400, 'Nothing to undo.');
+    const r = undo.fix_reason == null || FIX_REASONS[undo.fix_reason] ? undo.fix_reason ?? null : null;
+    await env.DB.prepare('UPDATE cards SET due_at = ?3, fix_reason = ?4, fix_at = ?5, updated_at = ?6 WHERE id = ?1 AND user_id = ?2').bind(id, user, due, r, r ? Number(undo.fix_at) || t : null, t).run();
+    return { card_id: id, undone: true };
+  }
+  if (reason != null && !FIX_REASONS[reason]) throw new HttpError(400, `The reason is one of: ${Object.keys(FIX_REASONS).join(', ')}, or none for just not now.`);
+  const due = Math.max(Number(row.due_at) || 0, tomorrow(t));
+  await env.DB.prepare(`UPDATE cards SET due_at = ?3, fix_reason = coalesce(?4, fix_reason), fix_at = CASE WHEN ?4 IS NULL THEN fix_at ELSE ?5 END, updated_at = ?5
+    WHERE id = ?1 AND user_id = ?2`).bind(id, user, due, reason, t).run();
+  return { card_id: id, skipped: true, queued: !!reason, before: { due_at: row.due_at, fix_reason: row.fix_reason, fix_at: row.fix_at } };
+}
+
+/** The cards waiting for their Claude: skipped with a reason, forgotten often (leeches), or slow to answer. */
+export async function cardsToFix(env, user, { limit = FIX.list } = {}) {
+  const { results } = await env.DB.prepare(`SELECT c.id, c.front, c.back, c.lapses, c.reps, c.fix_reason, t.name AS topic,
+      (SELECT avg(r.duration_ms) FROM card_reviews r WHERE r.user_id = c.user_id AND r.card_id = c.id AND r.duration_ms IS NOT NULL) AS avg_ms,
+      (SELECT count(*) FROM card_reviews r WHERE r.user_id = c.user_id AND r.card_id = c.id AND r.duration_ms IS NOT NULL) AS timed_n
+    FROM cards c LEFT JOIN topics t ON t.user_id = c.user_id AND t.id = c.topic_id
+    WHERE c.user_id = ?1 AND c.deleted_at IS NULL AND c.suspended = 0 AND coalesce(c.source, '') <> 'anki'
+      AND (c.fix_reason IS NOT NULL OR ((c.fix_at IS NULL OR c.fix_at < ?6) AND (c.lapses >= ?2
+        OR (SELECT count(*) FROM card_reviews r WHERE r.user_id = c.user_id AND r.card_id = c.id AND r.duration_ms > ?3) >= ?4)))
+    ORDER BY c.fix_reason IS NULL, c.lapses DESC, c.fix_at DESC LIMIT ?5`).bind(user, FIX.leech_lapses, FIX.slow_ms, FIX.slow_reviews, limit, now() - FIX.recheck_days * 864e5).all();
+  return (results || []).map(r => ({ id: r.id, front: r.front, back: r.back, topic: r.topic || null,
+    why: r.fix_reason ? `they skipped it: ${FIX_REASONS[r.fix_reason].toLowerCase()}` : r.lapses >= FIX.leech_lapses ? `forgotten ${r.lapses} times` : `slow: about ${Math.round((r.avg_ms || 0) / 1000)} s an answer` }));
 }
 
 // ------------------------------------------------------------------ adding
@@ -345,6 +397,9 @@ export async function patchCard(env, user, idRaw, body, { actor = LEARNER, surfa
     if (typeof body.suspended !== 'boolean') throw new HttpError(400, 'Say whether the card is paused: true or false.');
     set.suspended = body.suspended ? 1 : 0;
   }
+  // Fixed or kept by their Claude (or edited by them): no longer waiting to be fixed.
+  // fix_at stays as when it was looked at, so a kept leech is not listed again for FIX.recheck_days.
+  if (body.keep === true || 'front' in body || 'back' in body || 'suspended' in body) { set.fix_reason = null; set.fix_at = now(); }
   const topicGiven = 'topic_id' in body;
   const topic = topicGiven ? idOrNull(body.topic_id, 'topic') : undefined;
   if (!Object.keys(set).length && !topicGiven) throw new HttpError(400, 'Nothing to change.');
@@ -415,8 +470,15 @@ export async function deleteCard(env, user, idRaw, { actor = LEARNER, surface = 
 async function review(request, env, ctx, params, url, user, session) {
   requireModule(session, 'cards', env);
   const body = await readJson(request, 5_000);
-  return ok(await reviewCard(env, user, params.id, body.rating, { duration_ms: body.duration_ms, surface: 'web', via: 'web' }));
+  return ok(await reviewCard(env, user, params.id, body.rating, { duration_ms: body.duration_ms, surface: 'web', via: 'web', confidence: body.confidence ?? null }));
 }
+
+async function skip(request, env, ctx, params, url, user, session) {
+  requireModule(session, 'cards', env);
+  const body = await readJson(request, 2_000);
+  return ok(await skipCard(env, user, params.id, { reason: body.reason ?? null, undo: body.undo || null }));
+}
+const toFix = async (request, env, ctx, params, url, user, session) => { requireModule(session, 'cards', env); return ok({ cards: await cardsToFix(env, user) }); };
 
 // ------------------------------------------------------------------ AI drafts
 
@@ -639,6 +701,8 @@ export const ROUTES = [
   ['PATCH', '/api/p/cards/:id', patch],
   ['DELETE', '/api/p/cards/:id', remove],
   ['POST', '/api/p/cards/:id/review', review],
+  ['POST', '/api/p/cards/:id/skip', skip],
+  ['GET', '/api/p/cards/to-fix', toFix],
   ['POST', '/api/p/anki/push', ankiPush],
   ['POST', '/api/p/anki/key', ankiKey],
   ['GET', '/api/p/anki/status', ankiStatusRoute],
@@ -695,13 +759,14 @@ const cardRate = {
 const cardEdit = {
   name: 'card_edit',
   module: 'cards',
-  description: 'Finds and fixes the student\'s own flashcards: find {text} lists up to 10 matches (id, front, back, topic). Then card_id with front and/or back to correct it, suspended true or false to pause or resume it, or delete true to remove it (ask first). Your own words only.',
-  inputSchema: { type: 'object', additionalProperties: false, properties: { find: { type: 'string' }, card_id: { type: ['integer', 'string'] },
+  description: 'Finds and fixes the student\'s own flashcards: find {text} lists up to 10 matches; find "to_fix" lists the cards waiting for you (skipped with a reason, forgotten 4+ times, or slow), with why. Then card_id with front and/or back to correct it, keep true to leave it as it is, suspended to pause or resume, or delete true (ask first). Your own words only.',
+  inputSchema: { type: 'object', additionalProperties: false, properties: { find: { type: 'string' }, card_id: { type: ['integer', 'string'] }, keep: { type: 'boolean' },
     front: { type: 'string', maxLength: FRONT_BACK_MAX - 1 }, back: { type: 'string', maxLength: FRONT_BACK_MAX - 1 }, suspended: { type: 'boolean' }, delete: { type: 'boolean' } } },
   annotations: { readOnlyHint: false, destructiveHint: true },
   async run(env, user, args) {
     const ctx = { actor: 'claude', surface: 'chat', via: 'platform:card_edit' };
     if (args.card_id == null) {
+      if (args.find === 'to_fix') { const cards = await cardsToFix(env, user); return { cards, note: cards.length ? 'For each: rewrite it (front, back), keep it, pause it or delete it (ask first). Tell them in a line what you changed.' : 'No card is waiting to be fixed.' }; }
       const q = typeof args.find === 'string' ? args.find.trim().slice(0, 100) : '';
       if (!q) throw new HttpError(400, 'Give find (words on the card) to look for it, or card_id to change one.');
       const { results } = await env.DB.prepare(`SELECT c.id, c.front, c.back, c.suspended, t.name AS topic FROM cards c LEFT JOIN topics t ON t.user_id = c.user_id AND t.id = c.topic_id
@@ -711,7 +776,7 @@ const cardEdit = {
     }
     if (args.delete === true) { await deleteCard(env, user, args.card_id, ctx); return { deleted: true, card_id: args.card_id, note: 'Deleted; this cannot be undone.' }; }
     const body = {};
-    for (const k of ['front', 'back', 'suspended']) if (args[k] !== undefined) body[k] = args[k];
+    for (const k of ['front', 'back', 'suspended', 'keep']) if (args[k] !== undefined) body[k] = args[k];
     const card = await patchCard(env, user, args.card_id, body, ctx);
     return { card: { id: card.id, front: card.front, back: card.back, suspended: !!card.suspended }, changed: Object.keys(body) };
   },

@@ -4,6 +4,7 @@
 import { errorResponse, HttpError } from './util.js';
 import * as registry from './map/registry/index.js';
 import { currentUser } from './users.js';
+import { noteTrace } from './debug/trace.js';
 import * as exams from './exams.js';
 import * as sittings from './sittings.js';
 import * as blocks from './blocks.js';
@@ -22,7 +23,10 @@ import * as images from './images.js';
 import * as summary from './summary.js';
 import * as uworld from './uworld.js';
 import { reviewRoute as uworldReviewRoute } from './uworld-review.js';
+import { pagesRoute as uworldPagesRoute } from './uworld-pages.js';
+import { talkGetRoute, talkPostRoute, talkCatchupRoute } from './uworld-review-talk.js';
 import * as gaps from './gaps.js';
+import { pushRoute as ankiReviewPush } from './map/ingest/anki-reviews.js';
 import * as spoken from './spoken.js';
 import * as backfillSignals from './backfill-signals.js';
 import * as backfillAudit from './backfill-audit.js';
@@ -32,6 +36,7 @@ import * as listen from './listen.js';
 import * as cardsAsk from './cards-ask.js';
 import { connectorToken } from './mcp.js';
 import * as perf from './perf.js';
+import * as bugs from './debug/bugs.js';
 import { NOTES_SERVER } from './mcp/notes-registry.js';
 import * as examBank from './exam-bank.js';
 
@@ -105,6 +110,7 @@ add('GET', '/api/healthhub/scores', results.healthhub);
 add('GET', '/api/focus', focus.get);
 add('GET', '/api/settings', settings.get);
 add('PUT', '/api/settings', settings.put);
+add('POST', '/api/catchup', settings.catchup);
 add('GET', '/api/plan', plan.get);
 add('POST', '/api/plan/seed', plan.seed);
 add('POST', '/api/uworld', plan.addUworld);
@@ -112,11 +118,17 @@ add('DELETE', '/api/uworld/:id', plan.removeUworld);
 add('PUT', '/api/uworld-blocks', uworld.put);
 add('DELETE', '/api/uworld-blocks/:id', uworld.deleteBlock);
 add('POST', '/api/uworld-blocks/:id/results', uworld.resultsShot);
+add('POST', '/api/uworld-blocks/:id/pages', uworldPagesRoute);
 add('GET', '/api/uworld-blocks/:id/review', uworldReviewRoute);
+add('GET', '/api/uworld-blocks/:id/my-review', talkGetRoute);
+add('POST', '/api/uworld-blocks/:id/my-review', talkPostRoute);
+add('POST', '/api/uworld-reviews/reanalyse', talkCatchupRoute);
 add('PUT', '/api/anki-sessions', spoken.put);
 add('POST', '/api/anki-sessions/:id/check', spoken.checkRoute);
 add('POST', '/api/anki-sessions/:id/alive', spoken.aliveRoute);
 add('POST', '/api/gaps', gaps.post);
+// Each Anki Voice rating straight after rate_card, through the same ingest as the 15-minute pull (map/ingest/anki-reviews.js).
+add('POST', '/api/anki-reviews', ankiReviewPush);
 add('POST', '/api/backfill/spoken-signals', backfillSignals.startRoute);
 add('POST', '/api/backfill/audit-cleanup', backfillAudit.route);
 add('GET', '/api/backfill/spoken-signals', backfillSignals.statusRoute);
@@ -153,6 +165,12 @@ add('POST', '/api/exam-bank/ask', examBank.askRoute);
 // Real-use frame times from the map (perf.js, speed 29 Oct).
 add('POST', '/api/perf/frames', perf.record);
 add('GET', '/api/perf/frames', perf.list);
+// Problem reports (debug/bugs.js, 1 Nov 2026): the report sheet on every page and Anki Voice's "flag this".
+add('POST', '/api/bugs', bugs.report);
+add('GET', '/api/bugs', bugs.listRoute);
+add('GET', '/api/bugs/:id', bugs.getRoute);
+add('GET', '/api/bugs/:id/shot', bugs.shotRoute);
+add('POST', '/api/bugs/:id/close', bugs.closeRoute);
 add('GET', '/api/export', exporter.exportAll);
 add('POST', '/api/import', exporter.importAll);
 
@@ -172,6 +190,7 @@ export async function dispatch(request, env, ctx, url, table) {
     if (!m) continue;
     pathMatched = true;
     if (r.method !== request.method) continue;
+    noteTrace(t => { t.route = `${r.method} ${r.pattern}`; });   // the trace names the route, so a report points at its handler
     try {
       const params = {};
       try {
@@ -183,6 +202,7 @@ export async function dispatch(request, env, ctx, url, table) {
       return await r.handler(request, env, ctx, params, url);
     } catch (e) {
       if (e instanceof HttpError) return errorResponse(e.status, e.message);
+      noteTrace(t => t.fail(e));
       console.error('api error', request.method, url.pathname, e && e.stack || e);
       return errorResponse(500, 'Something went wrong on the hub. Please try again in a moment.');
     }

@@ -5,17 +5,19 @@ import { topicYield, unitLane, ankingCounts, refreshYield } from './yield.js';
 import { fetchAliases, liveTopic, searchTopics, requeueAfter, resolveCategory } from './resolve.js';
 import { queueHandlers } from './registry/index.js';
 import { ambossUrlOk, cueLooksLikeStem, looksLikeQuestionText, GAP_LEFT_OUT } from './guard.js';
-import { placeRows } from './queue.js';
+import { placeRows, QUEUE_KINDS, PLACE_SQL } from './queue.js';
 import { SOFT, softFields } from './events.js';
 import { lookalikeProposals } from './links-ingest.js';
 import { planLinks } from './links-store.js';
 import { HttpError, json, readJson, londonDay } from '../util.js';
+import { isFoundationCategory } from '../../../public/js/shared/concept.js';
+const PLACED_KINDS = ['label', 'gap', 'card', 'review_row'];
 
 export const TOPIC_STATUSES = ['proposed', 'confirmed', 'merged', 'retired'];
 export const ALIAS_KINDS = ['name', 'abbrev', 'british', 'synonym', 'uworld_label', 'truncated', 'log_topic', 'analysis_topic', 'gap_topic',
   'tally_condition', 'amboss_title', 'nbme_term', 'merge', 'typo'];
 export const GIVEN_ALIAS_KINDS = ALIAS_KINDS.filter(k => !['name', 'merge'].includes(k));
-export const QUEUE_KINDS = ['label', 'gap', 'card', 'lookalike', 'unit', 'versus', 'review_row'];
+export { QUEUE_KINDS };
 export const MAX_TOPICS = 25, MAX_TOPICS_RUN = 50, MAX_ITEMS = 25, MAX_ITEMS_RUN = 50, MAX_ALIASES = 10;
 export const AUTO_CONFIRM_DAYS = 7;
 const DAY = 86_400_000;
@@ -695,7 +697,8 @@ async function existingCardTopics(env, user, cardIds) {
 
 const CONTEXT_KEYS = ['system', 'category_hint', 'category_id', 'unit', 'unit_id', 'unit_hint', 'lane', 'rank', 'split', 'tally', 'look_alike_head', 'gap',
   'said', 'ref_label', 'cut', 'source', 'amboss_url', 'title', 'names', 'pairs',
-  'label', 'true_topic_id', 'resolved'];   // a look-alike's miss label and the miss's own topic; a card pair's sides code placed
+  'label', 'true_topic_id', 'resolved',   // a look-alike's miss label and the miss's own topic; a card pair's sides code placed
+  'card_id', 'note_id', 'deck', 'reason', 'why', 'ratings', 'lapses', 'lapses_30d', 'median_s', 'p90_s'];   // a card to fix (card_fix, card-fix.js)
 
 export async function listQueue(env, user, { kind = null, category = null, limit = 10, offset = 0 } = {}) {
   const n = Math.max(1, Math.min(25, Number(limit) || 10));
@@ -704,21 +707,42 @@ export async function listQueue(env, user, { kind = null, category = null, limit
   let res;
   try {
     res = await env.DB.batch([
-      env.DB.prepare(`SELECT kind, count(*) AS n FROM topic_queue WHERE user_id = ? AND status = 'open' GROUP BY kind`).bind(user),
+      // Cards to fix (card_fix) are not things to place: counted and listed only when asked for by kind.
+      env.DB.prepare(`SELECT kind, count(*) AS n FROM topic_queue WHERE user_id = ?1 AND status = 'open' AND (CASE WHEN ?2 = 'card_fix' THEN kind = 'card_fix' ELSE ${PLACE_SQL} END) GROUP BY kind`).bind(user, kind),
       env.DB.prepare(`SELECT id, kind, label_raw, refs, first_seen_at, context_json, candidates_json FROM topic_queue WHERE user_id = ?1 AND status = 'open'
-          AND (?2 IS NULL OR kind = ?2) AND (?3 IS NULL OR json_extract(context_json, '$.category_hint') = ?3 OR json_extract(context_json, '$.category_id') = ?3)
+          AND (?2 IS NULL OR kind = ?2) AND (?2 = 'card_fix' OR ${PLACE_SQL}) AND (?3 IS NULL OR json_extract(context_json, '$.category_hint') = ?3 OR json_extract(context_json, '$.category_id') = ?3)
           ORDER BY refs DESC, first_seen_at, id LIMIT ?4 OFFSET ?5`).bind(user, kind, category, n, skip),
     ]);
   } catch (e) { if (noTable(e)) return { open: 0, by_kind: {}, items: [] }; throw e; }
   const by_kind = Object.fromEntries((res[0].results || []).map(r => [r.kind, r.n]));
+  const fixTopics = kind === 'card_fix' ? await cardFixTopics(env, user, res[1].results || []) : null;
   const items = (res[1].results || []).map(r => {
     const c = parse(r.context_json, {});
     const context = Object.fromEntries(CONTEXT_KEYS.filter(k => c[k] != null).map(k => [k, typeof c[k] === 'string' ? c[k].slice(0, 400) : c[k]]));
     const label = r.kind === 'gap' ? gapItemSafe(r.label_raw, c, context, r.first_seen_at) : r.label_raw;
+    if (fixTopics && c.card_id != null) context.topics = fixTopics.get(Number(c.card_id)) || [];
     return { queue_id: r.id, kind: r.kind, label_raw: label, refs: r.refs, first_seen_day: londonDay(r.first_seen_at), context,
       candidates: parse(r.candidates_json, []).slice(0, 3) };
   });
   return { open: Object.values(by_kind).reduce((a, b) => a + b, 0), by_kind, items };
+}
+
+// A card to fix: the topics it is linked to now (card_topics, live topics only), as {id, name}, at most 3 a card.
+async function cardFixTopics(env, user, rows) {
+  const ids = uniq(rows.map(r => Number(parse(r.context_json, {}).card_id)).filter(n => Number.isSafeInteger(n) && n > 0));
+  const out = new Map();
+  if (!ids.length) return out;
+  try {
+    const got = (await env.DB.prepare(`SELECT ct.card_id, t.id, t.name FROM card_topics ct JOIN topics t ON t.user_id = ct.user_id AND t.id = ct.topic_id
+        AND t.status IN ('proposed', 'confirmed') WHERE ct.user_id = ? AND ct.removed_at IS NULL AND ct.card_id IN (SELECT value FROM json_each(?))
+        ORDER BY ct.strong DESC, t.name`).bind(user, JSON.stringify(ids)).all()).results || [];
+    for (const g of got) {
+      const list = out.get(Number(g.card_id)) || [];
+      if (list.length < 3) list.push({ id: g.id, name: g.name });
+      out.set(Number(g.card_id), list);
+    }
+  } catch (e) { if (!noTable(e)) throw e; }
+  return out;
 }
 
 /**
@@ -965,6 +989,19 @@ export async function planQueueResolve(env, user, args, ctx) {
     existingCardTopics(env, user, cardIds),
   ]);
   data.taken = freshTaken();
+  // A root-cause topic (a foundation concept) takes only concept rows: a gap, a card, a review row or a label is placed on
+  // the clinical topic it is about (card-roots.js). Only a concept's own item (context.source 'concept') goes there.
+  const rootTarget = e => {
+    if (!PLACED_KINDS.includes(e.item.kind) || (e.item.kind === 'label' && e.item.context && e.item.context.source === 'concept')) return false;
+    const specs = [e.arg, ...(Array.isArray(e.arg.topics) ? e.arg.topics : [])].filter(isObj);
+    return specs.some(x => (typeof x.topic_id === 'string' && isFoundationCategory((topics.get(x.topic_id) || {}).category_id))
+      || [x.new_topic, x.new].some(n => isObj(n) && isFoundationCategory(n.category_id)));
+  };
+  for (let i = entries.length - 1; i >= 0; i--) {
+    if (!rootTarget(entries[i])) continue;
+    problems.push({ queue_id: entries[i].item.id, problem: 'That is a root-cause topic (a foundation concept); place it on the clinical topic it is about.' });
+    entries.splice(i, 1);
+  }
   const shared = {
     data, topics, unitTopicSeen: new Set(), cardTopics,
     out: { rows: [], events: [], dupes: [], repoint: [], placements: [], parts: [], new_topics: [], results: [], problems, touched: new Set() },
@@ -1003,7 +1040,11 @@ export async function planQueueResolve(env, user, args, ctx) {
   const allEvents = [...own.events, ...o.parts.flatMap(p => p.events), ...o.dupes];
   if (!allRows.length) return { refuse: problems.length ? problems.map(p => `${p.queue_id}: ${p.problem}`).join(' ').slice(0, 600) : 'Nothing to place.' };
   const done = o.results.length;
-  const summary = `Placed ${done} queue item${done === 1 ? '' : 's'}${o.new_topics.length ? `, ${o.new_topics.length} new topic${o.new_topics.length === 1 ? '' : 's'}` : ''}`;
+  // Cards to fix (card_fix) are reviewed, not placed: their change says what Claude did with them.
+  const fixed = o.results.filter(x => x && x.fixed);
+  const fixWords = ['rewritten', 'suspended', 'kept'].map(k => [k, fixed.filter(x => x.fixed === k).length]).filter(([, n]) => n).map(([k, n]) => `${n} ${k}`).join(', ');
+  const summary = fixed.length && fixed.length === done ? `Cards reviewed by Claude: ${fixWords}`
+    : `Placed ${done} queue item${done === 1 ? '' : 's'}${o.new_topics.length ? `, ${o.new_topics.length} new topic${o.new_topics.length === 1 ? '' : 's'}` : ''}`;
   return {
     rows: allRows, events: allEvents, evidence: o.repoint.length ? { repoint: o.repoint } : null, touched_topics: [...o.touched],
     count: entries.length, summary,
@@ -1137,7 +1178,7 @@ export async function seedStatus(env, user) {
   for (const r of t.results || []) out.topics[r.status] = r.n;
   try {
     const [q, m] = await env.DB.batch([
-      read(`SELECT kind, count(*) AS n FROM topic_queue WHERE user_id = ? AND status = 'open' GROUP BY kind`),
+      read(`SELECT kind, count(*) AS n FROM topic_queue WHERE user_id = ? AND status = 'open' AND ${PLACE_SQL} GROUP BY kind`),
       read(`SELECT count(*) AS total, sum(topic_id IS NOT NULL) AS placed, sum(source = 'anki' OR anki_mistake_id IS NOT NULL) AS anki,
           sum((source = 'anki' OR anki_mistake_id IS NOT NULL) AND topic_id IS NOT NULL) AS anki_placed FROM misses_live WHERE user_id = ?`),
     ]);

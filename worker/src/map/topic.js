@@ -1,3 +1,4 @@
+import { effectOf } from './lesson-effect.js';
 import { json, londonDay, HttpError } from '../util.js';
 import { leaks } from '../checks.js';
 import { leakIndexFor, stemSafe, questionSafe, gapSafe } from './guard.js';
@@ -5,17 +6,29 @@ import { whyLine } from './weakness.js';
 import { HALF_LIFE } from './weights.js';
 import { errorWords, gapOrigin, GAP_SOURCE_LABEL, SLOW_S } from './ingest/map-fields.js';
 import { lookAlikeHead, decayed, isMixedUp } from './links.js';
+import { causeOf, causeWords } from '../../../public/js/shared/cause.js';
 import { LINK_TYPES, importance, colourW } from '../../../public/js/shared/link-rank.js';
 import { bandOf, bandWord } from '../../../public/js/map/scale.js';
 import { ambossSearch } from '../../../public/js/shared/amboss.js';
 import { refreshSources, staleKinds, cardDetail, MY_DECK } from './sources.js';
+import { isRootCause } from './card-roots.js';
 import { DISCIPLINES } from './systems.js';
-import { TREND_WORDS } from './fsrs.js';
+import { TREND_WORDS, TREND_NONE_WORDS, modelFromStored } from './fsrs.js';
+import { timeline, RECORDED_GAP_SOURCES as RECORDED } from './evidence-timeline.js';
+import { EVIDENCE_WORDS, levelOfScore, nEffOfScore, nextRange, basisLine, confidenceWords, isBoilerplate, QUOTE_RULE } from '../../../public/js/shared/evidence.js';
+import { trendSentence } from '../../../public/js/shared/trend.js';
 import { topicHabitStatements, shapeTopicHabits, forExplaining } from './habits.js';
 import { rankJoin, RANK_COLS, examRankText } from '../exam-ranks.js';
 import { lastChangeSql, lastChangeOf } from './recent.js';
 import { photoStatement, shapePhotos } from './photos.js';
 import { pictureStatement, shapePictures, attachOnOpen } from './pictures.js';
+import { shapeFacets, facetsText, facetOfQuestion, partsView, liveFacetRows, FACET_READ_COLS } from './facets.js';
+import { STATE_COLS, withLive, liveSql, liveMap } from './live.js';
+import { foundationsFor } from './concepts.js';
+import { CLUSTER_OF_SQL, clusterOfRow } from './clusters.js';
+import { shapeViva } from './viva.js';
+import { rulesWords } from './weight-sets.js';
+import { ratingsSql, shapeRatings, ratingsText, KEEP_DAYS as RATING_DAYS } from './self-rating.js';
 
 export const AUDIENCES = ['page', 'claude'];
 export const SECTIONS = ['misses', 'gaps', 'cards', 'links', 'read', 'lessons'];
@@ -30,14 +43,15 @@ export const AWAIT_MS = 2500;
 // The only miss columns read (and so the only ones that can ever leave): plan §9's whitelist. block_id is read
 // for the leak check and never sent.
 export const MISS_COLS = ['id', 'label', 'day', 'at', 'result', 'outcome', 'flaw_kind', 'confidence', 'error_type', 'time_s', 'slow', 'rule',
-  'my_reasoning', 'look_alikes', 'retests_json', 'next_retest_day', 'block_id', 'uw_qid'];
+  'my_reasoning', 'look_alikes', 'retests_json', 'next_retest_day', 'block_id', 'uw_qid', 'cause', 'cause_quote', 'cause_inferred', 'cause_detail',
+  'confidence_source', 'reasoning_source', 'his_words', 'his_words_at', 'his_words_src', 'mo_corrected_json'];
 export const MISS_ITEM_KEYS = ['id', 'label', 'day', 'result', 'outcome', 'flaw_kind', 'confidence', 'error_type', 'error_words', 'time_s', 'slow',
-  'rule', 'my_reasoning', 'look_alike', 'retest', 'slip', 'uw_qid'];
+  'rule', 'my_reasoning', 'look_alike', 'miss_card', 'slip', 'uw_qid', 'cause', 'cause_words', 'cause_inferred', 'cause_quote',
+  'his_words', 'his_words_at', 'confidence_source', 'confidence_words', 'reasoning_source', 'corrected'];
 // Never in any reply, at any depth.
 export const FORBIDDEN_KEYS = ['correct_reasoning', 'why_wrong_options', 'right_reasoning', 'other_options', 'stem', 'question_text', 'explanation'];
 
-const CERT_WORDS = { low: 'not settled yet', medium: 'fairly sure', high: 'sure' };
-const ORIGIN_WORDS = { stated: 'You said', review: 'Anki review' };
+const ORIGIN_WORDS = { stated: 'Named by you', review: 'Anki review' };
 const RESULT_WORDS = { wrong: 'wrong', flawed: 'right but shaky' };
 const LESSON_OUTCOME_WORDS = { landed: 'landed', partial: 'partly', not_landed: 'did not land' };
 const REQUEST_MS = 24 * 3600_000, TEACHING_MS = 3 * 3600_000;
@@ -72,6 +86,9 @@ export function readOptions(opts = {}) {
 
 // ---------------------------------------------------------------- reads
 
+// The state columns s.score does not already select (live.js reads the fade from them).
+const SCORE_STATE = STATE_COLS.filter(c => !['seen', 'fsrs_at', 'prior_mastery'].includes(c)).join(', ');
+
 /**
  * The statements of the one read batch, by name. Sections not asked for are left out, and so is any optional
  * table in `skip` (one that does not exist yet). Every statement names user_id.
@@ -91,8 +108,10 @@ export function detailStatements(env, user, topicId, { audience = 'page', sectio
     WHERE t.user_id = ? AND t.id = ?`, user, topicId);
   s.aliases = q(`SELECT alias, kind FROM topic_aliases WHERE user_id = ? AND topic_id = ? AND status = 'active' AND kind NOT IN ('typo','truncated')
     ORDER BY kind = 'abbrev' DESC, length(alias) LIMIT ${CAPS.aliases}`, user, topicId);
+  // With the state the fade is worked out from on read (live.js, 1 Nov 2026: no hourly job writes it any more).
   s.score = q(`SELECT seen, t, band, certainty, certainty_level, why_json, n_seen, questions_n, right_n, misses_n, sure_wrong_n, slow_n, cards_n,
-      lapses_n, lessons_n, gaps_n, last_question_at, last_miss_at, computed_at, refreshed_at, weakness_raw, trend
+      lapses_n, lessons_n, gaps_n, retests_n, last_question_at, last_miss_at, computed_at, refreshed_at, weakness_raw, trend,
+      fsrs_real_n, fsrs_at, trend_basis_json, prior_mastery, ${SCORE_STATE}
     FROM topic_scores WHERE user_id = ? AND topic_id = ?`, user, topicId);
   s.fetches = q(`SELECT kind, fetched_at, n, status FROM source_fetches WHERE user_id = ? AND topic_id = ?`, user, topicId);
   if (audience === 'page' && !skip.has('topic_photos')) s.photos = photoStatement(env, user, topicId);
@@ -103,7 +122,7 @@ export function detailStatements(env, user, topicId, { audience = 'page', sectio
     s.misses = q(`SELECT ${MISS_COLS.join(', ')} FROM misses_live WHERE user_id = ? AND topic_id = ? ORDER BY at DESC LIMIT ?`, user, topicId, missesLimit);
   }
   if (sections.has('gaps')) {
-    s.gaps = q(`SELECT id, at, day, source, origin, verdict, gap, said, card_id, ref, count(*) OVER () AS total FROM gaps
+    s.gaps = q(`SELECT id, at, day, source, origin, verdict, gap, said, card_id, ref, confidence, mo_corrected_json, count(*) OVER () AS total FROM gaps
       WHERE user_id = ? AND topic_id = ? AND held = 0 ORDER BY at DESC LIMIT ${CAPS.gaps}`, user, topicId);
   }
   if (sections.has('cards')) {
@@ -116,35 +135,59 @@ export function detailStatements(env, user, topicId, { audience = 'page', sectio
   }
   if (sections.has('links')) {
     s.links = q(`SELECT k.id, k.type, k.from_id, k.to_id, k.directed, k.how, k.a_vs_b, k.b_vs_a, k.picture, k.strength, k.confusion, k.confusion_at,
-        k.confused_n, k.last_confused_at, k.last_truth_id, k.status, o.name AS other_name, o.short_name AS other_short, o.yield AS other_yield,
+        k.confused_n, k.last_confused_at, k.last_truth_id, k.status, o.name AS other_name, o.short_name AS other_short, o.yield AS other_yield, o.kind AS other_kind,
         so.seen AS other_seen, so.t AS other_t
       FROM links k JOIN topics o ON o.user_id = k.user_id AND o.id = CASE WHEN k.from_id = ?2 THEN k.to_id ELSE k.from_id END
       LEFT JOIN topic_scores so ON so.user_id = k.user_id AND so.topic_id = o.id
       WHERE k.user_id = ?1 AND (k.from_id = ?2 OR k.to_id = ?2) AND k.status IN ('active','proposed') AND o.status IN ('proposed','confirmed')
       ORDER BY k.type = 'versus' DESC, k.confusion DESC, k.strength DESC LIMIT 40`, user, topicId);
+    // The neighbours' colours as of now too (live.js), for their dots and the links' order.
+    s.linkLive = q(`${liveSql(false)} AND s.topic_id IN (SELECT CASE WHEN k.from_id = ?2 THEN k.to_id ELSE k.from_id END FROM links k
+        WHERE k.user_id = ?1 AND (k.from_id = ?2 OR k.to_id = ?2) AND k.status IN ('active','proposed'))`, user, topicId);
   }
   if (sections.has('read')) {
     s.mehlman = q(`SELECT r.resource_id, coalesce(x.title, r.label, r.resource_id) AS title, r.page, r.page_to, r.section, r.snippet, r.kind
       FROM resource_links r LEFT JOIN resources x ON x.user_id = r.user_id AND x.id = r.resource_id
       WHERE r.user_id = ? AND r.topic_id = ? AND r.status = 'live' ORDER BY r.kind = 'mehlman' DESC, r.rank DESC LIMIT 8`, user, topicId);
   }
+  if (audience === 'page') {
+    // The miss's and the gap's step and the card's front tag each row Diagnose or Manage (facets.js, the same joins as OBS_SQL).
+    s.evidence = q(`SELECT e.*, m.his_words, m.his_words_at, g.said AS gap_said, g.at AS gap_at, g.source AS gap_source,
+        m.step AS miss_step, g.step AS gap_step, c.question AS card_question
+      FROM evidence_live e LEFT JOIN misses m ON m.user_id = e.user_id AND m.id = e.miss_id
+      LEFT JOIN gaps g ON g.user_id = e.user_id AND g.id = e.gap_id
+      LEFT JOIN card_cache c ON c.user_id = e.user_id AND c.card_id = e.card_id AND e.kind = 'card_review'
+      WHERE e.user_id = ? AND e.topic_id = ? ORDER BY e.at DESC LIMIT 600`, user, topicId);
+    s.fsrs = q(`SELECT cursor FROM sync_state WHERE user_id = ? AND source = 'anki.fsrs'`, user);
+  }
   if (!skip.has('pattern_items') && !skip.has('habits')) Object.assign(s, topicHabitStatements(env, user, topicId));
   if (sections.has('lessons')) {
-    s.lessons = q(`SELECT id, kind, status, surface, minutes, outcome, day, requested_at, started_at, ended_at, card_id, card_note_id, card_action,
-        topic_id, pair_topic_id, mo_rating, what_clicked FROM lessons WHERE user_id = ?1 AND (topic_id = ?2 OR pair_topic_id = ?2)
+    // Every column: the viva-first lesson's scores (0065) when the database has them.
+    s.lessons = q(`SELECT * FROM lessons WHERE user_id = ?1 AND (topic_id = ?2 OR pair_topic_id = ?2)
       ORDER BY coalesce(ended_at, started_at, requested_at) DESC LIMIT 8`, user, topicId);
+    s.lesson_after = q(`SELECT kind, result, rating, amount, detail_json, at, slot, held FROM evidence_live WHERE user_id = ? AND topic_id = ?
+      AND kind IN ('card_review', 'question') ORDER BY at DESC LIMIT 300`, user, topicId);
     s.memory = q(`SELECT id, tactic, note, status FROM teach_memory WHERE user_id = ? AND scope = 'topic' AND scope_ref = ? AND status IN ('active','pinned')
       ORDER BY status = 'pinned' DESC, score DESC, updated_at DESC LIMIT ${CAPS.memory}`, user, topicId);
     if (!skip.has('misconceptions')) {
-      s.misconceptions = q(`SELECT * FROM misconceptions WHERE user_id = ? AND topic_id = ? AND status <> 'closed'
-        ORDER BY coalesce(last_seen, first_seen) DESC LIMIT ${CAPS.misconceptions}`, user, topicId);
+      // Open ones, and ones closed in the last 14 days so the close shows (wave 3).
+      s.misconceptions = q(`SELECT * FROM misconceptions WHERE user_id = ? AND topic_id = ? AND (status <> 'closed' OR closed_at >= ?)
+        ORDER BY status = 'closed', coalesce(last_seen, first_seen) DESC LIMIT ${CAPS.misconceptions}`, user, topicId, Date.now() - 14 * 86_400_000);
+    }
+    if (!skip.has('viva_results')) {
+      s.viva = q(`SELECT * FROM viva_results WHERE user_id = ? AND topic_id = ? AND status = 'graded' ORDER BY graded_at DESC LIMIT 1`, user, topicId);
     }
   }
+  s.ratings = q(ratingsSql, user, topicId, Date.now() - RATING_DAYS * 86_400_000);
+  // The topic's Diagnose and Manage parts (wave 3, facets.js; 0058).
+  if (!skip.has('topic_facets')) s.facets = q(`SELECT ${FACET_READ_COLS} FROM topic_facets WHERE user_id = ? AND topic_id = ?`, user, topicId);
+  // The error cluster it is part of (clusters.js, 0071), in the same batch.
+  if (!skip.has('clusters')) s.cluster = q(CLUSTER_OF_SQL, user, topicId);
   return s;
 }
 
 // Tables a later area adds; a database without one still answers (the section is left empty).
-const OPTIONAL = ['misconceptions', 'topic_photos', 'topic_pictures', 'pattern_items', 'habits'];
+const OPTIONAL = ['misconceptions', 'topic_photos', 'topic_pictures', 'pattern_items', 'habits', 'topic_facets', 'viva_results', 'clusters'];
 const missingOptional = e => { const m = /no such table:?\s*(?:main\.)?(\w+)/i.exec(String(e && e.message)); return m && OPTIONAL.includes(m[1]) ? m[1] : null; };
 
 // Optional tables found missing in this isolate, so later reads skip them without a failed batch.
@@ -216,29 +259,55 @@ export function unitLine(unit) {
 }
 
 /** The stored score in words. The browser never computes a score: t1000 is only mapped to a colour there. */
-export function shapeWeakness(s, now) {
+export function shapeWeakness(s, now = Date.now()) {
   if (!s || !Number(s.seen)) {
-    return { seen: false, t1000: null, band: 'unseen', band_words: bandWord('unseen'), cert100: 0, certainty_words: CERT_WORDS.low, signs: 0,
-      why: 'Not seen yet.', counts: countsOf(s) };
+    return { seen: false, t1000: null, band: 'unseen', band_words: bandWord('unseen'), cert100: 0, certainty_words: EVIDENCE_WORDS.thin, signs: 0,
+      why: 'Not seen yet.', counts: countsOf(s), evidence: { level: 'thin', n_eff: 0, words: EVIDENCE_WORDS.thin, basis: basisLine(countsOf(s), 'thin') } };
   }
   const t1000 = s.t == null ? null : Math.round(Number(s.t) * 1000);
   const band = s.band && s.band !== 'unseen' ? s.band : bandOf(t1000);
+  const ev = evidenceOf(s, now);
   return {
     seen: true, t1000, band, band_words: bandWord(band), cert100: Math.round((Number(s.certainty) || 0) * 100),
-    certainty_words: CERT_WORDS[s.certainty_level] || CERT_WORDS.low, signs: Number(s.n_seen) || 0,
-    why: whyLine({ ...s, band, t1000 }, s.why_json, now), counts: countsOf(s), ...memoryOf(s),
+    certainty_words: ev.words, signs: Number(s.n_seen) || 0,
+    why: whyLine({ ...s, band, t1000 }, s.why_json, now), counts: countsOf(s), evidence: ev, ...memoryOf(s, { thin: ev.level === 'thin', now, n_eff: ev.n_eff }),
+    // Lineage (shadow mode, weight-sets.js): which scoring rules worked this colour out ("Scored with rules v9").
+    ...(rulesWords(s.formula_version) ? { rules: rulesWords(s.formula_version) } : {}),
   };
 }
 
-export function memoryOf(s) {
-  const trend = s && s.trend != null && Number.isFinite(Number(s.trend)) ? Number(s.trend) : null;
+/**
+ * How much the colour rests on (wave 2 C.4, shared/evidence.js): {level thin | some | solid, n_eff, words "evidence: thin",
+ * basis "Based on 1 question and 3 cards, so the colour is still a guess"}.
+ */
+export function evidenceOf(s, now = Date.now()) {
+  const level = levelOfScore(s, now);
+  return { level, n_eff: Math.round(nEffOfScore(s, now) * 100) / 100, words: EVIDENCE_WORDS[level], basis: basisLine(countsOf(s), level) };
+}
+
+export function memoryOf(s, { thin = false, now = Date.now(), n_eff = 0 } = {}) {
+  const stored = s && s.trend != null && Number.isFinite(Number(s.trend)) ? Number(s.trend) : null;
+  // No trend word while the evidence is thin (wave 2 C.4): one answer never makes "slipping".
+  const trend = thin ? null : stored;
   const raw = s && s.weakness_raw != null && Number.isFinite(Number(s.weakness_raw)) ? Number(s.weakness_raw) : null;
-  return { trend, trend_words: trend == null ? null : TREND_WORDS[trend], next_right100: raw == null ? null : Math.round(100 * (1 - raw)) };
+  let basis = null;
+  try { basis = s && s.trend_basis_json ? JSON.parse(s.trend_basis_json) : null; } catch { basis = null; }
+  // No trend yet is said as such ("too early to tell", never a blank that reads as steady); a trend names what it rests
+  // on ("Slipping: right 22 Oct, wrong today").
+  return {
+    trend, trend_words: trend == null ? TREND_NONE_WORDS : TREND_WORDS[trend], trend_sentence: trendSentence(trend, basis, { now }),
+    ...(basis && trend != null ? { trend_basis: { answers: (basis.answers || []).slice(-3), answer_at: (basis.answer_at || []).slice(-3), days: basis.days ?? null } } : {}),
+    next_right100: raw == null ? null : Math.round(100 * (1 - raw)),
+    // Thin evidence: the chance as an 80% range, not one number (statistics review, section 3).
+    ...(thin && raw != null ? { next_range: nextRange(1 - raw, n_eff) } : {}),
+  };
 }
 
 function countsOf(s) {
   const out = {};
   for (const k of ['questions_n', 'right_n', 'misses_n', 'sure_wrong_n', 'slow_n', 'cards_n', 'lapses_n', 'lessons_n', 'gaps_n']) out[k.replace(/_n$/, '')] = s ? Number(s[k]) || 0 : 0;
+  // A miss's card answered the first time (retests_n): its own name, never "re-test" (1 Nov 2026).
+  out.miss_cards = s ? Number(s.retests_n) || 0 : 0;
   return out;
 }
 
@@ -255,16 +324,47 @@ export function retestOf(retestsJson, nextDay) {
   return nextDay ? { due: nextDay, result: null } : null;
 }
 
+export function missCardOf(retestsJson, nextDay, now = Date.now()) {
+  const r = retestOf(retestsJson, nextDay);
+  if (!r) return null;
+  const line = r.result == null
+    ? (r.due > londonDay(now) ? `A card from this miss joins your deck from ${shortDay(r.due) || r.due}.` : 'A card from this miss is waiting to join your deck (3 new a day, best first).')
+    : /^(got_it|right|pass)/.test(String(r.result)) ? 'The card from this miss was right the first time.' : 'The card from this miss was missed the first time; Anki brings it back.';
+  return { day: r.due, result: r.result, line };
+}
+
 /** One miss through the whitelist. Only MISS_ITEM_KEYS come out. */
-export function shapeMiss(m, audience = 'page') {
+export function shapeMiss(m, audience = 'page', now = Date.now()) {
   const error_type = m.error_type || null;
+  const c = causeOf(m);
+  const look = lookAlikeHead(m.look_alikes) || null;
+  const words = causeWords(c, { lookAlike: look });
   return {
     id: m.id, label: m.label, day: m.day, result: m.result, outcome: m.outcome || null, flaw_kind: m.flaw_kind || null,
     confidence: m.confidence || null, error_type, error_words: errorWords(error_type), time_s: num(m.time_s),
     slow: !!Number(m.slow) || (num(m.time_s) != null && num(m.time_s) > SLOW_S),
     rule: cut(m.rule, TEXT.rule), my_reasoning: cut(m.my_reasoning, audience === 'claude' ? TEXT.reasoning_claude : TEXT.reasoning_page),
-    look_alike: lookAlikeHead(m.look_alikes) || null, retest: retestOf(m.retests_json, m.next_retest_day), slip: SLIP_ERRORS.includes(error_type),
+    look_alike: look, miss_card: missCardOf(m.retests_json, m.next_retest_day, now), slip: SLIP_ERRORS.includes(error_type),
     uw_qid: m.uw_qid != null && m.uw_qid !== '' ? String(m.uw_qid) : null,
+    cause: c ? c.cause : null, cause_words: words ? words.text : null, cause_inferred: c ? c.inferred : null,
+    cause_quote: c && c.quote ? cut(c.quote, TEXT.gap) : null,
+    ...provenanceOf(m, audience),
+  };
+}
+
+export function correctedOf(json) {
+  const o = parse(json, null);
+  return isObj(o) ? Object.keys(o).filter(k => ['cause', 'confidence', 'his_words'].includes(k)) : [];
+}
+
+export function provenanceOf(m, audience = 'page') {
+  const corrected = correctedOf(m.mo_corrected_json);
+  const words = m.his_words && !isBoilerplate(m.his_words) ? cut(m.his_words, audience === 'claude' ? TEXT.reasoning_claude : TEXT.reasoning_page) : null;
+  const confSource = corrected.includes('confidence') ? 'mo' : m.confidence_source || null;
+  return {
+    his_words: words, his_words_at: words && num(m.his_words_at) != null ? num(m.his_words_at) : null,
+    confidence_source: m.confidence ? confSource : null, confidence_words: confidenceWords(m.confidence, confSource) || null,
+    reasoning_source: m.my_reasoning ? m.reasoning_source || null : null, corrected,
   };
 }
 
@@ -297,13 +397,19 @@ export function missLine(sum) {
   return parts.join(' · ');
 }
 
+export { RECORDED_GAP_SOURCES } from './evidence-timeline.js';
+
 export function shapeGap(g, audience = 'page') {
   g = gapSafe(g);
   const origin = gapOrigin(g);
-  const words = origin === 'stated' ? cut(g.gap, TEXT.gap) : cut(g.said, TEXT.gap);
-  const item = { id: g.id, day: g.day || dayOf(g.at), origin, origin_words: ORIGIN_WORDS[origin], source: g.source,
-    source_words: GAP_SOURCE_LABEL[g.source] || String(g.source || '').replace(/_/g, ' '), text: words, card_id: num(g.card_id) };
-  if (audience === 'claude') { item.gap = cut(g.gap, TEXT.gap); item.said = cut(g.said, TEXT.gap); item.verdict = g.verdict || null; }
+  const corrected = correctedOf(g.mo_corrected_json);
+  const raw = origin === 'stated' ? g.gap : g.said;
+  const words = raw && !isBoilerplate(raw) ? cut(raw, TEXT.gap) : null;
+  const quoted = !!words && (origin === 'stated' || RECORDED.includes(g.source) || corrected.includes('his_words'));
+  const item = { id: g.id, day: g.day || dayOf(g.at), at: num(g.at), origin, origin_words: ORIGIN_WORDS[origin], source: g.source,
+    source_words: GAP_SOURCE_LABEL[g.source] || String(g.source || '').replace(/_/g, ' '), text: words, quoted, card_id: num(g.card_id),
+    confidence: g.confidence || null, confidence_words: confidenceWords(g.confidence, corrected.includes('confidence') ? 'mo' : null) || null, corrected };
+  if (audience === 'claude') { item.gap = cut(g.gap, TEXT.gap); item.said = isBoilerplate(g.said) ? null : cut(g.said, TEXT.gap); item.verdict = g.verdict || null; }
   return item;
 }
 
@@ -325,6 +431,7 @@ export function linkLabel(type, how, dir) {
   if (type === 'causes') {
     if (how === 'risk_factor') return out ? 'Risk factor for' : 'Risk factors';
     if (how === 'complication') return out ? 'Can lead to' : 'Complication of';
+    if (how === 'underlies') return out ? 'Underlies' : 'Rests on';   // a foundation concept (concepts.js)
     return out ? 'Causes' : 'Caused by';
   }
   return (LINK_TYPES[type] || {}).label || type;
@@ -344,7 +451,7 @@ export function shapeLinks(rows, topic, { now = Date.now(), score = null, hlDays
     const otherT = Number(l.other_seen) && l.other_t != null ? Math.round(Number(l.other_t) * 1000) : null;
     const spec = LINK_TYPES[l.type] || { typeW: 0.5 };
     const imp = importance({ strength: Number(l.strength) || 0, typeW: spec.typeW, wA: colourW(myT), wB: colourW(otherT), yA: myY, yB: Number(l.other_yield) || 0, c });
-    const other = { id: otherId, name: l.other_name || otherId, t1000: otherT, seen: otherT != null };
+    const other = { id: otherId, name: l.other_name || otherId, t1000: otherT, seen: otherT != null, ...(l.other_kind ? { kind: l.other_kind } : {}) };
     if (l.type === 'versus') {
       let you_took = null;
       if (c > 0 && l.last_truth_id) {
@@ -366,7 +473,7 @@ export function shapeLinks(rows, topic, { now = Date.now(), score = null, hlDays
   return { versus: kept.filter(x => x.group === 'versus').map(x => x.item), other: kept.filter(x => x.group === 'other').map(x => x.item), more: Math.max(0, items.length - kept.length) };
 }
 
-export function shapeLessons(rows, topicId, now) {
+export function shapeLessons(rows, topicId, now, after = []) {
   const items = [];
   let open_request = null, in_progress = null, last = null;
   for (const l of rows) {
@@ -385,16 +492,21 @@ export function shapeLessons(rows, topicId, now) {
         outcome: l.outcome || null, outcome_words: LESSON_OUTCOME_WORDS[l.outcome] || null,
         card: l.card_action === 'added' || l.card_action === 'edited_existing' || l.card_id != null || l.card_note_id != null,
         pair: l.pair_topic_id ? (l.topic_id === topicId ? l.pair_topic_id : l.topic_id) : null,
-        mo_rating: Number.isInteger(Number(l.mo_rating)) && l.mo_rating != null ? Number(l.mo_rating) : null, what_clicked: cut(l.what_clicked, 200) || null });
+        mo_rating: Number.isInteger(Number(l.mo_rating)) && l.mo_rating != null ? Number(l.mo_rating) : null, what_clicked: cut(l.what_clicked, 200) || null,
+        ...(l.topic_id === topicId && effectOf(l, after) ? { effect: effectOf(l, after) } : {}) });
     }
   }
   return { items, open_request, in_progress, last };
 }
 
-const MISCONCEPTION_KEYS = ['id', 'belief', 'status', 'ref', 'first_seen', 'last_seen'];
+const MISCONCEPTION_KEYS = ['id', 'belief', 'status', 'ref', 'first_seen', 'last_seen', 'closed_at', 'closed_by'];
 export function shapeMisconception(m) {
   const out = {};
-  for (const k of MISCONCEPTION_KEYS) if (m[k] !== undefined) out[k] = k === 'belief' ? cut(m[k], 200) : m[k];
+  for (const k of MISCONCEPTION_KEYS) if (m[k] !== undefined && (m[k] !== null || !['closed_at', 'closed_by'].includes(k))) out[k] = k === 'belief' ? cut(m[k], 200) : m[k];
+  // Which part it is about, from its words (wave 3), and whether a lesson found it.
+  const facet = facetOfQuestion(m.belief);
+  if (facet) out.facet = facet;
+  if (m.first_lesson_id || m.source === 'lesson') out.from_lesson = true;
   if (String(m.note || '').startsWith('Re-check')) out.recheck = cut(m.note, 160);
   return out;
 }
@@ -421,13 +533,23 @@ export function shapeRead(t, mehlmanRows, fetches, audience) {
 export function scrubLeaks(items, index) {
   for (const it of items) {
     // Every row, hub or not: text that reads like question text never reaches the panel or Claude.
-    for (const [k, safe] of [['rule', questionSafe], ['look_alike', questionSafe], ['my_reasoning', stemSafe]]) if (it[k] && !safe(it[k])) it[k] = null;
-    if (index && index.size) for (const k of ['rule', 'my_reasoning', 'look_alike']) if (it[k] && leaks(index, it[k])) it[k] = null;
+    for (const [k, safe] of [['rule', questionSafe], ['look_alike', questionSafe], ['my_reasoning', stemSafe], ['cause_quote', stemSafe], ['cause_words', questionSafe], ['his_words', stemSafe]]) {
+      if (it[k] && !safe(it[k])) it[k] = null;
+    }
+    if (index && index.size) for (const k of ['rule', 'my_reasoning', 'look_alike', 'cause_quote', 'cause_words', 'his_words']) if (it[k] && leaks(index, it[k])) it[k] = null;
+    if (!it.his_words && it.his_words_at != null) it.his_words_at = null;
   }
   return items;
 }
 
 // ---------------------------------------------------------------- Claude's text
+
+function clock(ms) {
+  const d = dayOf(ms);
+  let hm = '';
+  try { hm = new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/London', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(new Date(ms)); } catch { hm = ''; }
+  return `${shortDay(d) || ''} ${hm}`.trim();
+}
 
 /** A plain rendering for Claude, at most 5,000 characters. */
 export function claudeText(d) {
@@ -437,19 +559,34 @@ export function claudeText(d) {
     examRankText(u.nbme_rank ?? null, u.cms_rank ?? null) || null].filter(Boolean).join(', ') : 'not on the checklist';
   const head = [t.category && t.category.name, unitWords].filter(Boolean).join('; ');
   const lines = [`${t.name} (${head}).`];
-  if (d.weakness) lines.push(`${d.weakness.band_words}, ${d.weakness.certainty_words}${d.weakness.trend_words ? `, ${d.weakness.trend_words}` : ''}: ${d.weakness.why}`);
+  if (d.weakness) {
+    const w = d.weakness;
+    // The evidence it rests on and the trend with its basis (wave 2 C.4, C.5), in the panel's own words.
+    const ev = w.evidence ? `${w.evidence.words} (${w.evidence.basis})` : w.certainty_words;
+    lines.push(`${w.band_words}, ${ev}, trend: ${w.trend_sentence || w.trend_words}${w.next_range ? `; next question ${w.next_range.lo}-${w.next_range.hi}%` : ''}: ${w.why}`);
+  }
   const tags = d.topic && d.topic.tags;
   if (tags && (tags.oncology || tags.disciplines.length)) lines.push(`Tags: ${[...(tags.oncology ? ['Oncology'] : []), ...tags.disciplines.map(x => x.word)].join(', ')}.`);
   if (d.misses) {
     lines.push(`Misses (${d.misses.total}): ${missLine(d.misses)}.`);
+    lines.push(QUOTE_RULE);
     for (const m of d.misses.items.slice(0, 5)) {
-      lines.push(`- ${m.day} ${m.label}: ${m.result}${m.error_words ? `, ${m.error_words}` : ''}${m.confidence ? `, ${m.confidence}` : ''}${m.slip ? ' (slip)' : ''}.`
-        + (m.rule ? ` Rule: ${m.rule}` : '') + (m.my_reasoning ? ` He thought: ${m.my_reasoning}` : '') + (m.look_alike ? ` Look-alike: ${m.look_alike}.` : ''));
+      const fixed = m.corrected && m.corrected.length ? ` (you corrected: ${m.corrected.join(', ').replace('his_words', 'his words')})` : '';
+      lines.push(`- ${m.day} ${m.label}: ${m.result}${m.error_words ? `, ${m.error_words}` : ''}${m.confidence ? `, ${m.confidence_words || m.confidence}` : ''}${m.slip ? ' (slip)' : ''}.${fixed}`
+        + (m.cause_words ? ` Cause: ${m.cause_words}${m.corrected && m.corrected.includes('cause') ? ' (you corrected)' : m.cause_inferred === false ? ' (he said so)' : ' (inferred)'}.` : '')
+        + (m.rule ? ` Rule: ${m.rule}` : '')
+        + (m.his_words ? ` His words${m.his_words_at ? ` at ${clock(m.his_words_at)}` : ` on ${m.label}`}: "${m.his_words}"` : '')
+        + (m.my_reasoning ? ` ${m.reasoning_source === 'mo' && !m.his_words ? 'His note via Claude' : "Claude's summary (not his words)"}: ${m.my_reasoning}` : '')
+        // Only a confusion is a mix-up; any other look-alike is a teaching contrast, so it is never called one.
+        + (m.look_alike && m.cause !== 'confusion' ? ` Contrast (not a mix-up): ${m.look_alike}.` : ''));
     }
   }
   if (d.gaps && d.gaps.total) {
     lines.push(`Gaps (${d.gaps.total}):`);
-    for (const g of d.gaps.items.slice(0, 3)) lines.push(`- ${g.day} ${g.origin}: ${g.text || g.gap || 'a card did not hold'}`);
+    for (const g of d.gaps.items.slice(0, 3)) {
+      const words = g.text ? (g.quoted ? `"${g.text}"${g.at ? ` (${clock(g.at)})` : ''}` : `summary: ${g.text}`) : 'a card did not hold';
+      lines.push(`- ${g.day} ${g.origin === 'stated' ? 'named by him' : g.source_words || g.origin}: ${words}${g.corrected && g.corrected.length ? ' (you corrected)' : ''}`);
+    }
   }
   if (d.cards && d.cards.count) lines.push(`Cards (${d.cards.count}${d.cards.capped ? '+' : ''}): ${d.cards.items.slice(0, 4).map(c => `${c.card_id} "${c.preview}"`).join('; ')}`);
   if (d.links && d.links.versus.length) lines.push(`Look-alikes: ${d.links.versus.slice(0, 5).map(v => `${v.other.name}${v.confused ? ' (mixed up)' : ''}${v.a_vs_b ? `: ${v.a_vs_b}` : ''}`).join('; ')}`);
@@ -459,8 +596,17 @@ export function claudeText(d) {
     else if (m.match === 'weak') lines.push('Mehlman: nothing named on this.');
     if (d.read.amboss.url) lines.push(`AMBOSS article to send Mo to: ${t.name}, ${d.read.amboss.url}`);
   }
-  if (d.lessons && d.lessons.items.length) lines.push(`Lessons: ${d.lessons.items.slice(0, 3).map(l => `${l.day} ${l.kind} ${l.outcome_words || ''}`.trim()).join('; ')}.`);
-  if (d.lessons && d.lessons.misconceptions && d.lessons.misconceptions.length) lines.push(`Open misconceptions: ${d.lessons.misconceptions.map(m => m.belief).join('; ')}`);
+  if (d.lessons && d.lessons.items.length) lines.push(`Lessons: ${d.lessons.items.slice(0, 3).map(l => `${l.day} ${l.kind} ${l.outcome_words || ''}${l.effect && l.effect.line ? ` (${l.effect.line})` : ''}`.trim()).join('; ')}.`);
+  const openBeliefs = d.lessons && d.lessons.misconceptions ? d.lessons.misconceptions.filter(m => m.status !== 'closed') : [];
+  if (openBeliefs.length) lines.push(`Open misconceptions: ${openBeliefs.map(m => m.belief).join('; ')}`);
+  const parts = facetsText(d.facets);
+  if (parts) lines.push(parts);
+  const rated = ratingsText(d.ratings);
+  if (rated) lines.push(rated);
+  if (d.viva) {
+    const v = d.viva, off = v.points.filter(p => p.status === 'wrong').concat(v.points.filter(p => p.status === 'missing'));
+    lines.push(`Last viva (${v.day}): said ${v.said} of ${v.of} key points${off.length ? `; ${off.slice(0, 5).map(p => `${p.status === 'wrong' ? 'wrong' : 'missed'}: ${p.text}${p.quote ? ` (he said "${p.quote}")` : ''}`).join('; ')}` : ''}.`);
+  }
   if (d.habits && d.habits.here.length) lines.push(`His traps here: ${d.habits.here.map(h => `${h.label} (${h.n}${h.refs.length ? `, ${h.refs.join(', ')}` : ''})`).join('; ')}.`);
   const text = lines.join('\n');
   return text.length > TEXT.claude_text ? text.slice(0, TEXT.claude_text - 1) + '…' : text;
@@ -470,6 +616,7 @@ export function claudeText(d) {
 
 // Lists cut down in this order until the reply fits; the header, weakness and Teach me are never cut.
 const TRIMS = [
+  d => d.evidence && d.evidence.items.length > 15 && (d.evidence.more += d.evidence.items.length - 15, d.evidence.items = d.evidence.items.slice(0, 15)),
   d => d.misses && d.misses.items.length > 10 && (d.misses.items = d.misses.items.slice(0, 10)),
   d => d.cards && d.cards.items.length > 10 && (d.cards.items = d.cards.items.slice(0, 10), d.cards.capped = true),
   d => d.links && d.links.other.length > 6 && (d.links.more += d.links.other.length - 6, d.links.other = d.links.other.slice(0, 6)),
@@ -481,6 +628,7 @@ const TRIMS = [
   d => d.cards && d.cards.items.length > 4 && (d.cards.items = d.cards.items.slice(0, 4), d.cards.capped = true),
   d => d.misses && d.misses.items.length > 3 && (d.misses.items = d.misses.items.slice(0, 3)),
   d => typeof d.text === 'string' && d.text.length > 2000 && (d.text = d.text.slice(0, 1999) + '…'),
+  d => d.viva && d.viva.points.length > 6 && (d.viva.points = d.viva.points.filter(p => p.status !== 'said').slice(0, 6)),
 ];
 export function fitSize(d, max) {
   for (const trim of TRIMS) {
@@ -497,14 +645,24 @@ export function shapeDetail(r, { audience, sections, now, anki = true, leakIndex
   const t = r.topic[0];
   const topic = shapeTopic(t, r.aliases);
   topic.unit_line = unitLine(topic.unit);
-  const score = r.score[0] || null;
+  // The colour as of now (live.js): the stored row faded from its own state; its parts fade with it.
+  const score = r.score[0] ? withLive(r.score[0], now) : null;
   const d = { seq: (r.seq[0] || {}).seq || 0, topic, weakness: shapeWeakness(score, now) };
-  const lessons = sections.has('lessons') ? shapeLessons(r.lessons, t.id, now) : null;
+  const level = score && score !== r.score[0] && score.weakness_raw != null ? 1 - Number(score.weakness_raw) : null;
+  if (r.facets) r = { ...r, facets: liveFacetRows(r.facets, level) };
+  if (r.links && r.linkLive) {
+    const lm = liveMap(r.linkLive, now);
+    r = { ...r, links: r.links.map(l => { const o = lm.get(l.from_id === t.id ? l.to_id : l.from_id); return o && o.t != null ? { ...l, other_t: o.t } : l; }) };
+  }
+  // Diagnose and Manage (wave 3): null until both parts are worked out; shown is false when both rest on thin evidence.
+  const facets = r.facets ? shapeFacets(r.facets) : null;
+  if (facets) d.facets = facets;
+  const lessons = sections.has('lessons') ? shapeLessons(r.lessons, t.id, now, r.lesson_after || []) : null;
   d.teach = { open_request: lessons ? lessons.open_request : null, in_progress: lessons ? lessons.in_progress : null, last: lessons ? lessons.last : null };
   if (audience === 'page') d.teach.prompt = `Teach me ${t.name} (map: ${t.id})`;
   if (sections.has('misses')) {
     const sum = missSummary(r.missCounts);
-    d.misses = { ...sum, line: missLine(sum), items: scrubLeaks(r.misses.map(m => shapeMiss(m, audience)), leakIndex) };
+    d.misses = { ...sum, line: missLine(sum), items: scrubLeaks(r.misses.map(m => shapeMiss(m, audience, now)), leakIndex) };
   }
   if (sections.has('gaps')) d.gaps = { total: r.gaps.length ? Number(r.gaps[0].total) || r.gaps.length : 0, items: r.gaps.map(g => shapeGap(g, audience)) };
   if (sections.has('cards')) {
@@ -514,13 +672,26 @@ export function shapeDetail(r, { audience, sections, now, anki = true, leakIndex
     if (audience === 'claude') d.cards.card_ids = rows.map(c => Number(c.card_id));
   }
   if (r.photos) d.photos = [...shapePhotos(r.photos), ...shapePictures(r.pictures)];
+  if (r.ratings) d.ratings = shapeRatings(r.ratings, londonDay(now));
+  // "Why this colour" (wave 2 C.6, C.7): the scored rows newest first with their effect, and where sources disagree.
+  if (r.evidence && score && Number(score.seen)) {
+    const m0 = Number.isFinite(Number(score.prior_mastery)) ? Number(score.prior_mastery) : 0.6;
+    const model = modelFromStored(((r.fsrs || [])[0] || {}).cursor ?? null);
+    try { d.evidence = timeline(r.evidence, { m0, now, model }); } catch (e) { console.error('evidence timeline failed', e && e.message); d.evidence = null; }
+    // The header's part switch (Overall / Diagnose / Manage): each part's stored band with what it rests on, counted from
+    // the same tagged rows as the timeline, so "Why Diagnose is shaky" lists exactly what the Diagnose score counted.
+    d.parts = partsView(r.facets || [], d.evidence && d.evidence.parts);
+    if (d.evidence) delete d.evidence.parts;
+  }
   if (sections.has('links')) d.links = shapeLinks(r.links, { id: t.id, name: t.name, yield: t.yield }, { now, score });
   if (sections.has('read')) d.read = shapeRead(t, r.mehlman, r.fetches, audience);
   if (lessons) {
     d.lessons = { items: lessons.items, memory: r.memory.map(m => ({ id: m.id, tactic: m.tactic, note: cut(m.note, 300), pinned: m.status === 'pinned' })),
       misconceptions: (r.misconceptions || []).map(shapeMisconception) };
+    if (r.viva && r.viva[0]) d.viva = shapeViva(r.viva[0]);
   }
-  const refreshing = anki ? staleKinds(r.fetches, now).filter(k => (k === 'cards' ? sections.has('cards') : sections.has('read'))) : [];
+  // A root-cause topic (a foundation concept) has no cards to refresh (card-roots.js): never "refreshing" them.
+  const refreshing = anki ? staleKinds(r.fetches, now).filter(k => (k === 'cards' ? sections.has('cards') && !isRootCause(t) : sections.has('read'))) : [];
   const status = k => { const f = r.fetches.find(x => x.kind === k); return !anki ? 'off' : !f ? 'never' : f.status; };
   d.meta = { refreshing, updated_at: Math.max(Number(t.updated_at) || 0, Number(score && score.computed_at) || 0) || null, last: lastChangeOf(r.last),
     sources_status: { cards: status('cards'), mehlman: status('mehlman') } };
@@ -571,6 +742,12 @@ export async function topicDetail(env, user, topicId, opts = {}) {
   }
   if (anki && !opts.prefetch && o.audience === 'page' && r.pictures && !r.fetches.some(f => f.kind === 'pictures')) waitFor(opts.ctx, attachOnOpen(env, user, id));
   if (notReached) for (const k of d.meta.refreshing) d.meta.sources_status[k] = 'not reached';
+  // Foundations (concepts.js): "at risk because <concept> is weak" on a clinical topic (a flag, never its colour), or what
+  // a concept topic underlies. One read; the field is left out when the topic has no concept links.
+  const found = await foundationsFor(env, user, t.id).catch(e => { if (!noTable(e)) console.error('foundations read failed', e && e.message); return null; });
+  if (found) { d.foundations = found; if (typeof d.text === 'string' && found.line) d.text += `\nFoundations: ${found.line}.`; }
+  const cl = clusterOfRow((r.cluster || [])[0], t.id);
+  if (cl) { d.cluster = cl; if (typeof d.text === 'string') d.text += `\nCluster: ${cl.line}.`; }
   return fitSize(d, SIZE[o.audience]);
 }
 

@@ -163,7 +163,8 @@ export async function topicLinkRoute(request, env, ctx, params, url, user) {
   const type = url.searchParams.get('type') || 'versus';
   const a = url.searchParams.get('a') || '', b = url.searchParams.get('b') || '';
   if (!LINK_TYPES.includes(type) || !a || !b) throw new HttpError(400, 'Which link? Give type, a and b.');
-  const link = await env.DB.prepare(`SELECT * FROM links WHERE user_id = ?1 AND type = ?2 AND status = 'active'
+  // a suggested link (the concept back-fill's, shown on the map) has its note too, not only an active one
+  const link = await env.DB.prepare(`SELECT * FROM links WHERE user_id = ?1 AND type = ?2 AND status IN ('active', 'proposed')
       AND ((from_id = ?3 AND to_id = ?4) OR (from_id = ?4 AND to_id = ?3)) ORDER BY strength DESC LIMIT 1`).bind(user, type, a, b).first();
   if (!link) throw new HttpError(404, 'That link is no longer there.');
   const sup = await env.DB.prepare(`SELECT ls.src, ls.role, ls.truth_id, ls.miss_id, ls.gap_id, ls.lesson_id, ls.card_id, ls.at,

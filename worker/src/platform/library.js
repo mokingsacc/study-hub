@@ -1,5 +1,6 @@
 import { HttpError, json, readJson, safeParse } from '../util.js';
-import { requireModule, modulesFor } from './modules.js';
+import { requireModule, modulesFor, LEARNER } from './modules.js';
+import { writeBatch, summaryOf } from '../map/events.js';
 import { meterFixed } from './ai.js';
 import { bump, lockedFor } from './auth.js';
 import * as lib from '../library/routes.js';
@@ -57,7 +58,9 @@ async function listRoute(request, env, ctx, params, url, user) {
     env.DB.prepare("SELECT doc_id, COUNT(*) AS n FROM library_pages WHERE user_id = ?1 AND ocr_state = 'pending' GROUP BY doc_id").bind(user).all(),
   ]);
   const pending = new Map((ocr.results || []).map(r => [r.doc_id, r.n]));
-  return json({ ...body, docs: (body.docs || []).map(d => ({ ...d, ocr_pending: pending.get(d.id) || 0 })),
+  const folders = new Map(((await env.DB.prepare('SELECT id, folder FROM library_docs WHERE user_id = ? AND folder IS NOT NULL').bind(user).all()).results || []).map(r => [r.id, r.folder]));
+  return json({ ...body, docs: (body.docs || []).map(d => ({ ...d, ocr_pending: pending.get(d.id) || 0, folder: folders.get(d.id) || null })),
+    folders: [...new Set(folders.values())].sort((a, b) => a.localeCompare(b)),
     limits: { ...(body.limits || {}), max_file_bytes: MAX_FILE },
     quota: { docs: u.docs, bytes: u.bytes, max_docs: MAX_DOCS, max_bytes: MAX_TOTAL } });
 }
@@ -150,7 +153,37 @@ async function searchRoute(request, env, ctx, params, url, user) {
   return lib.searchRoute(request, env, ctx, params, url, user);
 }
 
+// ------------------------------------------------------------------ folders (0108)
+// Their own folders: a name on each document (none is "Not in a folder"). Moving and renaming are one undoable batch,
+// from the Library page or their Claude (library_folders).
+const FOLDER_MAX = 60;
+const folderName = v => { const t = String(v ?? '').replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, FOLDER_MAX); return t || null; };
+export async function fileDocs(env, user, b = {}, { actor = LEARNER, surface = 'web' } = {}) {
+  let rows, target;
+  if (b.rename) {
+    const from = folderName(b.rename.from);
+    target = folderName(b.rename.to);
+    if (!from || !target) throw new HttpError(400, 'Say the folder and its new name.');
+    rows = (await env.DB.prepare('SELECT id, title, folder FROM library_docs WHERE user_id = ? AND folder = ?').bind(user, from).all()).results || [];
+    if (!rows.length) throw new HttpError(404, `There is no folder called ${from}.`);
+  } else {
+    const ids = [...new Set((Array.isArray(b.ids) ? b.ids : []).map(x => String(x || '').slice(0, 80)).filter(Boolean))];
+    if (!ids.length || ids.length > 200) throw new HttpError(400, 'Say which documents to move (up to 200).');
+    target = folderName(b.folder);
+    rows = (await env.DB.prepare('SELECT id, title, folder FROM library_docs WHERE user_id = ?1 AND id IN (SELECT value FROM json_each(?2))').bind(user, JSON.stringify(ids)).all()).results || [];
+    if (rows.length !== ids.length) throw new HttpError(404, 'Some of those are not in your library. library_read with no doc_id lists them.');
+  }
+  const moving = rows.filter(r => (r.folder || null) !== target);
+  if (!moving.length) return { moved: 0, folder: target };
+  // One row and one event per document (undo puts each row back from its own event).
+  const w = await writeBatch(env, user, { actor, surface, via: 'platform:folders', undoable: true,
+    rows: moving.map(r => ({ table: 'library_docs', op: 'update', key: { id: r.id }, before: { folder: r.folder || null }, after: { folder: target } })),
+    events: moving.map(r => ({ kind: 'library.filed', target_type: 'library_docs', target_id: r.id, summary: summaryOf(`${r.title} moved to ${target || 'no folder'}`) })) });
+  return { moved: moving.length, folder: target, batch_id: w.batch_id };
+}
+
 export const ROUTES = [
+  ['POST', '/api/p/library/folders', gate(async (request, env, ctx, params, url, user) => json(await fileDocs(env, user, await readJson(request, 20_000))))],
   ['GET', '/api/p/library', gate(listRoute)],
   ['GET', '/api/p/library/status', gate(lib.statusRoute)],
   ['GET', '/api/p/library/search', gate(searchRoute)],
@@ -214,7 +247,8 @@ export async function readTool(env, user, args) {
   const id = String(args.doc_id || '').trim();
   if (!id) {
     const docs = await store.listDocs(env, user);
-    return { docs: docs.map(d => ({ doc_id: d.id, title: d.title, pages: d.page_count, status: d.status, ...(d.collection ? { kind: d.collection } : {}) })), note: 'Give doc_id (and page) to read one. kind exam-paper or mark-scheme: exam_make turns an exam paper into an exam they sit on screen.' };
+    const folders = new Map(((await env.DB.prepare('SELECT id, folder FROM library_docs WHERE user_id = ? AND folder IS NOT NULL').bind(user).all()).results || []).map(r => [r.id, r.folder]));
+    return { docs: docs.map(d => ({ doc_id: d.id, title: d.title, pages: d.page_count, status: d.status, ...(d.collection ? { kind: d.collection } : {}), ...(folders.get(d.id) ? { folder: folders.get(d.id) } : {}) })), note: 'Give doc_id (and page) to read one. kind exam-paper or mark-scheme: exam_make turns an exam paper into an exam they sit on screen.' };
   }
   const d = await store.getDoc(env, user, id);
   if (!d) throw new HttpError(404, 'That document is not in this library.');
@@ -281,13 +315,38 @@ export const TOOLS = [
         doc_id: { type: 'string', description: 'The document (from library_search or the list).' },
         page: { type: 'integer', minimum: 1, description: 'The page to start at (default 1).' },
         offset: { type: 'integer', minimum: 0, description: 'Characters to skip on the first page (from next, for a very long page).' },
+        ink: { type: 'boolean', description: 'Pictures of the pages they wrote on (from page).' },
       },
       additionalProperties: false,
     },
     annotations: { readOnlyHint: true },
-    run: (env, user, args) => readTool(env, user, args || {}),
+    run: (env, user, args) => (args && args.ink ? inkTool(env, user, args) : readTool(env, user, args || {})),
+  },
+  {
+    name: 'library_folders',
+    module: 'library',
+    description: 'Files their library documents into folders: move {ids, folder} (folder null: no folder), or rename {from, to}. library_read without doc_id lists documents with their folders. One undoable change.',
+    inputSchema: { type: 'object', additionalProperties: false, properties: {
+      ids: { type: 'array', items: { type: 'string' } }, folder: { type: ['string', 'null'] },
+      rename: { type: 'object', properties: { from: { type: 'string' }, to: { type: 'string' } } } } },
+    annotations: { readOnlyHint: false, destructiveHint: false },
+    run: (env, user, args) => fileDocs(env, user, args || {}, { actor: 'claude', surface: 'chat' }),
   },
 ];
+
+const b64 = bytes => { let x = ''; for (let i = 0; i < bytes.length; i += 0x8000) x += String.fromCharCode(...bytes.subarray(i, i + 0x8000)); return btoa(x); };
+/** library_read with ink: the pages they wrote on (a class sheet, notes) as pictures, for their Claude to check. */
+async function inkTool(env, user, args) {
+  const d = await store.getDoc(env, user, String(args.doc_id || ''));
+  if (!d) throw new HttpError(404, 'That document is not in this library.');
+  const { docInkPictures } = await import('./ink.js');
+  const r = await docInkPictures(env, user, d, num(args.page, 1, 1, store.MAX_PAGES + 10));
+  const head = { doc_id: d.id, title: d.title, written_pages: r.written,
+    note: r.written.length ? 'Their writing on the page. Check it with them; marks or scores go on their map with log_results.' : 'They have not written on this document yet.' };
+  const content = [{ type: 'text', text: JSON.stringify(head) }];
+  for (const p of r.pictures) content.push({ type: 'text', text: `Page ${p.page}` }, { type: 'image', data: b64(p.data), mimeType: 'image/jpeg' });
+  return { __mcp: { content, structuredContent: head } };
+}
 
 // ------------------------------------------------------------------ self-check
 

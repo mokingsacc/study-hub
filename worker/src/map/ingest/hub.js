@@ -2,8 +2,9 @@ import { londonDay, now as nowMs } from '../../util.js';
 import { buildLeakIndex } from '../../checks.js';
 import { confFor } from '../../../../public/js/conf-words.js';
 import {
-  fromAnalysis, fromUworld, questionEvidence, missUpsert, rowHash, MISS_INGEST_COLS, STICKY_METHODS, releasable, userKey, rawKey,
-  hubKey, uwKey, uwbKey, labelQueueKey, normLabel, dayDiff, sameEvidence, EVIDENCE_COLS, wordsChanged, GAP_SOURCE_LABEL, CODE_PLACED, nextRetestDay, confidenceWinner,
+  fromAnalysis, fromUworld, questionEvidence, missUpsert, rowHash, MISS_INGEST_COLS, STICKY_METHODS, releasable, userKey, rawKey, keepMoFixes, moFixed,
+  hubKey, uwKey, uwbKey, labelQueueKey, normLabel, dayDiff, sameEvidence, EVIDENCE_COLS, wordsChanged, GAP_SOURCE_LABEL, CODE_PLACED, nextRetestDay, confidenceWinner, uworldQuestionAt, eventAt,
+  MISS_CAUSE_COLS, fnv1a, withCause, sameQuestion,
 } from './map-fields.js';
 import { queueStatements } from '../queue.js';
 import { gapSafe } from '../guard.js';
@@ -186,6 +187,8 @@ export async function placeTopics(env, user, reqs) {
     let data = null;
     try {
       data = await R.fetchAliases(env, user, [...new Set(all.flatMap(p => p.keys))], [...new Set(all.flatMap(p => p.cutKeys))]);
+      // A root-cause topic (a foundation concept) is never a row's home: it takes only concept rows (resolve.js withoutRoots).
+      if (typeof R.withoutRoots === 'function') data = R.withoutRoots(data);
     } catch (e) {
       if (!noTable(e)) console.error('alias read failed', e && e.message);
     }
@@ -236,13 +239,15 @@ const RESULT_WORD = { wrong: 'wrong', flawed: 'right for a shaky reason' };
 /** A miss event's summary, from its label and topic name only (never question or gap text). */
 export const missSummary = (m, name) => cap(`${m.label}: ${RESULT_WORD[m.result] || m.result}${name ? ` on ${name}` : ', not on the map yet'}`);
 
-const HASH_COLS = MISS_INGEST_COLS.filter(c => !['src_hash', 'updated_at'].includes(c));
+// The cause columns (0053) are hashed only when a judge named a cause, so the rows stored before them keep their hash.
+// cause_disputed (0067) likewise only when set, so a miss the judges agreed on keeps the hash it had.
+const HASH_COLS = MISS_INGEST_COLS.filter(c => !['src_hash', 'updated_at', 'cause_disputed', ...MISS_CAUSE_COLS].includes(c));
 const parseList = s => { try { const v = typeof s === 'string' ? JSON.parse(s) : s; return Array.isArray(v) ? v : []; } catch { return []; } };
 const MISS_DEFAULTS = { slow: 0, held: 0, match_status: 'open', look_alike_names_json: '[]', retests_json: '[]', anki_note_ids_json: '[]' };
 const TOPIC_FIELDS = ['topic_id', 'category_id', 'queue_id', 'match_status', 'match_method', 'label_norm'];
 export function finishMiss(user, key, base, existing, place, look, t) {
   const sticky = existing && STICKY_METHODS.includes(existing.match_method);
-  const row = { ...base, id: userKey(user, key), user_id: user };
+  const row = keepMoFixes({ ...base, id: userKey(user, key), user_id: user }, existing);
   const keep = sticky || (existing && !place.unplace && (place.topic_id ? place.topic_id === existing.topic_id : !!(existing.topic_id || existing.queue_id || !place.queue)));
   if (keep) {
     for (const c of TOPIC_FIELDS) row[c] = existing[c];
@@ -262,6 +267,8 @@ export function finishMiss(user, key, base, existing, place, look, t) {
   const hashed = { ...row, next_retest_day: nextRetestDay(parseList(row.retests_json)) };
   delete row.next_retest_day;
   row.src_hash = rowHash({ ...MISS_DEFAULTS, ...Object.fromEntries(Object.entries(hashed).filter(([, v]) => v != null)) }, HASH_COLS);
+  if (row.cause != null) row.src_hash = fnv1a(`${row.src_hash}\u0001${rowHash(row, MISS_CAUSE_COLS)}`);
+  if (Number(row.cause_disputed) === 1) row.src_hash = fnv1a(`${row.src_hash}\u0001disputed`);
   row.changed = !existing || existing.src_hash !== row.src_hash || existing.deleted_at != null;
   row.updated_at = t;
   // Insert-only (the upsert never updates them), but SQLite checks NOT NULL before it sees the conflict.
@@ -297,9 +304,12 @@ export async function lookAlikeParts(env, user, misses, t) {
   const max = Math.max(2, Math.floor((Number(env && env.D1_QUERY_BUDGET) || 45) / 6));
   if (todo.length > max) console.log(JSON.stringify({ lookalikes_deferred: todo.length - max }));
   const slice = todo.slice(0, max);
-  // weakness's confused_with rows in the miss's slots 1 and 2.
-  const cwRows = (m, cands) => {
+  // weakness's confused_with rows in the miss's slots 1 and 2: only for a look-alike the miss's cause makes a real
+  // confusion (cw > 0, links.js lookAlikeRole); a teaching contrast is never penalised (wave 2), and a row an
+  // earlier reading wrote goes (the remove below).
+  const cwRows = (m, all) => {
     const obs = rawKey(user, m.id);
+    const cands = all.filter(c => c.cw > 0);
     cands.forEach((c, i) => (m.held ? out.held : out.upsert).push({
       obs_key: obs, slot: i + 1, kind: 'confused_with', topic_id: c.topic_id, at: m.at, day: m.day, source: m.source, source_ref: m.source_ref || null,
       miss_id: m.id, sitting_id: m.sitting_id || null, held: m.held ? 1 : 0, result: m.result, outcome: m.outcome || null, confidence: m.confidence || null,
@@ -408,6 +418,9 @@ export async function writeQuestions(env, user, items, look, opts, t) {
     const queueId = missRow ? missRow.queue_id : it.place.queue ? userKey(user, it.place.queue.id) : null;
     const ev = questionEvidence({ obs_key: it.key, answer: it.answer, at: it.at, day: it.day, source: opts.source, source_ref: it.source_ref,
       miss_id: missRow ? missRow.id : null, sitting_id: opts.sitting_id || null, held: isHeld });
+    // The miss counts on its topic by its judged cause (wave 2), the stored one when this pass brings none.
+    if (missRow) withCause(ev, missRow.cause != null ? missRow : it.existing);
+    if (it.existing && moFixed(it.existing).includes('confidence') && it.existing.confidence) ev.confidence = it.existing.confidence;
     if (it.evidence && it.existing && it.existing.anki_mistake_id != null && it.existing.block_id == null) {
       const assumed = it.existing.confidence_source === 'assumed' && ev.confidence != null;
       for (const k of ['confidence', 'error_type', 'outcome']) if (it.evidence[k] != null && !(k === 'confidence' && assumed)) ev[k] = it.evidence[k];
@@ -448,8 +461,10 @@ export async function ingestAnalysis(env, user, blockId, qIndex) {
   const [a, b, q, m, e, tr] = await env.DB.batch([
     env.DB.prepare('SELECT * FROM analyses WHERE block_id = ? AND q_index = ?').bind(blockId, qIndex),
     env.DB.prepare(`SELECT b.id, b.sitting_id, b.idx, b.q_from, b.started_at, b.ended_at, json_extract(b.state_json, ?) AS conf, json_extract(b.state_json, ?) AS secs,
+      (SELECT max(json_extract(e.value, '$.t')) FROM json_each(b.state_json, '$.events') e
+        WHERE json_extract(e.value, '$.type') = 'choose' AND json_extract(e.value, '$.q') = ?) AS chose_at,
       s.name, s.status, s.exam_id, s.exam_type FROM blocks b JOIN sittings s ON s.id = b.sitting_id WHERE b.id = ?`)
-      .bind(`$.conf."${qIndex}"`, `$.time_on_q."${qIndex}"`, blockId),
+      .bind(`$.conf."${qIndex}"`, `$.time_on_q."${qIndex}"`, qIndex, blockId),
     env.DB.prepare(`SELECT json_extract(e.questions_json, ?) AS q FROM blocks b JOIN sittings s ON s.id = b.sitting_id JOIN exams e ON e.id = s.exam_id
       WHERE b.id = ?`).bind(`$[${Math.trunc(qIndex)}]`, blockId),
     env.DB.prepare('SELECT * FROM misses WHERE user_id = ? AND id = ?').bind(user, userKey(user, key)),
@@ -465,7 +480,8 @@ export async function ingestAnalysis(env, user, blockId, qIndex) {
   }
   const question = JSON.parse(qRow.q);
   const sitting = { id: block.sitting_id, name: block.name, status: block.status, exam_type: block.exam_type };
-  const at = (block.started_at || nowMs()) + (qIndex - block.q_from) * 1000;
+  const start = block.started_at || nowMs();
+  const at = eventAt(block.chose_at, start + (qIndex - block.q_from) * 1000, { lo: start, hi: block.ended_at || start + 12 * 3600_000 });
   // Confidence as analyze.js and Smart review read it (v16): a tap, else sure, lean or guess said aloud (B3-4).
   const said = confFor(block.conf, { segments_json: (tr.results[0] || {}).segments_json || '[]' });
   const r = fromAnalysis(analysis, { sitting, block, num: question.num ?? qIndex + 1, conf: said.conf, confFrom: said.from, secs: Number(block.secs),
@@ -502,7 +518,7 @@ export async function ingestUworldQuestions(env, user, blockId, questions) {
   if (!list.length) return { skipped: true };
   const qids = [...new Set(list.map(q => q.uworld_id).filter(Boolean))];
   const [b, mq] = await env.DB.batch([
-    env.DB.prepare('SELECT id, day FROM uworld_blocks WHERE id = ?').bind(blockId),
+    env.DB.prepare('SELECT id, day, mode FROM uworld_blocks WHERE id = ?').bind(blockId),
     env.DB.prepare(`SELECT * FROM misses WHERE user_id = ? AND (uw_qid IN (SELECT value FROM json_each(?)) OR uworld_block_id = ?)`)
       .bind(user, JSON.stringify(qids), blockId),
   ]);
@@ -515,12 +531,15 @@ export async function ingestUworldQuestions(env, user, blockId, questions) {
     if (!r) continue;
     let key = q.uworld_id ? uwKey(q.uworld_id, block.day) : uwbKey(block.id, q.q);
     let existing = misses.find(x => x.id === userKey(user, key)) || null;
+    // A duplicate the clean-up merged (map/hygiene.js) sends this question to the miss it was merged into.
+    if (existing && existing.merged_into) existing = misses.find(x => x.id === existing.merged_into && x.deleted_at == null) || null;
     if (!existing && q.uworld_id) {
-      const near = misses.filter(x => x.uw_qid === q.uworld_id && x.day && dayDiff(x.day, block.day) <= 2)
+      const near = misses.filter(x => sameQuestion(x, { uw_qid: q.uworld_id, day: block.day, uworld_block_id: block.id }))
         .sort((x, y) => dayDiff(x.day, block.day) - dayDiff(y.day, block.day))[0];
       if (near) { existing = near; key = rawKey(user, near.id); }
     }
     if (!existing) existing = misses.find(x => x.uworld_block_id === block.id && x.uworld_q === q.q && x.deleted_at == null) || null;
+    if (!existing && misses.some(x => x.id === userKey(user, key) && x.merged_into)) continue;   // merged, and its survivor is gone: leave it
     if (existing) key = rawKey(user, existing.id);
     items.push({ key, r, existing, q });
   }
@@ -562,7 +581,7 @@ export async function ingestUworldQuestions(env, user, blockId, questions) {
     // A relabel whose new words do not place it: the row stays, and waits on their queue item too (B4-3).
     if (place && !place.topic_id && place.queue && it.existing && it.existing.topic_id) place = { ...place, pending: place.queue };
     const base = it.r.miss ? (it.existing ? mergeHubIntoAnki(it.existing, it.r.miss) : it.r.miss) : null;
-    const at = it.r.miss ? it.r.miss.at : Date.parse(`${block.day}T12:00:00Z`) + it.q.q * 1000;
+    const at = it.r.miss ? it.r.miss.at : uworldQuestionAt(block, it.q);
     return { key: it.key, base, answer: it.r.answer, existing: it.existing, place, held: 0, at, day: block.day, evidence: evRow, source_ref: `uworld:${blockId}:q${it.q.q}` };
   });
   const w = await writeQuestions(env, user, rows, look, { via: 'hook:uworld', source: 'uworld' }, t);

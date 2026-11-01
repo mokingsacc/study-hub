@@ -1,3 +1,4 @@
+import { advertise } from '../mcp/registry.js';
 import { HttpError, safeParse } from '../util.js';
 import { userForConnector } from './auth.js';
 import { safeEqual } from './crypto.js';
@@ -34,6 +35,8 @@ function checkNames(list) {
   return list;
 }
 
+export const listed = list => list.map(({ name, description, inputSchema, annotations }) => ({ name, description, inputSchema: advertise(inputSchema), ...(annotations ? { annotations } : {}) }));
+
 export function tools() {
   return checkNames([SELF_CHECK_TOOL, ...features.tools()]);
 }
@@ -47,6 +50,7 @@ async function call(env, who, toolset, name, args, ctx) {
   if (!toolset.allowed(tool)) return reply({ refused: true, reason: 'That part of the hub is switched off. It can be turned on in Settings.' }, true);
   try {
     const payload = await tool.run(env, who, args || {}, ctx);
+    if (payload && payload.__mcp) return payload.__mcp;   // a tool that answers with its own blocks (images)
     return reply(payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : { value: payload ?? null });
   } catch (e) {
     if (e instanceof HttpError && e.status < 500) return reply({ refused: true, reason: e.message }, true);
@@ -66,7 +70,7 @@ async function dispatch(env, msg, who, toolset, ctx) {
   }
   if (method === 'ping') return result(id, {});
   if (method === 'tools/list') {
-    return result(id, { tools: toolset.list.filter(t => toolset.allowed(t)).map(({ name, description, inputSchema, annotations }) => ({ name, description, inputSchema, ...(annotations ? { annotations } : {}) })) });
+    return result(id, { tools: listed(toolset.list.filter(t => toolset.allowed(t))) });
   }
   if (method === 'tools/call') {
     const args = params.arguments || {};

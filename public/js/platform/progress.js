@@ -1,7 +1,7 @@
 // Your study days (#progress, and the Today tile): a year of days as a grid of squares, darker the longer they spent
 // in the Study Hub that day (like Anki's, cleaner), and the numbers under it: daily average, days studied, longest and
 // current streak. GET /api/p/activity; the page sends a beat a minute while it is open (main.js).
-import { h, icon, pageHead, loading, errorState, plural, linkBtn } from './kit.js';
+import { h, icon, pageHead, loading, errorState, plural, linkBtn, askClaude } from './kit.js';
 import { get } from './api.js';
 
 const DAY_MS = 86_400_000;
@@ -43,7 +43,23 @@ const statsRow = s => h('div', { class: 'pg-stats' },
   h('div', null, h('b', { class: 'num' }, plural(s.current, 'day')), h('span', null, 'Current streak')));
 
 /** Today's tiles (today.js gives them empty): Paste from Claude, and the last 20 weeks with the streak. */
+function nowTile(app) {
+  const box = h('section', { class: 'tile s12 nw', hidden: true });
+  get('/api/p/next').then(({ steps }) => {
+    if (!steps.length) return;
+    box.replaceChildren(h('div', { class: 'tile-label' }, icon('bolt'), 'What to do now'),
+      h('div', { class: 'list' }, steps.map(st => {
+        const kids = [h('span', { class: 'grow' }, h('b', null, st.title), h('span', { class: 'sub' }, `${st.why} About ${st.minutes} min.`))];
+        return st.href ? h('a', { class: 'li', href: st.href }, ...kids, icon('chevron', 'chev'))
+          : h('div', { class: 'li' }, ...kids, askClaude(st.prompt, 'Ask my Claude', { app }));
+      })));
+    box.hidden = false;
+  }).catch(() => {});
+  return box;
+}
+
 export function todayTiles(el, paste, app) {
+  if (el.parentNode && !el.parentNode.querySelector('.nw')) el.parentNode.insertBefore(nowTile(app), el.parentNode.firstChild);
   paste.replaceChildren(h('button', { type: 'button', class: 'tile-btn', onclick: () => import('./chats.js').then(m => m.pasteSheet(app)) },
     h('span', { class: 't-ico' }, icon('chat')), h('span', { class: 'grow' }, h('b', { class: 't-head' }, 'Paste from Claude'), h('span', { class: 'sub foot', style: 'display:block' }, 'A chat or its summary, for next time'))));
   paste.hidden = false;

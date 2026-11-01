@@ -11,7 +11,9 @@ const LESSON_COLS = ['content_type', 'tactics_suggested_json', 'misc_ids_json', 
   'what_clicked', 'claude_view_json', 'questions_asked', 'tactics_json', 'facts_json', 'blend', 'blend_json', 'tactic_delta_json', 'stick_json',
   'teach_back_text',
   'memory_brought_json',   // the pinned notes the brief brought in (migration 0039)
-  'checkpoint_json'];   // what lesson_save's checkpoints hold beyond the probe and steps (migration 0042)
+  'checkpoint_json',   // what lesson_save's checkpoints hold beyond the probe and steps (migration 0042)
+  'cluster_id',   // the error cluster a lesson teaches (migration 0071, clusters.js)
+  'plan_id'];   // the planner decision it was started from (migration 0075, forecast/panel.js)
 const MISC_COLS = ['topic_id', 'topic_name', 'belief', 'belief_key', 'words', 'ref', 'status', 'first_seen', 'last_seen', 'seen_n', 'targeted_at',
   'closed_at', 'closed_by', 'first_lesson_id', 'lesson_ids_json', 'note'];
 const TACTIC_COLS = ['content_type', 'tactic', 'wins', 'losses', 'uses', 'clicked_n', 'last_used_at'];
@@ -42,7 +44,8 @@ export const CHANGE_KINDS = {
   'lesson.close': {
     tier: (args, plan, ctx) => (ctx.actor === 'code' ? 'free' : 'refused'), kind: 'lesson.saved', undoable: false, page_only: true,
     allowKeys: ['result', 'verdict'], codeMarks: ['lessons.outcome', 'evidence.result', 'evidence.outcome'], evidence: true,
-    writes: { lessons: { actions: 'u', cols: LESSON_COLS }, ...MISC_WRITES },
+    // teach_memory: the corrections its checkpoints kept (1 Nov 2026) are written as correction notes when it closes.
+    writes: { lessons: { actions: 'u', cols: LESSON_COLS }, ...MISC_WRITES, teach_memory: { actions: 'i', cols: ['scope', 'scope_ref', 'tactic', 'note', 'status', 'uses', 'wins', 'losses', 'evidence_json'] } },
     reason: 'Stale lessons are closed by the hub itself.', plan: (...a) => save.planLessonClose(...a),
   },
   // The minute-29 clean-up of stale lessons: code only.
@@ -94,7 +97,7 @@ export const EXPORT = {
       'final_explain_json', 'teach_back_json', 'mo_rating', 'mo_rating_why', 'what_clicked', 'claude_view_json', 'questions_asked', 'tactics_json', 'facts_json',
       'blend', 'blend_json', 'outcome', 'tactic_delta_json', 'stick_json', 'weak_spot', 'card_note_id', 'card_id', 'card_action', 'miss_ids_json', 'media_shown_json',
       'memory_used_json', 'memory_written_json', 'mo_feedback', 'method_version', 'source', 'source_ref', 'created_by', 'created_at', 'updated_at', 'teach_back_text',
-      'memory_brought_json', 'checkpoint_json'],
+      'memory_brought_json', 'checkpoint_json', 'viva_before', 'viva_after', 'viva_json', 'cluster_id', 'plan_id'],
     required: ['id', 'user_id', 'kind', 'status', 'created_by', 'created_at', 'updated_at'],
     types: { id: T, user_id: T, topic_id: T, topic_name: T, pair_topic_id: T, link_id: T, kind: ['lesson', 'pair', 'pair_test', 'patch'],
       status: ['requested', 'in_progress', 'done', 'abandoned'], abandon_reason: T, served_by: T, requested_by: T, request_from: T, surface_hint: T,
@@ -105,7 +108,7 @@ export const EXPORT = {
       outcome: ['landed', 'partial', 'not_landed'], tactic_delta_json: JA, stick_json: J,
       weak_spot: T, card_note_id: I, card_id: I, card_action: T, miss_ids_json: J, media_shown_json: J, memory_used_json: J,
       memory_written_json: J, mo_feedback: T, method_version: T, source: T, source_ref: T, created_by: T, created_at: I, updated_at: I, teach_back_text: T,
-      memory_brought_json: JA, checkpoint_json: J },
+      memory_brought_json: JA, checkpoint_json: J, viva_before: R, viva_after: R, viva_json: J, cluster_id: T, plan_id: T },
   },
   teach_memory: {
     cols: ['id', 'user_id', 'scope', 'scope_ref', 'tactic', 'note', 'status', 'uses', 'wins', 'losses', 'score', 'evidence_json', 'retired_reason', 'source',

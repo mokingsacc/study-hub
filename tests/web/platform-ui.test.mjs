@@ -129,9 +129,9 @@ test('stylesheet: Bento tokens, light and dark, 16 px inputs, safe areas, long l
 // Every file outside js/platform/ the map's pages load (the static allowlist PLATFORM_FILES in worker/src/index.js
 // must serve exactly these, besides scale.js which is already there). layout.js comes in by import() for the first
 // layout and the upright reshape, so it is listed with its own graph.
-const MAP_STATIC = ['js/map/camera.js', 'js/map/colour.js', 'js/map/data.js', 'js/map/donut.js', 'js/map/families.js', 'js/map/halos.js', 'js/map/hover.js', 'js/map/labels.js', 'js/map/layout.js',
+const MAP_STATIC = ['js/map/camera.js', 'js/map/colour.js', 'js/map/data.js', 'js/map/donut.js', 'js/map/families.js', 'js/map/foundations-ring.js', 'js/map/halos.js', 'js/map/hover.js', 'js/map/labels.js', 'js/map/layout.js',
   'js/map/links-draw.js', 'js/map/marks.js', 'js/map/motion.js', 'js/map/nodes.js', 'js/map/pick.js', 'js/map/render.js', 'js/map/scale.js', 'js/map/semantic.js', 'js/map/similarity.js',
-  'js/map/sky.js', 'js/map/sprites.js', 'js/map/tween.js', 'js/shared/link-rank.js'];
+  'js/map/sky.js', 'js/map/sprites.js', 'js/map/tween.js', 'js/shared/cause.js', 'js/shared/concept.js', 'js/shared/evidence.js', 'js/shared/link-rank.js'];
 
 test('the map screen reuses Mo\'s map modules, loads on demand, and pulls in no hub client, no d3 and no HTML sink', () => {
   const main = read(`${JS_DIR}/main.js`);

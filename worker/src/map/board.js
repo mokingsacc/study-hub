@@ -27,6 +27,7 @@ import {
   rowsOf, mapOf, unitsOf, progressOf, matchFilters, countMisses, logSentence, tallyLines, tallyView, highYieldRows, checklistRows,
   checklistTotals, checklistView, checklistSentence, chipOf, unitCode, plural,
 } from '../../../public/js/board/shape.js';
+import { bandWord } from '../../../public/js/map/scale.js';
 
 export const LIVE_STATUSES = ['proposed', 'confirmed'];
 export const LIMITS = { log: 40, log_default: 15, detail: 10, tally: 60, tally_default: 30, checklist: 60, checklist_default: 40, offset: 5000, review: 25, unit_topics: 20 };
@@ -215,6 +216,9 @@ const DAY_PROBLEM = 'since_day is a day like 2026-10-18.';
 
 // ------------------------------------------------------------------ Claude's reads
 
+// A chip's band in words ("Shaky"), as the panel and map_topic say it (wave 2 C.8).
+const bandWordOf = chip => (chip && chip.word) || bandWord((chip && chip.band) || 'unseen');
+
 function claudeLogRow(r, { topics, units, categories, detail }) {
   const t = r.topic_id ? topics.get(r.topic_id) : null;
   const u = r.unit_id ? units.get(r.unit_id) : null;
@@ -226,14 +230,15 @@ function claudeLogRow(r, { topics, units, categories, detail }) {
     category: c ? c.name : null, unit_num: u ? Number(u.num) || null : null, lane: r.lane || null, error_type: r.error_type || null,
     confidence: r.confidence || null, result: r.result, ...(r.outcome && r.outcome !== 'wrong' ? { outcome: r.outcome } : {}),
     ...(r.flaw_kind ? { flaw_kind: r.flaw_kind } : {}), time_s: r.time_s ?? null, slow: r.slow, sure_wrong: r.sure_wrong, rule: r.rule || null,
-    next_retest_day: r.next_retest_day || null, reviewed: r.reviewed, card: r.card, band: chip.band, t1000: chip.t1000,
+    // The band in the words every surface uses (wave 2 C.8: "Shaky", never the stored code "mixed").
+    miss_card_day: r.next_retest_day || null, reviewed: r.reviewed, card: r.card, band: chip.word, t1000: chip.t1000,
   };
   const d = detail && detail[r.id];
   if (d) {
     row.my_reasoning = d.my_reasoning || null;
     row.look_alikes = d.look_alikes || null;
     row.learning_point = d.learning_point || null;
-    if (d.retests && d.retests.length) row.retests = d.retests;
+    if (d.retests && d.retests.length) row.miss_cards = d.retests;
   }
   return row;
 }
@@ -256,7 +261,7 @@ export async function errorLog(env, user, args = {}, ctx = {}) {
   if (a.category && !category) return { problems: [`No system called "${String(a.category).slice(0, 40)}". Systems: ${[...d.categories.values()].map(c => c.name).join(', ')}.`] };
   const conf = a.confidence === 'unknown' || a.confidence === 'unsaid' ? 'unsaid' : ['sure', 'lean', 'guess'].includes(a.confidence) ? a.confidence : null;
   const f = { category, error_type: a.error_type || null, confidence: conf, result: ['wrong', 'flawed'].includes(a.result) ? a.result : null,
-    sure_wrong: a.sure_wrong_only === true, slow: a.slow_only === true, retest_due: a.retest_due === true,
+    sure_wrong: a.sure_wrong_only === true, slow: a.slow_only === true, retest_due: a.miss_card_due === true || a.retest_due === true,
     reviewed: typeof a.reviewed === 'boolean' ? a.reviewed : null, q: typeof a.query === 'string' ? a.query.slice(0, 80) : null };
   const kept = d.rows.filter(r => matchFilters(r, f, { today, topics: d.topics })).sort((x, y) => (y.at || 0) - (x.at || 0) || String(y.id).localeCompare(String(x.id)));
   const counts = countMisses(kept, today);
@@ -268,7 +273,7 @@ export async function errorLog(env, user, args = {}, ctx = {}) {
   const left = Math.max(0, kept.length - offset - page.length);
   return {
     seq: d.seq, since_day: since, today, total: kept.length, shown: page.length, summary: logSentence(counts, since),
-    counts: { sure_wrong: counts.sure_wrong, slow: counts.slow, retests_due: counts.retests_due, not_reviewed: counts.not_reviewed, not_on_map: counts.not_on_map, topics: counts.topics },
+    counts: { sure_wrong: counts.sure_wrong, slow: counts.slow, miss_cards_due: counts.retests_due, not_reviewed: counts.not_reviewed, not_on_map: counts.not_on_map, topics: counts.topics },
     rows: page.map(r => claudeLogRow(r, { ...d, detail })),
     ...(left ? { more: { left, call: `board_error_log with offset ${offset + page.length}` } } : {}),
   };
@@ -279,8 +284,8 @@ function claudeLine(L) {
   return {
     unit_id: L.unit_id || null, ...(L.topic_id ? { topic_id: L.topic_id } : {}), num: L.num, name: L.name, lane: L.unit_id ? L.lane : 'off',
     mehlman_rank: L.mehlman_rank, nbme_rank: L.nbme_rank ?? null, cms_rank: L.cms_rank ?? null, system: L.system, misses: L.misses, sure_wrong: L.sure_wrong, slow: L.slow, last_day: L.last_day,
-    studied: L.studied, ...(L.unit_id ? { mastered: L.mastered } : {}), band: L.chip.band, t1000: L.chip.t1000,
-    topics: L.topics.slice(0, 8).map(t => ({ topic_id: t.topic_id, name: t.name, misses: t.misses, last_day: t.last_day, band: t.band })),
+    studied: L.studied, ...(L.unit_id ? { mastered: L.mastered } : {}), band: bandWordOf(L.chip), t1000: L.chip.t1000,
+    topics: L.topics.slice(0, 8).map(t => ({ topic_id: t.topic_id, name: t.name, misses: t.misses, last_day: t.last_day, band: bandWord(t.band || 'unseen') })),
   };
 }
 
@@ -288,6 +293,15 @@ export async function tally(env, user, args = {}, ctx = {}) {
   const a = isObj(args) ? args : {};
   const kind = a.kind === 'high_yield' ? 'high_yield' : 'topics';
   if (a.since_day != null && !isDay(a.since_day)) return { problems: [DAY_PROBLEM] };
+  if (a.kind === 'forecast') {
+    const { honestyReport } = await import('./honesty.js');
+    return honestyReport(env, user);
+  }
+  // The nightly data checks (integrity.js, wave 2 D): each rule's count, examples and the counts over time.
+  if (a.kind === 'integrity') {
+    const { integrityReport } = await import('./integrity.js');
+    return integrityReport(env, user);
+  }
   if (a.kind === 'calibration') {
     let category_id = null;
     if (a.category) {
@@ -378,7 +392,7 @@ export async function checklist(env, user, args = {}, ctx = {}) {
     seq: d.seq, summary: `${checklistSentence(totals)}. A unit is done when all five steps are mastered.`, done: totals.done, of: totals.of,
     started: totals.started, by_lane: totals.by_lane, gaps_in_notes: totals.gaps, shown: page.length,
     units: page.map(r => ({ unit_id: r.unit_id, num: r.num, code: r.code, name: r.name, lane: r.lane, mehlman_rank: r.mehlman_rank, nbme_rank: r.nbme_rank ?? null, cms_rank: r.cms_rank ?? null, system: r.system,
-      steps: r.steps, done: r.done, studied: r.studied_at != null, misses: r.misses, band: r.chip.band, t1000: r.chip.t1000 })),
+      steps: r.steps, done: r.done, studied: r.studied_at != null, misses: r.misses, band: bandWordOf(r.chip), t1000: r.chip.t1000 })),
     ...(left ? { more: { left, call: `board_checklist with offset ${offset + page.length}` } } : {}),
   };
 }

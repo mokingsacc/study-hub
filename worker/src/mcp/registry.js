@@ -1,6 +1,7 @@
 // The connector's tool registry (plan §10.2): every tool in one list, in the order tools/list shows them.
 // An entry is {name, title, description, inputSchema, annotations, _meta?, legacy?, cap?, trim?, moreCall?,
-// unknownOk?, run(env, user, args, ctx)}. legacy tools (the 12 originals) build their own MCP result; every
+// unknownOk?, unlisted?, run(env, user, args, ctx)}. unlisted: callable by name, left out of tools/list (a tool another
+// one now does, kept for older chats and pastes). legacy tools (the 12 originals) build their own MCP result; every
 // other run returns a payload that reply.js turns into the JSON envelope.
 import { EXAM_TOOLS } from './exams.js';
 import { MAP_TOOLS } from './map.js';
@@ -12,13 +13,18 @@ import { buildInstructions } from './instructions.js';
 import { withKnowledge } from './knowledge.js';
 import { withLibrary } from './library.js';
 import { withExams } from './exam-bank.js';
+import { CODE_TOOLS, ALL_CLIENT_TOOLS } from './bugs.js';
+import { PHOTO_TOOLS } from './photos.js';
 
-export const TOOLS = [...EXAM_TOOLS, ...TEACH_TOOLS, ...MAP_TOOLS, ...BOARD_TOOLS, ...HUB_TOOLS, ...HISTORY_TOOLS].map(withKnowledge).map(withExams).map(withLibrary);
+export const TOOLS = [...EXAM_TOOLS, ...TEACH_TOOLS, ...MAP_TOOLS, ...BOARD_TOOLS, ...HUB_TOOLS, ...HISTORY_TOOLS, ...PHOTO_TOOLS, ...ALL_CLIENT_TOOLS].map(withKnowledge).map(withExams).map(withLibrary);
 export const LEGACY_NAMES = EXAM_TOOLS.map(t => t.name);
 export const NEW_PREFIXES = ['map_', 'teach_', 'lesson_', 'board_', 'hub_', 'screen_', 'media_'];
 export const LIST_MAX = 36_000, DESCRIPTION_MAX = 1_800;
 
-const BY_NAME = new Map(TOOLS.map(t => [t.name, t]));
+// The fix loop's tools (mcp/bugs.js, 1 Nov 2026): listed only when Claude Code calls (env.MCP_CLIENT 'code'), so the
+// Claude app's list and its cap stay as they are; callable by name from any client.
+export { CODE_TOOLS };
+const BY_NAME = new Map([...TOOLS, ...CODE_TOOLS].map(t => [t.name, t]));
 export const toolByName = name => BY_NAME.get(name) || null;
 
 /**
@@ -42,9 +48,11 @@ export function advertise(schema, depth = 0) {
 
 // What tools/list sends: the MCP fields only.
 const LISTED = ['name', 'title', 'description', 'inputSchema', 'annotations', '_meta'];
-const LIST = TOOLS.map(t => Object.fromEntries(LISTED.filter(k => t[k] !== undefined).map(k => [k, k === 'inputSchema' && !t.legacy ? advertise(t[k]) : t[k]])));
-export function listTools() {
-  return LIST;
+const listed = list => list.map(t => Object.fromEntries(LISTED.filter(k => t[k] !== undefined).map(k => [k, k === 'inputSchema' && !t.legacy ? advertise(t[k]) : t[k]])));
+const LIST = listed(TOOLS.filter(t => !t.unlisted));
+const LIST_CODE = LIST.concat(listed(CODE_TOOLS));
+export function listTools(env = null) {
+  return env && env.MCP_CLIENT === 'code' ? LIST_CODE : LIST;
 }
 
-export const INSTRUCTIONS = buildInstructions(TOOLS.map(t => t.name));
+export const INSTRUCTIONS = buildInstructions(TOOLS.filter(t => !t.unlisted).map(t => t.name));

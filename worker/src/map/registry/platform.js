@@ -5,7 +5,6 @@ export const EXPORT_SKIP = {
   rate_limits: 'sign-in attempt counters, short-lived',
   connector_keys: 'connector token hashes: secrets',
   upload_links: 'one-time upload link token hashes from their Claude: secrets, an hour long',
-  subjects_new: 'only for a moment in 0105: made with the wider track list, then renamed to subjects (exported as subjects)',
   ai_keys: 'sealed AI keys: secrets, never exported',
   ai_settings: "per-user AI choice and caps; in the person's own export, not the hub backup",
   ai_usage: "spend counters; in the person's own export, not the hub backup",

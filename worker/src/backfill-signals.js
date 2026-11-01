@@ -113,7 +113,7 @@ async function gapsUnit(env, s) {
   const { rows, worth } = await gapsToTag(env, s.gaps_after);
   if (!rows.length) { s.gaps_done = true; return 'gaps done'; }
   if (worth.length) {
-    const { data } = await paid(env, s, () => callJson(env, { role: 'checker', system: GAPS_SYSTEM, schema: GAPS_SCHEMA, effort: 'high', maxTokens: 16000,
+    const { data } = await paid(env, s, () => callJson(env, { role: 'checker', use: 'catchup', system: GAPS_SYSTEM, schema: GAPS_SCHEMA, effort: 'high', maxTokens: 16000,
       messages: [{ role: 'user', content: gapsMessage(worth) }] }));
     const st = gapTagStatements(env, worth, data);
     if (st.length) await env.DB.batch(st);
@@ -175,12 +175,18 @@ export async function tick(env, ctx = null) {
     did = s.gaps_done ? await blockUnit(env, s, ctx) : await gapsUnit(env, s);
     s.error = null;
   } catch (e) {
-    s.error = String(e && e.message || e).slice(0, 200);
-    if (e instanceof HttpError && e.status === 429 && s.usd >= BACKFILL_MAX_USD) { s.status = 'stopped'; s.finished_at = now(); }
+    // Waiting for its Message Batch (claude.js): not an error; the same unit asks the same next minute.
+    if (e && e.pending === true && e.batch === true) s.waiting = true;
+    else {
+      s.error = String(e && e.message || e).slice(0, 200);
+      if (e instanceof HttpError && e.status === 429 && s.usd >= BACKFILL_MAX_USD) { s.status = 'stopped'; s.finished_at = now(); }
+    }
   }
+  const waiting = !!s.waiting;
+  delete s.waiting;
   s.updated_at = now();
   await setSetting(env, KEY, s);
-  await noteJob(env, { job: 'catchup_signals', key: String(s.started_at), state: s.status === 'stopped' ? 'held' : s.error ? 'failed' : 'ok', detail: s.error,
-    counts: { status: s.status, gaps: s.gaps_tagged || 0, blocks: (s.blocks_done || []).length, left: s.blocks_left ?? 0, usd: s.usd || 0, max: BACKFILL_MAX_USD } });
+  await noteJob(env, { job: 'catchup_signals', key: String(s.started_at), state: s.status === 'stopped' || waiting ? 'held' : s.error ? 'failed' : 'ok', detail: s.error,
+    counts: { status: s.status, gaps: s.gaps_tagged || 0, blocks: (s.blocks_done || []).length, left: s.blocks_left ?? 0, usd: s.usd || 0, max: BACKFILL_MAX_USD, ...(waiting ? { batch: 1 } : {}) } });
   return did;
 }

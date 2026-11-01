@@ -7,15 +7,16 @@
 // so a new source (AnkiMobile, a new spoken cue) needs no change here. Unknown kinds have no mass but still
 // mark the topic seen.
 //
-// A weight change bumps WEIGHTS_VERSION; refreshScores then recomputes every row whose formula_version is older.
+// A weight change bumps WEIGHTS_VERSION; repairScores then sends every row whose formula_version is older to be
+// recomputed, 30 a run, once each (a Recent activity line counts them).
 
-// 2: a lesson's probe answers carry no fail mass (LRN3-2). 3: the colour is read from FSRS memory per topic
-// (fsrs.js, WEA2); these masses still feed the gates, the certainty buckets and the why list.
-export const WEIGHTS_VERSION = 4;   // 4 (29 Oct): a gap said on a card is that card's day, heard once
+import { causeMult, CAUSE_MULT } from '../../../public/js/shared/cause.js';
+
+export let WEIGHTS_VERSION = 10;
 export const DAY_MS = 86400000;
 
 // Half-lives in days, by group (plan §7.1). Card state never decays while it holds.
-export const HALF_LIFE = { q: 21, card: 14, card_state: null, lesson_pass: 7, lesson_fail: 14, self: 14, gap: 14 };
+export const HALF_LIFE = { q: 21, card: 14, card_state: null, lesson_pass: 7, lesson_fail: 14, self: 14, gap: 14, gate: null };
 
 // The stored buckets (topic_scores columns), each with its half-life.
 export const BUCKETS = {
@@ -23,6 +24,7 @@ export const BUCKETS = {
   card_pass: HALF_LIFE.card, card_fail: HALF_LIFE.card, card_state: HALF_LIFE.card_state,
   lesson_pass: HALF_LIFE.lesson_pass, lesson_fail: HALF_LIFE.lesson_fail,
   self_pass: HALF_LIFE.self, self_fail: HALF_LIFE.self, gap_fail: HALF_LIFE.gap,
+  gate_nq: HALF_LIFE.gate,
 };
 export const BUCKET_NAMES = Object.keys(BUCKETS);
 
@@ -41,15 +43,76 @@ export const GATES = {
   strong_f: 0.5,                            // a strong fail's decayed f
 };
 
-// The prior (plan §7.1): m0 = clamp((n·r + 10·g)/(n + 10), 0.50, 0.72), worth k0 = 3 answers.
-export const PRIOR = { k0: 3, weight: 10, min: 0.5, max: 0.72, g_min: 0.55, g_max: 0.72, g_default: 0.62, days: 60 };
+export const GATE_CREDIT = { viva: 0.5, card: 0.25, card_max: 0.5, blue_max: 1.0, deep_max: 1.5, window_days: 60, concept: 0 };
+
+export const CLOSING_VIVA = 0.5;
+/** A viva row's weight factor (pure): CLOSING_VIVA for a lesson's closing viva, else 1. */
+export const vivaPhaseWeight = row => (detailOf(row).phase === 'after' ? CLOSING_VIVA : 1);
+
+/**
+ * The non-question credit toward the gates from a topic's rows (pure; held rows skipped): strong-viva days times 0.5
+ * plus right-card days times 0.25 (capped), from the last window_days before now. dayOf(row): its London day (row.day
+ * by default).
+ */
+export function gateCredit(rows, dayOf = row => row.day, now = Date.now()) {
+  const viva = new Map(), card = new Set();   // viva: day -> its best phase weight (a closing viva half)
+  let concept = 0;   // topics the concept underlies, held, summed over days (concept-held.js)
+  const since = now - GATE_CREDIT.window_days * DAY_MS;
+  for (const row of rows || []) {
+    if (!row || Number(row.held) === 1) continue;
+    if (Number.isFinite(Number(row.at)) && Number(row.at) < since) continue;
+    if (row.kind === 'recall_audit' && detailOf(row).part !== 'belief' && lessonResult(row) === 'right') viva.set(dayOf(row), Math.max(viva.get(dayOf(row)) || 0, vivaPhaseWeight(row)));
+    else if (row.kind === 'card_review') {
+      const r = REVIEW_RATING[lower(row.rating)] || REVIEW_RATING[String(row.amount)];
+      if (r === 'good' || r === 'easy') card.add(dayOf(row));
+    } else if (row.kind === 'concept_held') concept += Math.max(0, Number(row.amount) || 0);
+  }
+  let vivaW = 0;
+  for (const w of viva.values()) vivaW += w;
+  return vivaW * GATE_CREDIT.viva + Math.min(card.size * GATE_CREDIT.card, GATE_CREDIT.card_max) + concept * (Number(GATE_CREDIT.concept) || 0);
+}
+
+/**
+ * The gate a topic's non-question credit lifted (pure): 'blue' when the blue cap would have held a topic above it
+ * without that credit, 'deep' the same for deep blue, else null. The two never both hold (deep needs q_pass >= 1.0).
+ */
+export function gateLiftOf(pHat, b) {
+  const q = Number(b && b.q_pass) || 0, nq = Number(b && b.gate_nq) || 0;
+  const opens = (gate, max) => nq > 0 && q < gate.q_pass && q + Math.min(nq, max) >= gate.q_pass && pHat > gate.max;
+  return opens(GATES.blue, GATE_CREDIT.blue_max) ? 'blue' : opens(GATES.deep, GATE_CREDIT.deep_max) ? 'deep' : null;
+}
+
+export const PRIOR = { k0: 3, weight: 10, min: 0.5, max: 0.72, g_min: 0.55, g_max: 0.72, g_default: 0.62, days: 60, learned_min: 0.35, learned_max: 0.85 };
+
+// A stored m0 is the old rule's (0.50-0.72) or a learned starting guess (0.35-0.85): read within the wider range.
+export const clampM0 = m0 => Math.min(PRIOR.learned_max, Math.max(PRIOR.learned_min, Number(m0)));
+
+export const GUESS_KIND = 'starting_guess';
+export function guessM0(version, categoryId) {
+  const v = version && typeof version === 'object' ? version : null;
+  if (!v) return null;
+  const c = categoryId != null && v.by_category ? v.by_category[categoryId] : null;
+  const m = c && Number.isFinite(Number(c.m0)) ? Number(c.m0) : Number(v.global);
+  return Number.isFinite(m) ? clampM0(m) : null;
+}
 
 export const PACE = { pace_s: 90, slow_s: 120, steps: [[90, 0], [120, 0.15], [180, 0.4], [Infinity, 0.55]] };
 /** 'slow' over 120 s, 'over pace' over 90 s, 'on pace', or null with no time. */
 export const paceWord = s => { const t = num(s); return t == null ? null : t > PACE.slow_s ? 'slow' : t > PACE.pace_s ? 'over pace' : 'on pace'; };
 
-// Error type multipliers on f only (Anki keys; anything else counts in full).
-export const ERROR_MULT = { premature_closure: 0.8, calculation: 0.5, misread: 0.3, test_taking: 0.3 };
+export const HEARD_MULT = { clear: 1, partial: 0.85, unclear: 0.6, not_said: 1 };
+/** A row's heard multiplier (pure): HEARD_MULT of detail_json.heard, 1 when none was recorded. */
+export const heardMult = row => HEARD_MULT[detailOf(row).heard] ?? 1;
+export const WORD_RULES = ['right_guess', 'right_flawed', 'shaky_elimination', 'misread_detail'];
+
+// A right answer whose words showed a foundation concept understood (concepts.js, polarity right): a light Good on the
+// concept topic (fsrs.js REVIEW_W.concept_right reads this), never a mass and never toward the gates, so concept orbs
+// can improve as well as worsen without a passing remark outweighing a question.
+export const CONCEPT_RIGHT_WEIGHT = 0.2;
+
+// Error type multipliers on f only (Anki keys; anything else counts in full). faulty synthesis is a reasoning slip
+// like premature closure (wave 2: reasoning 0.8), so the two weigh the same.
+export const ERROR_MULT = { premature_closure: 0.8, faulty_synthesis: 0.8, calculation: 0.5, misread: 0.3, test_taking: 0.3 };
 export const ERROR_KEYS = ['knowledge_gap', 'misread', 'premature_closure', 'faulty_synthesis', 'test_taking', 'threshold', 'calculation'];
 
 // Every mass in one place (map_rules and the tests read this).
@@ -65,7 +128,11 @@ export const WEIGHTS = {
     first_sight_lapse: 0.15, first_sight_max: 4, mature: [0, 0.25] },
   // An Anki review of a card on the topic (anki_cards' ease): Again is a lapse, Good and Easy are passes.
   card_review: { again: [0.3, 0], hard: [0.15, 0.05], good: [0, 0.1], easy: [0, 0.15] },
-  lesson_probe: { right: [0, 0.2], partial: [0, 0.1], wrong: [0, 0], unsure: [0, 0] },
+  lesson_probe: { right: [0, 0.2], partial: [0, 0.1], wrong: [0, 0], unsure: [0, 0], new_strand_wrong: [0.3, 0] },
+  // Lessons as evidence (wave 3): failures after the teaching count, rights there earn nothing (short-term performance).
+  lesson_check: { wrong: [0.3, 0] },
+  lesson_teachback: { wrong: [0.3, 0], partial: [0.15, 0] },
+  lesson_misconception: [0.3, 0],
   lesson_final: { right: [0, 0.4], right_guess: [0.1, 0.2], partial: [0.2, 0.2], wrong: [0.6, 0], wrong_sure: [0.7, 0], unsure: [0.6, 0] },
   pair_item: { right: [0, 0.2], wrong: [0.3, 0], unsure: [0.3, 0] },
   gap_stated: { gap: [0.5, 0], shaky: [0.3, 0] },
@@ -73,13 +140,11 @@ export const WEIGHTS = {
   self_rating: { again: [0.3, 0], hard: [0.15, 0], good: [0, 0.1], easy: [0, 0.2] },
 };
 
-// Kinds by group. card_lapse covers both a dated lapse on a card-day row and the first-sight count
-// (detail_json.first_sight = 1, amount = the lapse count).
 export const KINDS = {
   q: ['question', 'confused_with', 'retest'],
   card: ['card_lapse', 'card_check', 'card_weak_part', 'card_review'],
   card_state: ['card_new', 'card_young', 'card_mature', 'card_suspended'],
-  lesson: ['lesson_probe', 'lesson_final', 'lesson_check', 'pair_item'],
+  lesson: ['lesson_probe', 'lesson_final', 'lesson_check', 'pair_item', 'lesson_teachback', 'lesson_misconception'],
   self: ['gap_stated', 'self_mastered', 'self_rating'],
 };
 const GROUP_OF = Object.fromEntries(Object.entries(KINDS).flatMap(([g, ks]) => ks.map(k => [k, g])));
@@ -115,6 +180,16 @@ export function errorKeyOf(v) {
   if (k.startsWith('calc')) return 'calculation';
   if (k.startsWith('knowledge')) return 'knowledge_gap';
   return null;
+}
+
+/**
+ * A miss's multiplier on its own topic (wave 2): its judged cause (detail_json.cause, shared/cause.js CAUSE_MULT:
+ * missing fact or confusion 1, reasoning or ignored clue 0.8, guess 0.8, misread 0.3) when one was judged, else its
+ * error type's (ERROR_MULT), which reads the same causes from the error type.
+ */
+export function causeMultOf(row) {
+  const m = causeMult(detailOf(row).cause, confidenceOf(row && row.confidence));
+  return m ?? (ERROR_MULT[errorKeyOf(row && row.error_type)] ?? 1);
 }
 
 export function detailOf(row) {
@@ -173,8 +248,8 @@ export function questionMass(row) {
   const base = questionBase(row);
   if (!base) return { f: 0, p: 0, rule: null };
   let { f, p } = base;
-  const err = errorKeyOf(row.error_type);
-  f *= ERROR_MULT[err] ?? 1;
+  f *= causeMultOf(row);
+  if (WORD_RULES.includes(base.rule)) f *= heardMult(row);   // a flaw heard in garbled words counts less
   if (!NOT_SLOWED.has(base.rule)) {
     const s = slowShare(row.time_s);
     f += p * s;
@@ -203,9 +278,10 @@ export function cardDayMass(row) {
   const facts = [];
   if (row.kind === 'card_lapse' || Number(d.lapsed) > 0) facts.push({ kind: 'card_lapse', f: C.lapse[0], p: C.lapse[1] });
   const verdict = lower(row.verdict) || (row.kind === 'card_check' ? 'gap' : null);
-  if (verdict === 'gap') facts.push({ kind: 'card_check', f: C.check_gap[0], p: C.check_gap[1] });
-  else if (verdict === 'shaky') facts.push({ kind: 'card_check', f: C.check_shaky[0], p: C.check_shaky[1] });
-  else if (verdict === 'sound') facts.push({ kind: 'card_check', f: C.check_sound[0], p: C.check_sound[1] });
+  const h = heardMult(row);
+  if (verdict === 'gap') facts.push({ kind: 'card_check', f: C.check_gap[0] * h, p: C.check_gap[1] * h });
+  else if (verdict === 'shaky') facts.push({ kind: 'card_check', f: C.check_shaky[0] * h, p: C.check_shaky[1] * h });
+  else if (verdict === 'sound') facts.push({ kind: 'card_check', f: C.check_sound[0] * h, p: C.check_sound[1] * h });
   const parts = num(d.missed_parts) ?? (row.kind === 'card_weak_part' ? num(row.amount) : null);
   if (parts != null && parts > 0) facts.push({ kind: 'card_weak_part', f: C.weak_part * Math.min(parts, C.weak_parts_max), p: 0 });
   if (!facts.length) return { f: 0, p: 0, worst: null };
@@ -231,14 +307,21 @@ function lessonMass(row) {
   const res = lessonResult(row);
   if (!res) return [0, 0];
   const conf = confidenceOf(row.confidence);
-  if (row.kind === 'lesson_probe') return WEIGHTS.lesson_probe[res];
+  if (row.kind === 'lesson_probe') {
+    if ((res === 'wrong' || res === 'unsure') && detailOf(row).from === 'new') return WEIGHTS.lesson_probe.new_strand_wrong;
+    return WEIGHTS.lesson_probe[res];
+  }
+  // A step check wrong twice after the teaching (never a pair lesson's practice pair, which has a link_id: LRN4-5).
+  if (row.kind === 'lesson_check') return res === 'wrong' && detailOf(row).link_id == null ? WEIGHTS.lesson_check.wrong : [0, 0];
+  if (row.kind === 'lesson_teachback') return WEIGHTS.lesson_teachback[res] || [0, 0];
+  if (row.kind === 'lesson_misconception') return WEIGHTS.lesson_misconception;
   if (row.kind === 'pair_item') return WEIGHTS.pair_item[res === 'partial' ? 'wrong' : res];
   if (row.kind === 'lesson_final') {
     if (res === 'right' && conf === 'guess') return WEIGHTS.lesson_final.right_guess;
     if (res === 'wrong' && conf === 'sure') return WEIGHTS.lesson_final.wrong_sure;
     return WEIGHTS.lesson_final[res];
   }
-  return [0, 0];   // lesson_check: kept for teach_memory, no mass
+  return [0, 0];
 }
 
 // ------------------------------------------------------------------ evidenceMass
@@ -258,7 +341,7 @@ export function evidenceMass(row) {
       if (kind === 'confused_with') {
         // 0.3 of the miss's base f, with its error-type multiplier (a misread is a habit, not a mix-up).
         const base = questionBase(row);
-        const f = base ? WEIGHTS.confused_with * base.f * (ERROR_MULT[errorKeyOf(row.error_type)] ?? 1) : 0;
+        const f = base ? WEIGHTS.confused_with * base.f * causeMultOf(row) * heardMult(row) : 0;
         return out(f, 0, 'q_fail', 'q_pass', base && base.rule);
       }
       const r = lower(row.outcome) || lower(row.result);
@@ -288,11 +371,13 @@ export function evidenceMass(row) {
     case 'self': {
       if (kind === 'gap_stated') {
         const v = lower(row.verdict) === 'shaky' ? 'shaky' : 'gap';
-        return out(...WEIGHTS.gap_stated[v], 'gap_fail', 'self_pass', v);
+        const h = heardMult(row);
+        return out(WEIGHTS.gap_stated[v][0] * h, WEIGHTS.gap_stated[v][1] * h, 'gap_fail', 'self_pass', v);
       }
       if (kind === 'self_mastered') return out(...WEIGHTS.self_mastered, 'self_fail', 'self_pass', 'mastered');
       const r = WEIGHTS.self_rating[lower(row.rating)];
-      return r ? out(...r, 'self_fail', 'self_pass', lower(row.rating)) : out(0, 0, 'self_fail', 'self_pass');
+      const share = row.amount == null || !Number.isFinite(Number(row.amount)) ? 1 : Math.min(1, Math.max(0, Number(row.amount)));
+      return r ? out(r[0] * share, r[1] * share, 'self_fail', 'self_pass', lower(row.rating)) : out(0, 0, 'self_fail', 'self_pass');
     }
     default:
       return out(0, 0, null, null);
@@ -322,7 +407,7 @@ export function strongNow(at, f, now) {
 
 // ------------------------------------------------------------------ gaps into evidence
 
-export const CHECK_SOURCES = ['anki_mac', 'anki_hub', 'anki_phone'];
+export const CHECK_SOURCES = ['anki_mac', 'anki_hub', 'anki_phone', 'anki_voice_check'];
 
 // Which kind of evidence a gaps row becomes (plan §6.4): an explicit origin wins; otherwise the Anki check is a
 // review, anki_voice with a card or said words is a review, and everything else was stated. The one copy (the data
@@ -355,6 +440,7 @@ export function gapKind(gap) {
 // gap by its id). ctx carries topic_id, category_id, label_norm, queue_id, held and sitting_id from ingestion.
 export function gapEvidence(gap, ctx = {}) {
   const k = gapKind(gap);
+  const heard = ['partial', 'unclear'].includes(lower(gap && gap.heard)) ? lower(gap.heard) : null;
   const at = Number(gap.at) || Number(ctx.at) || Date.now();
   return {
     obs_key: k.obs_key, slot: 0, kind: k.kind, at, day: gap.day,
@@ -363,7 +449,7 @@ export function gapEvidence(gap, ctx = {}) {
     card_id: gap.card_id ?? null, note_id: gap.note_id ?? null, gap_id: gap.id,
     held: ctx.held ? 1 : 0, sitting_id: ctx.sitting_id ?? null,
     verdict: k.verdict, error_type: errorKeyOf(gap.error_type),
-    detail_json: JSON.stringify({ origin: k.origin }),
+    detail_json: JSON.stringify({ origin: k.origin, ...(heard ? { heard } : {}) }),
   };
 }
 
@@ -373,9 +459,22 @@ export function gapEvidence(gap, ctx = {}) {
 export function rulesLines() {
   const Q = WEIGHTS.question;
   return [
-    `Gates read masses with a half-life of ${HALF_LIFE.q} days (questions), ${HALF_LIFE.card} (cards, gaps), ${HALF_LIFE.lesson_pass} (lesson passes); a miss counts ${Q.wrong_sure[0]} sure, ${Q.wrong_guess[0]} guessed, slips ${ERROR_MULT.misread} of that.`,
+    `Gates read masses with a half-life of ${HALF_LIFE.q} days (questions), ${HALF_LIFE.card} (cards, gaps), ${HALF_LIFE.lesson_pass} (lesson passes); a miss counts ${Q.wrong_sure[0]} sure, ${Q.wrong_guess[0]} guessed, times its cause (reasoning ${CAUSE_MULT.reasoning}, misread ${CAUSE_MULT.misread}).`,
     `A slow right answer counts partly as a miss: ${PACE.steps.slice(1).map((st, i) => `${Math.round(st[1] * 100)}% over ${PACE.steps[i][0]} s`).join(', ')}.`,
     `A stated gap counts ${WEIGHTS.gap_stated.gap[0]}, a card lapse ${WEIGHTS.card.lapse[0]}.`,
-    `No blue until a question or re-test is right; deep blue needs about ${GATES.deep.q_pass}. One miss, or any number of gaps, never reaches Very weak; cards, lessons and ticks alone stop at Shaky.`,
+    `Blue needs ${GATES.blue.q_pass} tested: right Qs or cards from misses, strong viva ${GATE_CREDIT.viva}/day, right card ${GATE_CREDIT.card}/day (max ${GATE_CREDIT.card_max}); viva+card max ${GATE_CREDIT.blue_max} (${GATE_CREDIT.deep_max} of deep's ${GATES.deep.q_pass}). 1 miss never Very weak; ratings, lessons: 0.`,
   ];
 }
+
+export const WEIGHT_SETS = [
+  { id: 'v8', version: 8, date: '2026-10-31', note: 'What tests him opens blue: strong vivas and right card days count toward the gates (GATE_CREDIT).', changes: {} },
+  // Baked in by the 1 Nov builds that predate shadow mode (no shadow test ran for these two).
+  { id: 'v9', version: 9, date: '2026-11-01', note: "A lesson's closing viva counts half a viva (CLOSING_VIVA).", changes: {} },
+  { id: 'v10', version: 10, date: '2026-11-01', note: 'How clearly he was heard scales what the AI read from his words; a right answer showing a concept is a small Good on it (answer forms).', changes: {} },
+  { id: 'v11', version: 11, date: '2026-11-01', scored_on: 'concepts',
+    note: 'A foundation concept gets a small Good, and credit toward blue, on days he holds the topics it underlies.',
+    changes: { REVIEW_W: { concept_held: 0.2 }, GATE_CREDIT: { concept: 0.34 } } },
+];
+export const SHIPPED_WEIGHTS_VERSION = WEIGHTS_VERSION;
+/** Sets the live version (weight-sets.js only: the live set, or a set evaluated for a moment in shadow). */
+export function _setWeightsVersion(v) { WEIGHTS_VERSION = Number(v); }

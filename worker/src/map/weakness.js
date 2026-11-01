@@ -1,11 +1,15 @@
 import {
-  WEIGHTS_VERSION, DAY_MS, BUCKETS, BUCKET_NAMES, CAPS, GATES, PRIOR, PACE, paceWord,
-  evidenceMass, isStrongFail, strongNow, decay, detailOf, kindGroup, confidenceOf,
+  WEIGHTS_VERSION, DAY_MS, BUCKETS, BUCKET_NAMES, CAPS, GATES, PRIOR, PACE, paceWord, clampM0, guessM0, GUESS_KIND,
+  evidenceMass, isStrongFail, strongNow, decay, detailOf, kindGroup, confidenceOf, GATE_CREDIT, gateCredit, gateLiftOf,
 } from './weights.js';
 import { MODEL, trendOf, reviewOf, modelFromStored } from './fsrs.js';
+import { heldOn, heldByConcept, LINKED_RIGHTS_SQL, CONCEPTS_OF_SQL } from './concept-held.js';
+export { clampM0, guessM0, GUESS_KIND };
+import { snapshotStatements } from './snapshots.js';
 import { bandOf, bandWord } from '../../../public/js/map/scale.js';
 import { chunks, summaryOf, writeBatch } from './events.js';
 import { londonDay } from '../util.js';
+import { noteJob } from '../job-log.js';
 
 export const SAME_BATCH_MAX = 20;
 export const STRONG_KEEP = 10;
@@ -32,9 +36,13 @@ export function priorOf(n, right_n, g) {
 // The m0 for a topic: its category's stored prior, else a prior from g alone.
 export function m0For(categoryId, priors = {}, g = null) {
   const p = categoryId != null ? priors[categoryId] : undefined;
-  if (p != null && Number.isFinite(Number(p))) return clamp(Number(p), PRIOR.min, PRIOR.max);
+  if (p != null && Number.isFinite(Number(p))) return clampM0(p);
   return priorOf(0, 0, g);
 }
+
+// The newest adopted starting guess (its params_json): refreshPriors reads it in its batch (none before the first).
+export const LATEST_GUESS_SQL = `SELECT params_json FROM model_versions WHERE user_id = ?1 AND adopted_at IS NOT NULL AND adopted_at > 0
+  AND json_extract(params_json, '$.kind') = '${GUESS_KIND}' ORDER BY adopted_at DESC LIMIT 1`;
 
 // ------------------------------------------------------------------ building the state
 
@@ -61,11 +69,7 @@ function lessonScales(entries) {
   };
 }
 
-/**
- * The stored state of one topic from its live evidence rows: group masses decayed to now, strong fails, counts
- * and dates. Also returns each row's decayed contribution, for the why list.
- */
-export function buildState(rows, now, model = MODEL) {
+export function buildState(rows, now, model = MODEL, m0 = 0.6) {
   const b = emptyBuckets();
   const st = {
     seen: 0, first_seen_at: null, last_seen_at: null, last_question_at: null, last_miss_at: null, evidence_at: null,
@@ -78,11 +82,15 @@ export function buildState(rows, now, model = MODEL) {
     if (!row || Number(row.held) === 1) continue;
     const at = Number(row.at);
     if (!Number.isFinite(at)) continue;
-    st.seen = 1;
-    st.first_seen_at = st.first_seen_at == null ? at : Math.min(st.first_seen_at, at);
-    st.last_seen_at = st.last_seen_at == null ? at : Math.max(st.last_seen_at, at);
-    const upd = Number(row.updated_at) || at;
-    st.evidence_at = st.evidence_at == null ? upd : Math.max(st.evidence_at, upd);
+    // A concept's days held on the topics it underlies (concept-held.js) are worked out, never seen on it: alone they
+    // never put a concept on the map.
+    if (row.kind !== 'concept_held') {
+      st.seen = 1;
+      st.first_seen_at = st.first_seen_at == null ? at : Math.min(st.first_seen_at, at);
+      st.last_seen_at = st.last_seen_at == null ? at : Math.max(st.last_seen_at, at);
+      const upd = Number(row.updated_at) || at;
+      st.evidence_at = st.evidence_at == null ? upd : Math.max(st.evidence_at, upd);
+    }
     const m = evidenceMass(row);
     entries.push({ row, m, at });
     countRow(st.counts, row, m, cards, lessons);
@@ -109,14 +117,18 @@ export function buildState(rows, now, model = MODEL) {
   }
   st.strong.sort((x, y) => y[0] - x[0]);
   st.strong = st.strong.slice(0, STRONG_KEEP);
+  b.gate_nq = gateCredit(entries.map(e => e.row), r => r.day || londonDay(Number(r.at)), now);
   st.buckets = b;
   st.ref_at = now;
   // FSRS memory over the same rows (reviews after now never count: a row is never dated ahead of the clock).
   const fs = model.run(entries.filter(e => e.at <= now).map(e => e.row));
   st.fsrs = fs.state ? { s: fs.state.s, d: fs.state.d, at: fs.state.at, n: fs.state.n } : null;
-  const tr = trendOf(fs.points);
+  // The question-side part of n (questions and re-tests only), which the evidence strength reads (shared/evidence.js).
+  st.fsrs_real_n = fs.state ? fs.state.real_n : 0;
+  const tr = trendOf(fs.points, { state: fs.state, m0, now, model });
   st.trend = tr.trend;
   st.trend_slope = tr.slope;
+  st.trend_basis = tr.basis;
   for (const e of entries) if (!e.m.group && reviewOf(e.row)) contrib.push({ row: e.row, m: e.m, f: 0, p: 0, strong: false, bucket_f: null, bucket_p: null });
   return { state: st, contrib };
 }
@@ -148,11 +160,13 @@ export function massesOf(b) {
   return { P, F };
 }
 
-// The three gates in mastery space (plan §7.1), the same for both formulas.
+// The three gates in mastery space (plan §7.1), the same for both formulas. Right questions and re-tests (q_pass) count
+// in full; a strong viva and right card days (gate_nq) at most GATE_CREDIT.blue_max toward blue and deep_max toward deep.
+const gateMass = (b, max) => (Number(b.q_pass) || 0) + Math.min(Number(b.gate_nq) || 0, max);
 export function gated(pHat, b, strongCount) {
   let mastery = pHat;
-  if (b.q_pass < GATES.blue.q_pass) mastery = Math.min(mastery, GATES.blue.max);
-  if (b.q_pass < GATES.deep.q_pass) mastery = Math.min(mastery, GATES.deep.max);
+  if (gateMass(b, GATE_CREDIT.blue_max) < GATES.blue.q_pass) mastery = Math.min(mastery, GATES.blue.max);
+  if (gateMass(b, GATE_CREDIT.deep_max) < GATES.deep.q_pass) mastery = Math.min(mastery, GATES.deep.max);
   if (strongCount < GATES.floor.strong) mastery = Math.max(mastery, GATES.floor.min);
   return mastery;
 }
@@ -166,7 +180,7 @@ export function scoreFromBuckets(b, strongCount, m0) {
   const pHat = (m0 * k0 + P) / (k0 + P + F);
   const mastery = gated(pHat, b, strongCount);
   const c = (P + F) / (P + F + k0);
-  return { P, F, pHat, mastery, t1000: t1000Of_(mastery), certainty: c };
+  return { P, F, pHat, mastery, t1000: t1000Of_(mastery), certainty: c, gate_lift: gateLiftOf(pHat, b) };
 }
 
 /**
@@ -178,7 +192,7 @@ export function scoreFromState(b, strongCount, m0, fsrs, now) {
   const { P, F } = massesOf(b);
   const r = MODEL.blend(fsrs, now, m0);
   const mastery = gated(r.p, b, strongCount);
-  return { P, F, pHat: r.p, R: r.R, mastery, t1000: t1000Of_(mastery), certainty: r.c };
+  return { P, F, pHat: r.p, R: r.R, mastery, t1000: t1000Of_(mastery), certainty: r.c, gate_lift: gateLiftOf(r.p, b) };
 }
 
 const certLevel = cert100 => (cert100 >= 60 ? 'high' : cert100 >= 33 ? 'medium' : 'low');
@@ -190,7 +204,8 @@ export function readScore(state, now, m0) {
   for (const name of BUCKET_NAMES) b[name] = (Number(state.buckets && state.buckets[name]) || 0) * decay(age, BUCKETS[name]);
   const strong = (state.strong || []).filter(([at, f]) => strongNow(at, f, now));
   const out = { buckets: b, strong, ref_at: now, prior_mastery: m0 };
-  if (state.fsrs !== undefined) Object.assign(out, { fsrs: state.fsrs, trend: state.trend ?? null, trend_slope: state.trend_slope ?? null });
+  if (state.fsrs !== undefined) Object.assign(out, { fsrs: state.fsrs, trend: state.trend ?? null, trend_slope: state.trend_slope ?? null,
+    ...(state.trend_basis ? { trend_basis: state.trend_basis } : {}), fsrs_real_n: state.fsrs_real_n ?? null });
   if (!state.seen) {
     return { ...out, seen: 0, mastery: null, weakness: null, weakness_raw: round(1 - m0, 6), t1000: null, band: 'unseen',
       certainty: 0, cert100: 0, certainty_level: 'low' };
@@ -200,7 +215,7 @@ export function readScore(state, now, m0) {
   return {
     ...out, seen: 1, mastery: round(s.mastery, 6), weakness: round(1 - s.mastery, 6), weakness_raw: round(1 - s.pHat, 6),
     t1000: s.t1000, band: bandOf(s.t1000), certainty: round(s.certainty, 6), cert100, certainty_level: certLevel(cert100),
-    recall: s.R == null ? null : round(s.R, 4),
+    recall: s.R == null ? null : round(s.R, 4), gate_lift: s.gate_lift,
   };
 }
 
@@ -215,8 +230,8 @@ const priorValue = prior => (typeof prior === 'number' ? prior : prior && Number
  * leave-one-out change in t1000).
  */
 export function scoreTopic(rows, prior, now = Date.now(), model = MODEL) {
-  const m0 = clamp(priorValue(prior), PRIOR.min, PRIOR.max);
-  const { state, contrib } = buildState(rows, now, model);
+  const m0 = clampM0(priorValue(prior));
+  const { state, contrib } = buildState(rows, now, model, m0);
   const score = readScore(state, now, m0);
   const why = state.seen ? whyRows(rows, contrib, score, m0, now, model) : [];
   return { ...state, ...score, counts: state.counts, why };
@@ -224,21 +239,50 @@ export function scoreTopic(rows, prior, now = Date.now(), model = MODEL) {
 
 const WHY_LOO_MAX = 30;   // leave-one-out reruns FSRS per row, so only the newest 30 contributing rows are tried
 
-// Leave-one-out: each contributing row's effect on t1000, by scoring the topic again without it (its decayed
-// masses out of the buckets, and the FSRS reviews run again without it).
-function whyRows(rows, contrib, score, m0, now, model = MODEL) {
+function looItems(rows, contrib, score, m0, now, model = MODEL, max = WHY_LOO_MAX, groups = null) {
   const items = [];
-  const list = contrib.length > WHY_LOO_MAX ? [...contrib].sort((x, y) => Number(y.row.at) - Number(x.row.at)).slice(0, WHY_LOO_MAX) : contrib;
+  const list = contrib.length > max ? [...contrib].sort((x, y) => Number(y.row.at) - Number(x.row.at)).slice(0, max) : contrib;
   const live = (rows || []).filter(r => r && Number(r.held) !== 1 && Number.isFinite(Number(r.at)) && Number(r.at) <= now);
+  const groupOf = new Map();
+  for (const g of groups || []) for (const r of g) groupOf.set(r, g);
+  const byRow = new Map(contrib.map(c => [c.row, c]));
+  const done = new Set();
   for (const c of list) {
+    const g = groupOf.get(c.row) || null;
+    if (g && done.has(g)) continue;
+    if (g) done.add(g);
+    const out = g ? g.map(r => byRow.get(r)).filter(Boolean) : [c];
+    const gone = new Set(g || [c.row]);
     const b = { ...score.buckets };
-    if (c.f) b[c.bucket_f] = Math.max(0, b[c.bucket_f] - c.f);
-    if (c.p) b[c.bucket_p] = Math.max(0, b[c.bucket_p] - c.p);
-    const fs = model.run(live.filter(r => r !== c.row)).state;
-    const without = scoreFromState(b, score.strong.length - (c.strong ? 1 : 0), m0, fs ? { s: fs.s, d: fs.d, at: fs.at, n: fs.n } : null, now);
+    for (const x of out) {
+      if (x.f) b[x.bucket_f] = Math.max(0, b[x.bucket_f] - x.f);
+      if (x.p) b[x.bucket_p] = Math.max(0, b[x.bucket_p] - x.p);
+    }
+    const fs = model.run(live.filter(r => !gone.has(r))).state;
+    const strongOut = out.filter(x => x.strong).length;
+    const without = scoreFromState(b, score.strong.length - strongOut, m0, fs ? { s: fs.s, d: fs.d, at: fs.at, n: fs.n } : null, now);
     const dt = score.t1000 - without.t1000;
-    items.push({ c, dt, mass: c.f + c.p + (reviewOf(c.row) ? 0.01 : 0) });
+    const dp = score.weakness_raw != null && without.pHat != null ? (1 - score.weakness_raw) - without.pHat : 0;
+    items.push({ c, row: g ? g[0] : c.row, dt, dp, mass: out.reduce((t, x) => t + x.f + x.p, 0) + (reviewOf(c.row) ? 0.01 : 0) });
   }
+  return items;
+}
+
+/**
+ * Every contributing row's leave-one-out effect, for the topic panel's "Why this colour" (wave 2 C.6): the score from
+ * these rows and [{row, dt, dp}] for the newest `max` rows that count (groups: arrays of rows that leave together, see
+ * looItems). Pure, like scoreTopic.
+ */
+export function rowEffects(rows, prior, now = Date.now(), model = MODEL, { max = WHY_LOO_MAX, groups = null } = {}) {
+  const m0 = clampM0(priorValue(prior));
+  const { state, contrib } = buildState(rows, now, model, m0);
+  const score = readScore(state, now, m0);
+  if (!state.seen) return { score, items: [] };
+  return { score, items: looItems(rows, contrib, score, m0, now, model, max, groups).map(x => ({ row: x.row, dt: x.dt, dp: x.dp })) };
+}
+
+function whyRows(rows, contrib, score, m0, now, model = MODEL) {
+  const items = looItems(rows, contrib, score, m0, now, model);
   items.sort((x, y) => Math.abs(y.dt) - Math.abs(x.dt) || y.mass - x.mass || Number(y.c.row.at) - Number(x.c.row.at));
   return items.filter(x => x.dt !== 0 || x.mass >= 0.1).slice(0, WHY_MAX).map(x => whyItem(x.c, x.dt));
 }
@@ -270,15 +314,23 @@ function questionWords(row, m) {
   }
 }
 
+// A miss's judged cause in a word or two (wave 2), after its result: "wrong (didn't know)". A guess already says so.
+const CAUSE_TAG = { confusion: 'mixed up', missing_fact: "didn't know", reasoning: 'reasoning', ignored_clue: 'passed over a clue', misread: 'misread' };
+function causeTag(row, m) {
+  const tag = CAUSE_TAG[detailOf(row).cause];
+  return tag && m && m.rule && !/^right(_sure|_lean)?$/.test(m.rule) ? ` (${tag})` : '';
+}
+
 // The words for one row, built by code from its facts (never question or gap text).
 export function rowWords(row, m = evidenceMass(row)) {
   const ref = safeRef(detailOf(row).label) || safeRef(row.source_ref);
   const on = ref ? ` on ${ref}` : '';
   const res = m.rule;
   switch (row.kind) {
-    case 'question': return questionWords(row, m) + on;
-    case 'confused_with': return `picked as the look-alike${on}`;
-    case 'retest': return `re-test ${res === 'got_it' ? 'right' : 'missed'}${on}`;
+    case 'question': return questionWords(row, m) + causeTag(row, m) + on;
+    // Only a real confusion writes this row now (wave 2: links.js lookAlikeRole), so it says so, never "picked".
+    case 'confused_with': return `mixed up with the right answer${on}`;
+    case 'retest': return `card from a miss ${res === 'got_it' ? 'right' : 'missed'} the first time${on}`;
     case 'card_lapse': return res === 'first_sight' ? `a card forgotten ${Number(row.amount ?? detailOf(row).lapses) || 0} times` : 'a card lapsed';
     case 'card_check': return res === 'card_weak_part' ? 'parts of a card missed' : res === 'card_lapse' ? 'a card lapsed'
       : `a card check (${lower(row.verdict) || 'gap'})`;
@@ -287,10 +339,42 @@ export function rowWords(row, m = evidenceMass(row)) {
     case 'card_review': return `a card rated ${res || lower(row.rating) || 'in Anki'}`;
     case 'lesson_probe': return `a lesson question ${res || 'skipped'}`;
     case 'lesson_final': return `a lesson's final case ${res || 'skipped'}`;
+    case 'lesson_check': return `a lesson's step check ${res === 'wrong' ? 'missed twice' : res || 'skipped'}`;
+    case 'lesson_teachback': return `a lesson's teach-back ${res === 'partial' ? 'partly right' : res || 'judged'}`;
+    case 'lesson_misconception': return 'a misconception found in a lesson';
     case 'pair_item': return `a look-alike drill case ${res || 'skipped'}`;
     case 'gap_stated': return lower(row.verdict) === 'shaky' ? 'a shaky spot you named' : 'a gap you named';
     case 'self_mastered': return 'a step ticked mastered';
-    case 'self_rating': return `rated ${lower(row.rating)}`;
+    case 'self_rating': {
+      const d = detailOf(row), word = { guess: 'Guess', lean: 'Lean', sure: 'Sure' }[d.level];
+      if (!word) return `rated ${lower(row.rating)}`;
+      const what = d.other_name ? `${d.aspect === 'manage' ? 'the management with' : 'telling it from'} ${d.other_name}` : d.part === 'manage' ? 'Manage' : 'Diagnose';
+      return `you rated ${what} ${word}${d.shown ? ' after seeing the answers' : ''}`;
+    }
+    case 'review_option': return detailOf(row).part === 'distinguish' ? 'what tells it from a choice, said right in your UWorld review'
+      : 'an answer choice you knew in your UWorld review';
+    case 'recall_audit': {
+      const d = detailOf(row);
+      if (d.part === 'belief') return 'a wrong belief in your viva';
+      const of = Number(d.of) || 0;
+      return `your viva${d.facet ? ` (${d.facet})` : ''}: ${of ? `${Number(d.said) || 0} of ${of} key points` : lower(row.result) || 'graded'}`;
+    }
+    // A foundation concept (concepts.js): a miss on a clinical topic, or a wrong belief, that rests on this concept.
+    case 'concept_miss': {
+      const d = detailOf(row);
+      const from = typeof d.from === 'string' && d.from.length <= 80 ? d.from : null;
+      return `${d.belief ? 'a wrong belief' : 'a miss'}${from ? ` on ${from}` : ''} that rests on it${on}`;
+    }
+    // A right answer whose words showed this concept understood (answer forms, 1 Nov 2026).
+    case 'concept_right': {
+      const d = detailOf(row);
+      const from = typeof d.from === 'string' && d.from.length <= 80 ? d.from : null;
+      return `a right answer${from ? ` on ${from}` : ''} that showed you understand it${on}`;
+    }
+    case 'concept_held': {
+      const n = Number(row.amount) || 0;
+      return `${n === 1 ? 'a topic' : `${n} topics`} it underlies held${on}`;
+    }
     default: return String(row.kind || 'evidence').replace(/_/g, ' ');
   }
 }
@@ -350,6 +434,8 @@ export const SCORE_COLS = [
   'n_seen', 'questions_n', 'right_n', 'misses_n', 'sure_wrong_n', 'slow_n', 'cards_n', 'lapses_n', 'lessons_n', 'retests_n', 'gaps_n',
   'why_json', 'evidence_at', 'computed_at', 'refreshed_at', 'formula_version',
   'fsrs_s', 'fsrs_d', 'fsrs_at', 'fsrs_n', 'trend',
+  // 0055: the evidence strength's question-side weight and what the trend rests on (wave 2 C.4, C.5).
+  'fsrs_real_n', 'trend_basis_json',
 ];
 const COUNT_COLS = ['n_seen', 'questions_n', 'right_n', 'misses_n', 'sure_wrong_n', 'slow_n', 'cards_n', 'lapses_n', 'lessons_n', 'retests_n', 'gaps_n'];
 
@@ -364,6 +450,7 @@ export function scoreColumns(user, topicId, s, { category_id = null, now = Date.
     why_json: JSON.stringify(s.why || []), evidence_at: s.evidence_at ?? null, computed_at, refreshed_at: now, formula_version: WEIGHTS_VERSION,
     fsrs_s: s.fsrs ? round(s.fsrs.s, 6) : null, fsrs_d: s.fsrs ? round(s.fsrs.d, 6) : null, fsrs_at: s.fsrs ? Math.round(s.fsrs.at) : null,
     fsrs_n: s.fsrs ? round(s.fsrs.n, 6) : 0, trend: s.trend ?? null,
+    fsrs_real_n: s.fsrs_real_n == null ? null : round(s.fsrs_real_n, 6), trend_basis_json: s.trend_basis ? JSON.stringify(s.trend_basis) : null,
   };
   for (const b of BUCKET_NAMES) row[b] = s.buckets ? s.buckets[b] || 0 : 0;
   for (const c of COUNT_COLS) row[c] = s.counts && s.counts[c] != null ? s.counts[c] : (s[c] ?? null);
@@ -383,8 +470,10 @@ export function stateOf(stored) {
   const fsrs = stored.fsrs_at != null && stored.fsrs_s != null
     ? { s: Number(stored.fsrs_s), d: Number(stored.fsrs_d) || 5, at: Number(stored.fsrs_at), n: Number(stored.fsrs_n) || 0 }
     : Number(stored.formula_version) >= 3 ? null : undefined;
+  let basis = null;
+  try { basis = stored.trend_basis_json ? JSON.parse(stored.trend_basis_json) : null; } catch { basis = null; }
   return {
-    fsrs, trend: stored.trend ?? null,
+    fsrs, trend: stored.trend ?? null, fsrs_real_n: stored.fsrs_real_n ?? null, ...(basis ? { trend_basis: basis } : {}),
     seen: Number(stored.seen) ? 1 : 0, ref_at: Number(stored.ref_at) || 0, buckets, strong: Array.isArray(strong) ? strong : [], why, counts,
     first_seen_at: stored.first_seen_at ?? null, last_seen_at: stored.last_seen_at ?? null, last_question_at: stored.last_question_at ?? null,
     last_miss_at: stored.last_miss_at ?? null, evidence_at: stored.evidence_at ?? null,
@@ -446,12 +535,15 @@ export async function loadForScore(env, user, topicIds) {
     env.DB.prepare('SELECT id, name, category_id, status FROM topics WHERE user_id = ?1 AND id IN (SELECT value FROM json_each(?2))').bind(user, list),
     env.DB.prepare('SELECT category_id, prior, g FROM category_priors WHERE user_id = ?1').bind(user),
     env.DB.prepare("SELECT cursor FROM sync_state WHERE user_id = ?1 AND source = 'anki.fsrs'").bind(user),
+    // Concepts learn from rights (concept-held.js): read only while the live rules give a held day weight (v11 switched on).
+    ...(heldOn() ? [env.DB.prepare(LINKED_RIGHTS_SQL).bind(user, list)] : []),
   ]);
   const priors = {};
   let g = null;
   for (const p of res[3].results || []) { priors[p.category_id] = Number(p.prior); g = g ?? p.g; }
+  const held = res[5] ? [...heldByConcept(res[5].results || []).values()].flat() : [];
   return {
-    rows: res[0].results || [],
+    rows: held.length ? [...(res[0].results || []), ...held] : res[0].results || [],
     stored: new Map((res[1].results || []).map(r => [r.topic_id, r])),
     topics: new Map((res[2].results || []).map(r => [r.id, r])),
     priors, g,
@@ -495,6 +587,11 @@ export async function recomputeTopics(env, user, topicIds, { pending = [], remov
   if (!all.length) return out;
   const mine = all.slice(0, SAME_BATCH_MAX), rest = all.slice(SAME_BATCH_MAX);
   const data = loaded || await loadForScore(env, user, mine);
+  // Before the first recompute under a new WEIGHTS_VERSION, each topic's old colour and look-alike penalties are kept
+  // (snapshots.js), from the evidence as stored before this change, so "what changed overnight" can say why.
+  const stale = mine.filter(t => { const st = data.stored.get(t); return st && Number(st.formula_version) < WEIGHTS_VERSION; });
+  if (stale.length) out.statements.push(...snapshotStatements(env.DB, user, stale.map(t => ({ topic_id: t, stored: data.stored.get(t),
+    rows: (data.rows || []).filter(r => String(r.topic_id) === t) })), now));
   const rows = applyPending(data.rows, pending, removed);
   const byTopic = new Map(mine.map(t => [t, []]));
   for (const r of rows) if (r.topic_id != null && byTopic.has(String(r.topic_id))) byTopic.get(String(r.topic_id)).push({ updated_at: now, ...r });
@@ -514,6 +611,10 @@ export async function recomputeTopics(env, user, topicIds, { pending = [], remov
   }
   out.statements.push(...scoreUpserts(env.DB, writes, { cas }));
   if (rest.length) out.statements.push(dirtyInsert(env.DB, user, rest, 'bulk', now));
+  // While the held days count (concept-held.js, v11 switched on), a topic's new answer moves the concepts under it too.
+  if (heldOn()) out.statements.push(env.DB.prepare(`INSERT INTO topic_dirty (user_id, topic_id, reason, at)
+      SELECT ?1, concept_id, 'held', ?3 FROM (${CONCEPTS_OF_SQL}) WHERE true ON CONFLICT (user_id, topic_id) DO UPDATE SET reason = excluded.reason, at = excluded.at`)
+    .bind(user, JSON.stringify(mine), now));
   return out;
 }
 
@@ -521,7 +622,7 @@ const dirtyInsert = (DB, user, topics, reason, now) => DB.prepare(`INSERT INTO t
     SELECT ?1, value, ?2, ?3 FROM json_each(?4) WHERE true ON CONFLICT (user_id, topic_id) DO UPDATE SET reason = excluded.reason, at = excluded.at`)
   .bind(user, reason, now, JSON.stringify(topics));
 
-// ------------------------------------------------------------------ hourly decay
+// ------------------------------------------------------------------ the stored rows' decay (nightly since 1 Nov 2026)
 
 const DECAY_SOURCE = 'scores.decay';
 const hourKey = now => Math.floor(now / 3600000);
@@ -536,7 +637,8 @@ function worthWriting(stored, next) {
 }
 
 /**
- * Hourly decay (plan §7.3): decays the stored group masses of up to `limit` seen rows to now, in topic order from
+ * The stored rows' decay (plan §7.3; was hourly, nightly at 04:04 London since 1 Nov 2026 as every live reader works
+ * the fade out itself, live.js): decays the stored group masses of up to `limit` seen rows to now, in topic order from
  * this hour's cursor, and rewrites only rows whose t1000 moved by 10 or more, whose band changed, or whose
  * ungated weakness_raw (teach's N) or certainty moved. Writes through realtime's writeBatch with one
  * scores.refreshed event (and score.changed for band changes). Each row is guarded by its ev_rev, so a change
@@ -626,7 +728,7 @@ export async function repairScores(env, user, { now = Date.now(), limit = 30, si
           LEFT JOIN topic_scores s ON s.user_id = e.user_id AND s.topic_id = e.topic_id
           WHERE e.user_id = ?1 AND e.topic_id IS NOT NULL AND e.updated_at > ?2
             AND (s.topic_id IS NULL OR s.evidence_at IS NULL OR e.updated_at > s.evidence_at) LIMIT ?3`).bind(user, from, n),
-      env.DB.prepare('SELECT topic_id FROM topic_scores WHERE user_id = ?1 AND formula_version < ?2 LIMIT ?3').bind(user, WEIGHTS_VERSION, n),
+      env.DB.prepare('SELECT topic_id FROM topic_scores WHERE user_id = ?1 AND formula_version IS NOT ?2 LIMIT ?3').bind(user, WEIGHTS_VERSION, n),
       env.DB.prepare(`SELECT tp.id AS topic_id FROM topics tp LEFT JOIN topic_scores s ON s.user_id = tp.user_id AND s.topic_id = tp.id
           WHERE tp.user_id = ?1 AND tp.status IN ('proposed', 'confirmed') AND s.topic_id IS NULL LIMIT ?2`).bind(user, n),
       env.DB.prepare(`SELECT s.topic_id FROM topic_scores s JOIN topics tp ON tp.user_id = s.user_id AND tp.id = s.topic_id
@@ -634,13 +736,19 @@ export async function repairScores(env, user, { now = Date.now(), limit = 30, si
           WHERE s.user_id = ?1 AND tp.status IN ('proposed', 'confirmed')
             AND (s.category_id IS NOT tp.category_id OR (p.prior IS NOT NULL AND abs(s.prior_mastery - p.prior) >= ?2)) LIMIT ?3`)
         .bind(user, PRIOR_MOVE, n),
+      // A seen row from before 0055 has no evidence strength or trend basis yet: recomputed like a stale one, 30 at a time.
+      env.DB.prepare('SELECT topic_id FROM topic_scores WHERE user_id = ?1 AND seen = 1 AND fsrs_real_n IS NULL LIMIT ?2').bind(user, n),
     ]);
   } catch (e) {
     if (noTable(e)) return { ids: [], error: 'not_ready' };
+    await noteJob(env, { job: 'scores_version', key: `v${WEIGHTS_VERSION}`, state: 'failed', detail: e, add: true, at: now, user });
     throw e;
   }
   const found = [...new Set(res.flatMap(r => (r.results || []).map(x => x.topic_id)).filter(Boolean))].slice(0, n);
   if (found.length) await env.DB.batch([dirtyInsert(env.DB, user, found, 'repair', now)]);
+  // A new WEIGHTS_VERSION recomputes every topic once, 30 at a time: one Recent activity line for the whole run.
+  const stale = (res[1].results || []).length;
+  if (stale) await noteJob(env, { job: 'scores_version', key: `v${WEIGHTS_VERSION}`, state: 'ok', counts: { topics: stale, version: WEIGHTS_VERSION }, add: true, at: now, user });
   return { ids: found };
 }
 
@@ -662,16 +770,26 @@ export async function refreshPriors(env, user, { now = Date.now() } = {}) {
     reads.push(env.DB.prepare(`SELECT sum(b.correct) AS correct, sum(b.scored) AS scored FROM blocks b JOIN sittings st ON st.id = b.sitting_id
         WHERE st.status = 'done' AND b.ended_at >= ?1 AND b.scored > 0`).bind(from));
   }
-  let res;
-  try { res = await env.DB.batch(reads); } catch (e) {
-    if (noTable(e)) return { priors: {}, g: null, written: 0, error: 'not_ready' };
-    throw e;
+  // The adopted starting guess (starting-guess.js), read in the same batch; before 0051 there is none.
+  const guessRead = env.DB.prepare(LATEST_GUESS_SQL).bind(user);
+  let res, guessRow = null;
+  try {
+    res = await env.DB.batch([...reads, guessRead]);
+    guessRow = (res.pop().results || [])[0] || null;
+  } catch (e) {
+    if (!noTable(e)) throw e;
+    try { res = await env.DB.batch(reads); } catch (e2) {
+      if (noTable(e2)) return { priors: {}, g: null, written: 0, error: 'not_ready' };
+      throw e2;
+    }
   }
   const groups = res[0].results || [];
   const nbme = res[3] ? (res[3].results || [])[0] || {} : {};
   const storedRows = res[2].results || [];
   const extra = [...(res[1].results || []).map(p => p.category_id), ...storedRows.map(s => s.topic_category ?? s.category_id)];
-  const { priors, g, priorRows } = priorsFrom(user, groups, nbme, extra, now);
+  let guess = null;
+  try { guess = guessRow && guessRow.params_json ? JSON.parse(guessRow.params_json) : null; } catch { guess = null; }
+  const { priors, g, priorRows } = priorsFrom(user, groups, nbme, extra, now, guess);
   const { writes, events } = rereadScores(user, storedRows, priors, g, now);
   const statements = [...priorUpserts(env.DB, priorRows), ...scoreUpserts(env.DB, writes, { cas: true })];
   if (statements.length) await commit(env, user, statements, events, 'cron:refreshPriors');
@@ -681,7 +799,7 @@ export async function refreshPriors(env, user, { now = Date.now() } = {}) {
 // The prior-reading parts of refreshPriors, shared with taxonomy.remap (which moves topics between systems and
 // so recomputes the priors and every stored score in its own batch, and again on undo).
 
-export function priorsFrom(user, groups, nbme = {}, extraCats = [], now = Date.now()) {
+export function priorsFrom(user, groups, nbme = {}, extraCats = [], now = Date.now(), guess = null) {
   let right = Number(nbme && nbme.correct) || 0, total = Number(nbme && nbme.scored) || 0;
   for (const r of groups) { right += Number(r.right_n) || 0; total += Number(r.n) || 0; }
   const g = total ? gOf(right / total) : PRIOR.g_default;
@@ -695,7 +813,7 @@ export function priorsFrom(user, groups, nbme = {}, extraCats = [], now = Date.n
   const priors = {};
   const priorRows = [];
   for (const [category_id, c] of cats) {
-    priors[category_id] = priorOf(c.n, c.right_n, g);
+    priors[category_id] = guessM0(guess, category_id) ?? priorOf(c.n, c.right_n, g);
     priorRows.push({ user_id: user, category_id, prior: round(priors[category_id], 6), right_n: c.right_n, n: c.n, g: round(g, 6), updated_at: now });
   }
   return { priors, g, priorRows };

@@ -90,12 +90,12 @@ export function attachOnOpen(env, user, topicId) {
   return matchPictures(env, user, { topicId }).catch(e => { if (!(e instanceof AnkiError) && !noTable(e)) console.error('pictures on open failed', e && e.message); return null; });
 }
 
-/** topicDetail's read: the topic's pictures that are not hidden. */
 export function pictureStatement(env, user, topicId) {
-  return env.DB.prepare(`SELECT source, ref, title FROM topic_pictures WHERE user_id = ? AND topic_id = ? AND hidden_at IS NULL ORDER BY created_at, ref LIMIT ${PICTURES_MAX}`)
-    .bind(user, topicId);
+  return env.DB.prepare(`SELECT source, ref, title, matched_by FROM topic_pictures WHERE user_id = ? AND topic_id = ? AND hidden_at IS NULL
+    ORDER BY CASE source WHEN 'anking' THEN 0 WHEN 'nbme_hy' THEN 1 ELSE 2 END, created_at, ref LIMIT ${PICTURES_MAX}`).bind(user, topicId);
 }
-export const shapePictures = rows => (rows || []).map(p => ({ id: `pic_${p.source}_${p.ref}`, src: `/api/map/pictures/${encodeURIComponent(p.ref)}`, source: p.source, ref: p.ref, title: p.title || null }));
+export const shapePictures = rows => (rows || []).map(p => ({ id: `pic_${p.source}_${p.ref}`, src: `/api/map/pictures/${encodeURIComponent(p.ref)}`, source: p.source, ref: p.ref,
+  title: p.title || null, ...(String(p.matched_by || '').startsWith('auto') ? { auto: true } : {}) }));
 
 // ---------------------------------------------------------------- hiding (op topic_picture.hide)
 
@@ -103,15 +103,45 @@ export async function planPictureHide(env, user, args, ctx) {
   const a = args || {};
   for (const k of Object.keys(a)) if (!['topic_id', 'ref'].includes(k)) return { refuse: `Unknown argument ${k}.` };
   if (typeof a.topic_id !== 'string' || !a.topic_id || typeof a.ref !== 'string' || !REF.test(a.ref)) return { refuse: 'topic_id and ref name the picture to hide.' };
-  const p = await env.DB.prepare(`SELECT p.hidden_at, p.title, t.name FROM topic_pictures p LEFT JOIN topics t ON t.user_id = p.user_id AND t.id = p.topic_id
-    WHERE p.user_id = ? AND p.topic_id = ? AND p.source = 'anking' AND p.ref = ?`).bind(user, a.topic_id, a.ref).first();
+  const p = await env.DB.prepare(`SELECT p.source, p.hidden_at, p.title, t.name FROM topic_pictures p LEFT JOIN topics t ON t.user_id = p.user_id AND t.id = p.topic_id
+    WHERE p.user_id = ? AND p.topic_id = ? AND p.ref = ? ORDER BY p.hidden_at IS NULL DESC LIMIT 1`).bind(user, a.topic_id, a.ref).first();
   if (!p) return { refuse: 'That picture is not on this topic.' };
   if (p.hidden_at != null) return { noop: true, summary: 'That picture is already hidden here.' };
-  const summary = summaryOf(`AnKing picture hidden on ${p.name || a.topic_id}`);
+  const summary = summaryOf(`${SOURCE_WORD[p.source] || 'AnKing'} picture hidden on ${p.name || a.topic_id}`);
   return {
-    rows: [{ table: 'topic_pictures', op: 'soft_delete', key: { topic_id: a.topic_id, source: 'anking', ref: a.ref }, before: { hidden_at: null }, after: { hidden_at: ctx.now } }],
+    rows: [{ table: 'topic_pictures', op: 'soft_delete', key: { topic_id: a.topic_id, source: p.source, ref: a.ref }, before: { hidden_at: null }, after: { hidden_at: ctx.now } }],
     events: [{ target_type: 'topic_pictures', target_id: a.ref, topic_id: a.topic_id, summary }], summary, reply: { topic_id: a.topic_id, ref: a.ref },
   };
+}
+
+// ---------------------------------------------------------------- the picture job's adds (op topic_picture.auto)
+
+export const AUTO_SOURCES = ['anking', 'nbme_hy', 'anki'];
+const SOURCE_WORD = { anking: 'AnKing', nbme_hy: 'NBME High Yield', anki: 'AnKing card' };
+
+export async function planPictureAuto(env, user, args, ctx) {
+  const a = args || {};
+  for (const k of Object.keys(a)) if (!['topic_id', 'pictures'].includes(k)) return { refuse: `Unknown argument ${k}.` };
+  if (typeof a.topic_id !== 'string' || !a.topic_id) return { refuse: 'topic_id is the topic the pictures belong to.' };
+  const list = Array.isArray(a.pictures) ? a.pictures : [];
+  if (!list.length || list.length > AUTO_SOURCES.length) return { refuse: `pictures is a list of 1 to ${AUTO_SOURCES.length}, one from each library.` };
+  const t = await env.DB.prepare(`SELECT name, status FROM topics WHERE user_id = ? AND id = ?`).bind(user, a.topic_id).first();
+  if (!t || ['retired', 'merged'].includes(t.status)) return { refuse: 'There is no topic with that id on the map.' };
+  const held = (await env.DB.prepare(`SELECT source, ref FROM topic_pictures WHERE user_id = ? AND topic_id = ?`).bind(user, a.topic_id).all()).results || [];
+  const has = new Set(held.map(r => r.source)), refs = new Set(held.map(r => r.ref));
+  const rows = [], events = [];
+  for (const p of list) {
+    if (!p || !AUTO_SOURCES.includes(p.source) || typeof p.ref !== 'string' || !REF.test(p.ref)) return { refuse: 'Each picture is {source, ref, title, by} from one of his libraries.' };
+    if (has.has(p.source) || refs.has(p.ref)) continue;
+    has.add(p.source);
+    const title = String(p.title || '').replace(/\s+/g, ' ').trim().slice(0, 200) || null;
+    rows.push({ table: 'topic_pictures', op: 'insert', key: { topic_id: a.topic_id, source: p.source, ref: p.ref }, before: null,
+      after: { title, matched_by: `auto:${p.by === 'claude' ? 'claude' : 'name'}`, created_at: ctx.now, hidden_at: null } });
+    events.push({ target_type: 'topic_pictures', target_id: p.ref, topic_id: a.topic_id, summary: summaryOf(`${SOURCE_WORD[p.source]} picture added automatically to ${t.name}`) });
+  }
+  if (!rows.length) return { noop: true, summary: 'Those pictures are already on the topic, or Mo removed them.' };
+  const summary = rows.length === 1 ? events[0].summary : summaryOf(`${rows.length} pictures added automatically to ${t.name}`);
+  return { rows, events, summary, reply: { topic_id: a.topic_id, added: rows.map(r => ({ source: r.key.source, ref: r.key.ref })) } };
 }
 
 // ---------------------------------------------------------------- routes
@@ -133,12 +163,15 @@ export async function hideRoute(request, env, ctx, params, url, user) {
     args: { topic_id: String(params.id || ''), ref: String(params.ref || '') } }));
 }
 
-// GET /api/map/pictures/:ref: from the Anki server (show_picture), never stored here.
 export async function pictureRoute(request, env, ctx, params, url, user) {
   const ref = String(params.ref || '');
   if (!REF.test(ref)) return json({ error: 'There is no picture with that name.' }, 404);
+  const card = /^card_(\d{6,16})$/.exec(ref);
   let r;
-  try { r = await ankiCallFull(env, 'show_picture', { names: [ref] }, { timeoutMs: 15_000 }); } catch (e) {
+  try {
+    r = card ? await ankiCallFull(env, 'get_card_images', { card_id: Number(card[1]), max_images: 1 }, { timeoutMs: 20_000 })
+      : await ankiCallFull(env, 'show_picture', { names: [ref] }, { timeoutMs: 15_000 });
+  } catch (e) {
     if (e instanceof AnkiError) return json({ error: 'The Anki server could not be reached for that picture.' }, 502);
     throw e;
   }

@@ -1,10 +1,25 @@
 import { londonDay } from '../util.js';
+import { planFactor, lessonFactor, feedbackEffects, orderKey } from '../forecast/teach-factor.js';
+import { TEACH } from '../forecast/constants.js';
 import { errorKeyOf } from './weights.js';
 import { pairOrder as linkPairOrder, orderName } from './links.js';
 import { buildProfile } from '../profiles.js';
 import { rankJoin, RANK_COLS, examRankText } from '../exam-ranks.js';
+import { CONCEPT_ROWS_SQL, conceptRowsOf } from './concepts.js';
+import { WEAK_BANDS } from '../../../public/js/shared/concept.js';
+import { stateSelect, liveMap, overlay, weakestCategories } from './live.js';
+import { examDayOf, daysToExam, EXAM_DATE_SQL } from '../exam-day.js';
 
-export const EXAM_DAY = '2027-06-30';
+export const LIVE_CAND_SQL = `SELECT s.topic_id, s.category_id, t.yield, s.t, s.band, s.mastery, s.weakness, s.weakness_raw, s.certainty, s.certainty_level, ${stateSelect('s')}
+  FROM topic_scores s JOIN topics t ON t.user_id = s.user_id AND t.id = s.topic_id
+  WHERE s.user_id = ?1 AND s.seen = 1 AND t.status IN ('proposed','confirmed')`;
+export const SEEN_CANDIDATES = 60;
+/** The seen candidates (pure): the SEEN_CANDIDATES largest yield x live ungated weakness. */
+export function seenCandidates(live) {
+  return [...live.values()].map(r => ({ id: r.topic_id, g: (Number(r.yield) || 0) * (Number(r.weakness_raw) || 0) }))
+    .sort((a, b) => b.g - a.g || String(a.id).localeCompare(String(b.id))).slice(0, SEEN_CANDIDATES).map(x => x.id);
+}
+
 const DAY_MS = 86_400_000;
 const HOUR_MS = 3_600_000;
 
@@ -22,10 +37,15 @@ export const PHASES = [
   { name: 'rest', minD: -Infinity, a: 0, lesson_minutes: 3, lanes: ['A', 'B'], pair_upgrade: false, mode: 'patch', rest: true },
 ];
 
-export function daysLeft(today = londonDay()) {
-  return Math.round((Date.parse(EXAM_DAY + 'T12:00:00Z') - Date.parse(today + 'T12:00:00Z')) / DAY_MS);
+export const OPEN_PHASE = Object.freeze({ ...PHASES[0], name: 'open', minD: null, open: true });
+
+/** Days from today to the exam date (the exam_date setting, passed in): null with no exam set. */
+export function daysLeft(today = londonDay(), examDay = null) {
+  return daysToExam(today, examDay);
 }
+/** The phase for d days left; no exam (null) or an exam in the past is the open phase. */
 export function phaseFor(d) {
+  if (d == null || !Number.isFinite(d) || d < 0) return OPEN_PHASE;
   return PHASES.find(p => d >= p.minD);
 }
 
@@ -82,6 +102,8 @@ export function pairGain(gA, gB) {
   return (gA + 0.6 * gB) / 1.3;
 }
 export const PAIR_CONFUSION = 0.5;
+// The planner's pair test is not offered again within this many days of one on either topic.
+export const PAIR_RECENT_DAYS = TEACH.pair_recent_days;
 
 // The exclusion that keeps a topic out of the pick, or null (E4 makes a topic eligible, so it is a flag).
 // row.last: the latest finished lesson on the topic {outcome, ended_at, card_action}; row.last_fail_at: the newest fail-side
@@ -119,12 +141,19 @@ export function rankTopics(rows, ctx) {
   for (const row of rows) {
     const scored = { ...row, Y: yieldOf(row), N: nOf(row, ctx.phase), K: kOf(row), T: tieBreak(row), lane: laneOf(yieldOf(row)) };
     scored.gain = scored.Y * scored.N * scored.K * scored.T;
+    // The planner (ctx.planner, teach-plan.js): the better of its lesson and pair-test values is the score (One list,
+    // 1 Nov 2026). Patch phases teach lessons only, so no pair test there.
+    const pairOff = !!((ctx.phase && ctx.phase.mode) || (ctx.pairOff && ctx.pairOff.has(row.topic_id)));
+    if (ctx.planner) scored.plan = planFactor(ctx.planner, row.topic_id, { pairOff, fb: ctx.feedback || null });
+    scored.score = scored.plan ? (scored.plan.planned ? scored.plan.best : 0) : scored.gain;
     scored.previous_angle_failed = !!(row.last && row.last.outcome === 'not_landed');
-    const rule = exclusion(row, ctx);
+    const named = ctx.named && ctx.named.has(row.topic_id);
+    const rule = exclusion(row, ctx) || (scored.plan && scored.plan.hidden && !named ? 'hidden' : null);
     if (rule) excluded.push({ topic_id: row.topic_id, rule });
     else ranked.push(scored);
   }
-  ranked.sort((a, b) => b.gain - a.gain || b.Y - a.Y || String(a.topic_id).localeCompare(String(b.topic_id)));
+  const planned = r => (r.plan && r.plan.planned ? 1 : 0);
+  ranked.sort((a, b) => planned(b) - planned(a) || b.score - a.score || b.gain - a.gain || b.Y - a.Y || String(a.topic_id).localeCompare(String(b.topic_id)));
   if (ctx.topicsDay && ranked.length > 1) interleave(ranked, ctx.lastCategories || []);
   return { ranked, excluded };
 }
@@ -133,8 +162,9 @@ export function rankTopics(rows, ctx) {
 // another category goes first if it is worth at least 0.85 of the top.
 export function interleave(ranked, lastCategories) {
   if (!lastCategories.length || !lastCategories.includes(ranked[0].category_id)) return ranked;
-  const i = ranked.findIndex(r => !lastCategories.includes(r.category_id));
-  if (i > 0 && ranked[i].gain >= 0.85 * ranked[0].gain) ranked.unshift(ranked.splice(i, 1)[0]);
+  const i = ranked.findIndex(r => !lastCategories.includes(r.category_id) && !!(r.plan && r.plan.planned) === !!(ranked[0].plan && ranked[0].plan.planned));
+  const val = r => (r.score != null ? r.score : r.gain);
+  if (i > 0 && val(ranked[i]) >= 0.85 * val(ranked[0])) ranked.unshift(ranked.splice(i, 1)[0]);
   return ranked;
 }
 
@@ -166,7 +196,7 @@ export function whyLine(row, servedBy, extra = {}) {
   if (row.sure_wrong_60d) bits.push(`${plural(row.sure_wrong_60d, 'sure-and-wrong miss', 'sure-and-wrong misses')}`);
   if (row.misses_60d && row.misses_60d > (row.sure_wrong_60d || 0)) bits.push(`${plural(row.misses_60d, 'miss', 'misses')} in 60 days`);
   if (row.slow_60d) bits.push('slow answers');
-  if (row.overdue) bits.push('a re-test is due');
+  if (row.overdue) bits.push('a miss on it is due a check');
   if (row.last && row.last_fail_at && row.last_fail_at > (row.last.ended_at || 0)) bits.push('a miss since the last lesson');
   if (row.confused && extra.partner) bits.push(`mixed up with ${extra.partner}`);
   else if (row.confused) bits.push('a mixed-up look-alike');
@@ -231,7 +261,8 @@ export function choose(data, opts = {}) {
   }
 
   const ctx = { phase: data.phase, now, skip: opts.skip || new Set() };
-  const gapPick = (data.gaps || []).map(g => ({ ...g, topic_id: resolve(g.topic_id) })).filter(g => {
+  // With the planner a stated gap is evidence the planner already weighs (One list, 1 Nov 2026), not a tier of its own.
+  const gapPick = data.planner ? null : (data.gaps || []).map(g => ({ ...g, topic_id: resolve(g.topic_id) })).filter(g => {
     const row = byId.get(g.topic_id);
     if (!row || isSlipGap(g) || now - g.at > 7 * DAY_MS) return false;
     if (!data.laneless && laneOf(yieldOf(row)) !== 'A' && laneOf(yieldOf(row)) !== 'B') return false;
@@ -246,7 +277,11 @@ export function choose(data, opts = {}) {
   const top = ranked.find(r => !ctx.skip.has(r.topic_id));
   if (!top) return { none: true };
   const pick = wrap('pick', top.topic_id);
-  if (data.phase.pair_upgrade && opts.mode !== 'patch') {
+  // The planner's better action for the top topic is a pair test with its look-alike: teach_next defaults to pair_test.
+  if (top.plan && top.plan.action === 'pair' && top.plan.partner && opts.mode !== 'patch' && !data.phase.mode) {
+    pick.pair = { topic_id: top.plan.partner, ...linkBetween(data, top.topic_id, top.plan.partner) };
+    pick.planned = 'pair_test';
+  } else if (data.phase.pair_upgrade && opts.mode !== 'patch' && !data.planner) {
     const partner = bestPartner(data, top);
     if (partner) pick.pair = partner;
   }
@@ -254,6 +289,38 @@ export function choose(data, opts = {}) {
 }
 
 const round3 = x => Math.round(x * 1000) / 1000;
+
+export function nextUp(data, { limit = 10, skip = new Set() } = {}) {
+  if (!data || !data.ok || (data.phase && data.phase.rest)) return [];
+  const out = [], seen = new Set();
+  for (const r of data.ranked || []) {
+    if (skip.has(r.topic_id)) continue;
+    const partner = r.plan && r.plan.action === 'pair' && r.plan.partner ? r.plan.partner : null;
+    const id = partner ? orderKey(`pair:${r.topic_id}:${partner}`) : `lesson:${r.topic_id}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const p = partner && data.byId ? data.byId.get(partner) : null;
+    out.push({ id, kind: partner ? 'pair' : 'lesson', topic_id: r.topic_id, name: r.name,
+      ...(partner ? { partner_id: partner, partner_name: (p && p.name) || partner } : {}), planned: !!(r.plan && r.plan.planned), row: r });
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+/** An item in plain words: "Ascites", or "Ascites against Nephrotic syndrome" for a pair test. */
+export const itemName = it => (it.kind === 'pair' && it.partner_name ? `${it.name} against ${it.partner_name}` : it.name);
+
+/** The order the planner follows for its lesson-type steps (forecast/model.js candidates): ids and topics only. */
+export const orderOf = items => (items || []).map(i => ({ id: i.id, kind: i.kind, topic_id: i.topic_id, ...(i.partner_id ? { partner_id: i.partner_id } : {}) }));
+
+/**
+ * rankTopicsFor with the planner's values always there (worked out now when none fresh is stored), and nextUp over it:
+ * {data, items}. Every surface calls this, so all read the same stored plan row. opts: rankTopicsFor's, plus limit.
+ */
+export async function nextUpFor(env, user, opts = {}) {
+  const data = await rankTopicsFor(env, user, { ...opts, plan_live: true });
+  return { data, items: nextUp(data, { limit: opts.limit || 10 }) };
+}
 
 // Follows merged_into at most 5 hops; a retired end resolves to itself (callers drop it).
 export function resolveMerged(id, merged = new Map()) {
@@ -300,6 +367,74 @@ export function topPair(data) {
   return best;
 }
 
+
+// The map's Shaky band is coded 'mixed' (scale.js BANDS); concept.js lists 'shaky', so both count here.
+const WEAK_SET = new Set([...WEAK_BANDS, 'mixed']);
+/** Whether a cluster is worth a lesson (pure): 2+ clinical members weak or shaky that share a mix-up pair or the root. */
+export function teachable(cluster, bandOf = m => m.band) {
+  const members = (cluster && cluster.members) || [];
+  const weak = new Set(members.filter(m => m.kind !== 'concept' && WEAK_SET.has(bandOf(m))).map(m => m.id));
+  if (weak.size < 2) return { ok: false, weak: [...weak], pair: false, root: false };
+  const pair = ((cluster && cluster.pairs) || []).some(p => weak.has(p.a) && weak.has(p.b));
+  const rootId = cluster && cluster.root && cluster.root.id;
+  const tied = members.filter(m => weak.has(m.id) && m.id !== rootId && m.root_tie).length;
+  const root = tied >= 2 || (weak.has(rootId) && tied >= 1);
+  return { ok: pair || root, weak: [...weak], pair, root };
+}
+
+export function clusterValue(cluster, data) {
+  let v = 0;
+  const plan = data && data.planner;
+  for (const m of (cluster && cluster.members) || []) {
+    const row = data && data.byId ? data.byId.get(m.id) : null;
+    const n = row ? (row.N != null ? Number(row.N) : row.seen && row.weakness_raw != null ? Number(row.weakness_raw) : null) : null;
+    const part = n != null && Number.isFinite(n) ? yieldOf(row) * n * (Number(m.density) || 0) : Number(m.cost) || 0;
+    v += plan ? part * lessonFactor(plan, m.id) : part;
+  }
+  return Math.round(v * 1000) / 1000;
+}
+
+/**
+ * Which cluster "teach me" serves, or null (pure). clusters: readClusters' rows; data: rankTopicsFor's. opts: {skip: Set
+ * (topic or cluster ids), clusterId (a tap or "(cluster: k_…)"), topicId (mode cluster with a topic: its cluster), force
+ * (mode cluster: no comparison with the topics), now}. Returns {cluster, value, top_gain, top_name, weak, why} or null.
+ */
+export function chooseCluster(clusters, data, { skip = new Set(), clusterId = null, topicId = null, force = false, now = Date.now() } = {}) {
+  const live = m => { const r = data && data.byId ? data.byId.get(m.id) : null; return (r && r.band) || m.band; };
+  const lastFail = c => Math.max(0, ...c.members.map(m => Number(((data && data.byId && data.byId.get(m.id)) || {}).last_fail_at) || 0));
+  const named = !!(clusterId || topicId);
+  let list = (clusters || []).filter(c => c && Array.isArray(c.members) && c.members.length);
+  if (clusterId) list = list.filter(c => c.id === clusterId);
+  else if (topicId) list = list.filter(c => c.members.some(m => m.id === topicId));
+  const scored = [];
+  for (const c of list) {
+    const t = teachable(c, live);
+    if (!named) {
+      if (skip.has(c.id) || (c.root && skip.has(c.root.id))) continue;
+      // Taught since its newest miss (or in the last two days when no miss is read): it waits until a miss says it did not stick.
+      if (c.lesson_at && (c.lesson_at >= lastFail(c) || now - c.lesson_at < 2 * DAY_MS)) continue;
+      if (!t.ok) continue;
+    }
+    scored.push({ cluster: c, value: clusterValue(c, data), weak: t.weak, pair: t.pair, root: t.root });
+  }
+  scored.sort((a, b) => b.value - a.value || (a.cluster.id < b.cluster.id ? -1 : 1));
+  const best = scored[0];
+  if (!best) return null;
+  const top = ((data && data.ranked) || []).find(r => !skip.has(r.topic_id)) || null;
+  const topGain = top ? Number(top.score != null ? top.score : top.gain) || 0 : 0;
+  if (!named && !force && !(best.value > topGain)) return null;
+  const nameOf = id => (best.cluster.members.find(m => m.id === id) || {}).name || id;
+  const weakNames = best.weak.map(nameOf);
+  const list3 = weakNames.length > 3 ? `${weakNames.slice(0, 3).join(', ')} and ${weakNames.length - 3} more` : weakNames.length > 1 ? `${weakNames.slice(0, -1).join(', ')} and ${weakNames[weakNames.length - 1]}` : weakNames.join('');
+  const tie = best.root && best.cluster.root && best.cluster.root.name ? `share one root, ${best.cluster.root.name}` : best.pair ? 'get mixed up with each other' : 'sit together';
+  const tail = `; together they cost more than ${top && top.name ? `${top.name} alone` : 'any one topic'}.`;
+  const long = `A cluster: ${list3 || 'its topics'} ${weakNames.length > 1 ? 'are' : 'is'} weak and ${tie}${tail}`;
+  const why = named ? `You asked for this cluster: ${best.cluster.name}.`
+    : long.length <= 200 ? long : `A cluster: ${weakNames.length} weak topics that ${tie}${tail}`;
+  return { cluster: best.cluster, value: best.value, top_gain: Math.round(topGain * 1000) / 1000, top_name: top ? top.name : null, weak: best.weak,
+    why: why.length > 200 ? `${why.slice(0, 197).replace(/[ ,;:]+\S*$/, '')}…` : why };
+}
+
 // ---------------------------------------------------------------- reads
 
 // Which of the named tables exist (one query, remembered: a table that exists stays; a missing one is asked
@@ -324,27 +459,46 @@ export async function tablesPresent(env, user, names) {
 const FAIL_SIDE = `((kind = 'question' AND result IN ('wrong','flawed','omitted')) OR (kind = 'retest' AND outcome = 'missed_again')
   OR kind = 'gap_stated' OR (kind = 'card_check' AND verdict IN ('gap','shaky')))`;
 const noTable = e => /no such table|no such column/i.test(String(e && e.message));
+export const CLUSTERS_READ = `SELECT c.*, (SELECT max(coalesce(l.ended_at, l.started_at)) FROM lessons l WHERE l.user_id = c.user_id AND l.cluster_id = c.id
+    AND l.status IN ('done', 'in_progress')) AS lesson_at,
+    (SELECT count(*) FROM lessons l WHERE l.user_id = c.user_id AND l.cluster_id = c.id AND l.status = 'done') AS lesson_n
+  FROM clusters c WHERE c.user_id = ?1 AND c.status = 'active' ORDER BY c.cost DESC, c.id LIMIT ?2`;
+const noClusters = e => /no such table:?\s*(?:main\.)?clusters\b|no such column:?\s*(?:l\.)?cluster_id/i.test(String(e && e.message));
+let clustersMissing = false;
+export const _resetClustersMissing = () => { clustersMissing = false; planMissing = false; feedbackMissing = false; };
+// The planner's stored values (0073_planner_teach.sql) ride in the same batch, left out the same way before the migration.
+const PLAN_ROW_SQL = 'SELECT at, model_version, plan_json FROM score_plan_coefs WHERE user_id = ?1';
+const noPlanTable = e => /no such table:?\s*(?:main\.)?score_plan_coefs\b/i.test(String(e && e.message));
+let planMissing = false;
+const FEEDBACK_SQL = 'SELECT option_id, action, reason, day, until_day FROM plan_feedback WHERE user_id = ?1 AND day >= ?2';
+const noFeedbackTable = e => /no such table:?\s*(?:main\.)?plan_feedback\b/i.test(String(e && e.message));
+let feedbackMissing = false;
 
 /**
- * Everything the pick needs, in one D1 batch (one query): candidate topics with their stored scores and
+ * Everything the pick needs, in one D1 batch (one query; a second only when a topic faded into the 60 weakest since
+ * its row was written): candidate topics with their scores as of now (live.js: the fade read on the spot) and
  * 60-day evidence counts, lessons of the last 14 days plus open ones, Teach me taps, stated gaps of the last
  * 7 days, mixed-up versus links, merged topics and the three weakest categories.
- * opts: {now?, today?, ids?: [topic ids to include], skip?: [ids], lastCategories?}
+ * opts: {now?, today?, ids?: [topic ids to include], skip?: [ids], lastCategories?, plan_live? (work the planner's values
+ * out when none fresh is stored: teach_next), plan? (a plan already loaded), planner? (false: none), waitUntil?}
  * Returns {ok, now, today, days_left, phase, rows, byId, ranked, excluded, lessons, requests, gaps, links, merged,
- * weak_categories} or {ok: false, reason} when the map tables are not there yet.
+ * weak_categories, planner} or {ok: false, reason} when the map tables are not there yet.
  */
 export async function rankTopicsFor(env, user, opts = {}) {
   const now = opts.now ?? Date.now();
+  // The planner's values (forecast/teach-plan.js): its stored row rides in the batch; none fresh, teach_next works them out.
+  const wantPlan = opts.planner !== false && !opts.plan;
   const today = opts.today ?? londonDay(now);
-  const d = daysLeft(today);
-  const phase = phaseFor(d);
+  // The exam date: the caller's (opts.examDay, null for none), else the setting, read in the batch below.
+  let examDay = opts.examDay !== undefined ? examDayOf(opts.examDay === null ? '' : opts.examDay) : examDayOf(undefined);
+  let d = daysLeft(today, examDay);
+  let phase = phaseFor(d);
   const since60 = now - 60 * DAY_MS, since7 = now - 7 * DAY_MS, since14 = now - 14 * DAY_MS, since72h = now - 72 * HOUR_MS;
-  const extra = JSON.stringify([...new Set((opts.ids || []).filter(Boolean).map(String))].slice(0, 20));
+  const extraIds = [...new Set((opts.ids || []).filter(Boolean).map(String))].slice(0, 20);
   const q = (sql, ...a) => env.DB.prepare(sql).bind(...a);
-  let res;
-  try {
-    res = await env.DB.batch([
-      q(`WITH cand(id) AS (
+  // The candidates: the 60 weakest by their stored rows, and (in ?2, with the named ones) any of the 60 weakest as of now
+  // (live.js) not among them. D1 allows 5 terms in one compound SELECT, so they share the json_each term.
+  const topicsSql = live => q(`WITH cand(id) AS (
            SELECT id FROM (SELECT t.id FROM topics t JOIN topic_scores s ON s.user_id = t.user_id AND s.topic_id = t.id
              WHERE t.user_id = ?1 AND t.status IN ('proposed','confirmed') AND s.seen = 1
              ORDER BY t.yield * coalesce(s.weakness_raw, 0) DESC LIMIT 60)
@@ -379,7 +533,10 @@ export async function rankTopicsFor(env, user, opts = {}) {
          ${rankJoin('u')}
          LEFT JOIN categories c ON c.user_id = t.user_id AND c.id = t.category_id
          LEFT JOIN ev ON ev.topic_id = t.id
-         WHERE t.user_id = ?1`, user, extra, since60, since7, since72h, today),
+         WHERE t.user_id = ?1`, user, JSON.stringify([...new Set([...extraIds, ...live])]), since60, since7, since72h, today);
+  let res;
+  const batch = (withClusters, withPlan, withFeedback) => env.DB.batch([
+      topicsSql([]),
       q(`SELECT id, topic_id, topic_name, pair_topic_id, link_id, kind, status, outcome, served_by, requested_by, request_from, surface_hint,
            requested_at, started_at, ended_at, day, goal, memory_used_json, steps_json, tactics_json, card_action, abandon_reason
          FROM lessons WHERE user_id = ? AND (coalesce(ended_at, started_at, requested_at) >= ? OR status IN ('requested','in_progress'))
@@ -389,31 +546,78 @@ export async function rankTopicsFor(env, user, opts = {}) {
       q(`SELECT id, from_id, to_id, confusion, a_vs_b, b_vs_a, last_confused_at FROM links
          WHERE user_id = ? AND type = 'versus' AND status IN ('active','proposed') AND confusion >= 0.5 ORDER BY confusion DESC LIMIT 200`, user),
       q(`SELECT id, merged_into FROM topics WHERE user_id = ? AND status = 'merged' AND merged_into IS NOT NULL LIMIT 1000`, user),
-      q(`SELECT category_id, avg(t) AS t, count(*) AS n FROM topic_scores WHERE user_id = ? AND seen = 1 AND t IS NOT NULL AND category_id IS NOT NULL
-         GROUP BY category_id HAVING count(*) >= 2 ORDER BY avg(t) DESC LIMIT 3`, user),
+      // The exam_date setting (the weakest systems, once here, come from the live colours below).
+      q(EXAM_DATE_SQL),
       // Each topic's latest finished lesson, however old (a landed one keeps its topic out until later evidence). A pair
       // test teaches nothing, so it is never a topic's last lesson (LRN4-1): it feeds only the link and its items.
       q(`SELECT id, topic_id, outcome, ended_at, card_action FROM (SELECT id, topic_id, outcome, ended_at, card_action,
            row_number() OVER (PARTITION BY topic_id ORDER BY ended_at DESC, id DESC) AS rn FROM lessons
            WHERE user_id = ? AND status = 'done' AND topic_id IS NOT NULL AND coalesce(kind, 'lesson') <> 'pair_test') WHERE rn = 1 LIMIT 2000`, user),
+      q(CONCEPT_ROWS_SQL, user),
+      // The seen topics' states (live.js), so the pick reads each colour as of now: a topic left alone fades.
+      q(LIVE_CAND_SQL, user),
       q(`SELECT profile, profile_json FROM users WHERE id = ?`, user),
+      // The error clusters (clusters.js), for teach_next's cluster pick, in this same batch.
+      ...(withClusters ? [q(CLUSTERS_READ, user, 12)] : []),
+      // The planner's stored values (0073): last, so the slots above keep their places.
+      ...(withPlan ? [q(PLAN_ROW_SQL, user)] : []),
+      ...(withFeedback ? [q(FEEDBACK_SQL, user, addDays(today, -8))] : []),
     ]);
+  let withC = !clustersMissing, withP = wantPlan && !planMissing, withF = !feedbackMissing;
+  try {
+    for (let tries = 0; ; tries++) {
+      try { res = await batch(withC, withP, withF); break; } catch (e) {
+        if (tries < 3 && withC && noClusters(e)) { clustersMissing = true; withC = false; continue; }
+        if (tries < 3 && withP && noPlanTable(e)) { planMissing = true; withP = false; continue; }
+        if (tries < 3 && withF && noFeedbackTable(e)) { feedbackMissing = true; withF = false; continue; }
+        throw e;
+      }
+    }
   } catch (e) {
-    if (noTable(e)) return { ok: false, reason: 'The map is not set up yet.', now, today, days_left: d, phase };
+    if (noTable(e)) return { ok: false, reason: 'The map is not set up yet.', now, today, exam_day: examDay, days_left: d != null && d >= 0 ? d : null, phase };
     throw e;
   }
-  const [topics, lessons, gaps, links, merged, weakCats, lastDone, users] = res.map(r => r.results || []);
+  const [topics1, lessons, gaps, links, merged, examRows, lastDone, concepts, liveRows, users, ...rest] = res.map(r => r.results || []);
   const profile = profileOfRow(users[0]);
   const p = phaseOf(profile, today);
-  return shapeData({ topics, lessons, gaps, links, merged, weakCats, lastDone },
-    { now, today, days_left: p.days_left, phase: p.phase, skip: opts.skip, lastCategories: opts.lastCategories, named: opts.named, laneless: p.laneless, profile: p.laneless ? profile : null });
+  const clusterRows = withC ? rest[0] : undefined;
+  const planRow = withP ? (rest[withC ? 1 : 0] || [])[0] || null : undefined;
+  const feedback = withF ? feedbackEffects(rest[(withC ? 1 : 0) + (withP ? 1 : 0)] || [], today) : null;
+  let planner = opts.plan || null;
+  if (wantPlan) {
+    const tp = await import('../forecast/teach-plan.js');
+    planner = tp.planFromRow(planRow, now);
+    if (!planner && opts.plan_live) planner = await tp.loadTeachPlan(env, user, { now, live: true, waitUntil: opts.waitUntil || null, row: planRow ?? null });
+  }
+  if (opts.examDay === undefined) {
+    examDay = examDayOf(examRows && examRows[0] ? examRows[0].value : undefined);
+    d = daysLeft(today, examDay);
+    phase = phaseFor(d);
+  }
+  // Past the exam there is no countdown: days_left is null, as with no exam set (the phase is the open one).
+  if (d != null && d < 0) d = null;
+  const live = liveMap(liveRows, now);
+  // A topic among the 60 weakest now that its stored row did not put in the batch (it faded since): one more read, rarely.
+  const have = new Set(topics1.map(r => r.topic_id));
+  const missing = seenCandidates(live).filter(id => !have.has(id));
+  let topics0 = topics1;
+  if (missing.length) {
+    const more = ((await topicsSql(missing).all()).results || []).filter(r => !have.has(r.topic_id));
+    topics0 = [...topics1, ...more];
+  }
+  const topics = overlay(topics0, live);
+  const weakCats = weakestCategories(live);
+  return { ...shapeData({ topics, lessons, gaps, links, merged, weakCats, lastDone }, { now, today, exam_day: p.laneless ? null : examDay, days_left: p.laneless ? p.days_left : d,
+      phase: p.laneless ? p.phase : phase, skip: opts.skip, lastCategories: opts.lastCategories, named: opts.named, planner, feedback,
+      laneless: p.laneless, profile: p.laneless ? profile : null }),
+    concepts: conceptRowsOf(concepts), ...(clusterRows ? { cluster_rows: clusterRows } : {}) };
 }
 
 /**
  * Turns the read rows into ranked data (pure; the tests feed it fixtures). Lessons give each topic its latest
  * finished lesson, whether it was taught today, and the categories of today's last two lessons.
  */
-export function shapeData(raw, { now, today, days_left, phase, skip, lastCategories, named, laneless = false, profile = null }) {
+export function shapeData(raw, { now, today, exam_day = null, days_left, phase, skip, lastCategories, named, planner = null, feedback = null, laneless = false, profile = null }) {
   const lessons = raw.lessons || [];
   const merged = new Map((raw.merged || []).map(m => [m.id, m.merged_into]));
   const weak = new Set((raw.weakCats || []).map(c => c.category_id));
@@ -445,13 +649,20 @@ export function shapeData(raw, { now, today, days_left, phase, skip, lastCategor
     && ['in_progress', 'done'].includes(o.status) && (o.started_at || 0) > (l.requested_at || 0));
   const openRequests = lessons.filter(l => l.status === 'requested' && now - (l.requested_at || 0) < 72 * HOUR_MS && !answered(l));
   const lastCats = lastCategories || doneToday.sort((a, b) => (b.ended_at || 0) - (a.ended_at || 0)).slice(0, 2).map(l => catOf(l.topic_id)).filter(Boolean);
+  // A pair tested in the last week (either topic) is not offered again as a pair test (the planner's pick then teaches it).
+  const pairOff = new Set();
+  for (const l of lessons) {
+    const when = Number(l.ended_at || l.started_at) || 0;
+    if (isPairTest(l) && l.status !== 'requested' && now - when < PAIR_RECENT_DAYS * DAY_MS) for (const id of [l.topic_id, l.pair_topic_id]) if (id) pairOff.add(id);
+  }
   const { ranked, excluded } = rankTopics(rows, {
+    planner, pairOff, feedback,
     phase, now, today, skip: new Set(skip || []), named: new Set(named || []), lastCategories: lastCats, topicsDay: isTopicsDay(today),
     requested: new Set(openRequests.filter(l => now - (l.requested_at || 0) < 24 * HOUR_MS).map(l => l.topic_id)),
   });
   for (const r of ranked) byId.set(r.topic_id, r);
   return {
-    ok: true, now, today, days_left, phase, rows, byId, ranked, excluded, lessons, merged, links: raw.links || [], gaps: raw.gaps || [],
+    ok: true, now, today, exam_day, days_left, phase, rows, byId, ranked, excluded, lessons, merged, links: raw.links || [], gaps: raw.gaps || [], planner,
     requests: openRequests,
     weak_categories: [...weak], last_categories: lastCats,
     ...(laneless ? { laneless: true } : {}), ...(profile ? { profile } : {}),

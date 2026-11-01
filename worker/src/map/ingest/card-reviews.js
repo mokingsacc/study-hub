@@ -1,7 +1,8 @@
 import { londonDay, now as nowMs } from '../../util.js';
 import { MO } from '../../users.js';
 import { commit } from './hub.js';
-import { MAX_TOPICS_PER_CARD, mergeReviewRow, reviewChanged } from '../cards.js';
+import { MAX_TOPICS_PER_CARD, mergeReviewRow, reviewChanged, unionReviews } from '../cards.js';
+import { CLINICAL_SQL } from '../card-roots.js';
 
 export const SOURCE = 'card_reviews', PAGE = 200;
 const RATING = { 1: 'again', 2: 'hard', 3: 'good', 4: 'easy' };
@@ -19,7 +20,9 @@ export function cardReviewRows(reviews, topicsOf) {
     const day = londonDay(at);
     const k = `${r.card_id}:${day}`;
     const prev = byKey.get(k);
-    if (!prev || ease < prev.ease || (ease === prev.ease && at < prev.at)) byKey.set(k, { card_id: Number(r.card_id), note_id: r.note_id ?? null, ease, at: prev ? Math.min(prev.at, at) : at, day });
+    const reviews = unionReviews(prev ? prev.reviews : [], [[at, ease]]);
+    if (!prev || ease < prev.ease || (ease === prev.ease && at < prev.at)) byKey.set(k, { card_id: Number(r.card_id), note_id: r.note_id ?? null, ease, at: prev ? Math.min(prev.at, at) : at, day, reviews });
+    else prev.reviews = reviews;
   }
   const rows = [];
   for (const v of byKey.values()) {
@@ -27,7 +30,7 @@ export function cardReviewRows(reviews, topicsOf) {
     topics.forEach((topic_id, slot) => rows.push({
       obs_key: `cardrev:${v.card_id}:${v.day}`, slot, topic_id, kind: 'card_review', at: v.at, day: v.day, source: 'anki_mac',
       card_id: v.card_id, note_id: v.note_id != null ? Number(v.note_id) : null, rating: RATING[v.ease], amount: v.ease,
-      detail_json: JSON.stringify({ ease: v.ease }), held: 0,
+      detail_json: JSON.stringify({ ease: v.ease, reviews: v.reviews }), held: 0,
     }));
   }
   return rows;
@@ -38,10 +41,13 @@ export function cardReviewRows(reviews, topicsOf) {
 // (release-2 review BUG-3). Each run therefore also back-fills up to BACKFILL strongly linked cards that have
 // reviews before the cursor and no card_review row yet.
 export const BACKFILL = 20;
-const REVIEWED = 'c.ease BETWEEN 1 AND 4';
+// An Anki Voice session's ratings (spoken.js device 'voice') are already in Anki's review log, which reaches the map
+// through anki-reviews.js with their review ids (so an undo there takes them off): they never count again from here.
+const REVIEWED = `c.ease BETWEEN 1 AND 4 AND c.session_id NOT IN (SELECT id FROM anki_sessions WHERE device = 'voice')`;
 const AT = 'coalesce(c.answered_at, c.revealed_at, c.shown_at)';
+// Never a root-cause topic (a foundation concept): cards sit on clinical topics only (card-roots.js).
 const TOPICS_OF = `SELECT ct.card_id, ct.topic_id FROM card_topics ct JOIN topics t ON t.user_id = ct.user_id AND t.id = ct.topic_id
-    AND t.status IN ('proposed', 'confirmed') WHERE ct.user_id = ?1 AND ct.strong = 1 AND ct.removed_at IS NULL`;
+    AND t.status IN ('proposed', 'confirmed') AND ${CLINICAL_SQL('t')} WHERE ct.user_id = ?1 AND ct.strong = 1 AND ct.removed_at IS NULL`;
 
 /**
  * The minute job: reviews answered since the cursor, a page at a time, onto the map through one code commit, plus

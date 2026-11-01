@@ -10,8 +10,9 @@
 // there is no mark scheme. On every paper a Record button keeps their spoken thinking (as words) for their Claude.
 // Vanilla JS, text only through textContent (h()), 44 pt targets.
 import { get, post, put, del } from './api.js';
-import { h, icon, btn, linkBtn, toast, field, select, pageHead, loading, errorState, state, busy, confirmSheet, plural, fmtDay, askClaude as ask } from './kit.js';
+import { h, icon, btn, linkBtn, toast, field, select, pageHead, loading, errorState, state, busy, confirmSheet, plural, fmtDay, sheet, askClaude as ask } from './kit.js';
 import { recordButton } from './record.js';
+import { inkBoard } from './ink.js';
 
 const CONF = [['sure', 'Sure'], ['think_so', 'Think so'], ['guess', 'Guess']];
 const CONF_WORD = Object.fromEntries(CONF);
@@ -229,7 +230,89 @@ function confRow(value, onpick) {
   return box;
 }
 
+// ------------------------------------------------------------------ writing on the paper with a pencil (ink.js)
+
+// Write on the paper, or type the answers: their pick for this paper (kept on this device); a paper already written on,
+// or a touch screen (an iPad), starts in writing.
+const modeKey = paper => `sh-exam-mode:${paper.id}`;
+function answerMode(paper) {
+  if (!isExam(paper)) return 'type';
+  let m = null;
+  try { m = localStorage.getItem(modeKey(paper)); } catch { /* private mode */ }
+  if (m === 'write' || m === 'type') return m;
+  return (paper.ink && paper.ink.pages.length) || navigator.maxTouchPoints > 0 ? 'write' : 'type';
+}
+async function switchMode(S, paper, mode) {
+  try { localStorage.setItem(modeKey(paper), mode); } catch { /* private mode */ }
+  await Promise.all([...S.flushers].map(f => f()));
+  try { show(S, (await get(`/api/p/papers/${encodeURIComponent(paper.id)}`)).paper); } catch (e) { toast(e.message); }
+}
+const markPrompt = paper => `Mark my exam "${paper.title || 'my exam'}" on my Study Hub. I wrote my answers on the paper with my pencil.`;
+
+function paintWrite(S, paper) {
+  const { root, back } = S;
+  const board = inkBoard(`/api/p/papers/${encodeURIComponent(paper.id)}/ink/`, { written: (paper.ink && paper.ink.pages) || [] });
+  S.closers.add(() => board.close());
+  S.flushers.add(() => board.flush());
+  let pane = null;
+  const slot = h('div', { class: 'exam-pdf-slot exam-write' });
+  const jump = paper.questions.some(q => q.page)
+    ? h('select', { class: 'input ink-jump', 'aria-label': 'Go to a question', onchange: e => { if (pane && e.target.value) pane.goTo(Number(e.target.value)); e.target.value = ''; } },
+      h('option', { value: '' }, 'Go to question…'), paper.questions.filter(q => q.page).map(q => h('option', { value: String(q.page) }, `Question ${labelOf(q)} · page ${q.page}`)))
+    : null;
+  const blank = btn('Add a blank page', () => { const n = pane && pane.addBlank(); if (!n) toast(pane ? 'Ten extra pages at most.' : 'The paper is still opening.'); }, 'gray', 'note', { cls: 'btn-sm' });
+  const hand = btn('Hand it in', () => handIn(S, paper, board), 'primary', 'check', { cls: 'btn-lg' });
+  const sent = paper.ink && paper.ink.sent_at
+    ? h('section', { class: 'card', style: 'padding:var(--pad);display:grid;gap:10px' },
+      h('b', null, 'Handed in'), h('p', { class: 'foot' }, 'Ask your Claude to mark it. It reads your writing, writes each answer down, then marks it with you against the mark scheme.'),
+      h('div', null, askClaude(markPrompt(paper), 'Mark it with my Claude')))
+    : null;
+  const rec = recordButton({ paperId: paper.id, question: () => null, onSaved: r => { paper.thinking = [...(paper.thinking || []), r]; } });
+  S.closers.add(() => rec.stop());
+  const kicker = `${plural(paper.questions.length, 'question')} · ${paper.out_of} marks${paper.minutes ? ` · ${paper.minutes} min` : ''}`;
+  root.replaceChildren(pageHead(paper.title || 'Exam', { back, kicker }),
+    h('p', { class: 'foot', style: 'margin:-8px 0 12px' }, 'Write on the paper with your pencil, as in the real exam. A finger scrolls. It saves as you write. Run out of lines? Add a blank page. Then hand it in.'),
+    h('div', { class: 'exam-bar' }, examTimer(S, paper), rec, jump),
+    sent,
+    h('div', { class: 'ink-bar' }, board.tools),
+    slot,
+    h('div', { class: 'row', style: 'margin-top:12px;justify-content:space-between;flex-wrap:wrap;gap:8px' },
+      h('span', { class: 'row', style: 'gap:8px' }, blank, h('button', { type: 'button', class: 'linkish foot', onclick: () => switchMode(S, paper, 'type') }, 'Type the answers instead')),
+      hand),
+    h('div', { class: 'row', style: 'margin-top:16px' }, deleteBtn(S)));
+  import('./pdfpane.js').then(({ pdfPane }) => {
+    pane = pdfPane(paper.source.doc_id, { extra: (paper.ink && paper.ink.extra) || 0, onPage: (n, el, c) => board.attach(n, el, c) });
+    S.closers.add(() => pane.close());
+    pane.el.classList.add('exam-write');
+    if (slot.isConnected) slot.replaceWith(pane.el); else pane.close();
+  }).catch(() => toast('The paper could not be opened. Reload to try again.'));
+}
+
+// Hand it in: how sure they were on each question they answered (before any mark scheme), then their Claude marks it.
+async function handIn(S, paper, board) {
+  await board.flush();
+  if (!board.written().length) { toast('Write on the paper first.'); return; }
+  const picks = {};
+  for (const q of paper.questions) if (q.confidence) picks[q.n] = q.confidence;
+  const rows = paper.questions.map(q => h('div', { style: 'display:grid;gap:6px' },
+    h('div', { class: 'spread' }, h('b', null, `Question ${labelOf(q)}`), h('span', { class: 'foot' }, plural(q.marks, 'mark'))),
+    confRow(picks[q.n] || null, c => { picks[q.n] = c; })));
+  const go = btn('Hand it in', null, 'primary', 'check');
+  const s = sheet({ title: 'How sure were you?', sub: 'Tap one for each question you answered; skip the ones you left blank. Your Claude compares it with your marks.', wide: true,
+    body: h('div', { class: 'stack' }, rows), actions: [btn('Not yet', () => s.close(), 'gray'), go] });
+  go.addEventListener('click', () => busy(go, async () => {
+    try {
+      const answers = Object.entries(picks).map(([n, confidence]) => ({ n: Number(n), confidence }));
+      const r = await post(`/api/p/papers/${encodeURIComponent(paper.id)}/hand-in`, { answers });
+      s.close();
+      toast('Handed in. Now ask your Claude to mark it.');
+      show(S, r.paper);
+    } catch (e) { toast(e.message); }
+  }));
+}
+
 function paintAnswer(S, paper) {
+  if (answerMode(paper) === 'write') return paintWrite(S, paper);
   const { app, root, back } = S;
   const exam = isExam(paper);
   const state_ = Object.fromEntries(paper.questions.map(q => [q.n, { answer: q.answer || '', confidence: q.confidence || null }]));
@@ -309,7 +392,8 @@ function paintAnswer(S, paper) {
   const rec = recordButton({ paperId: paper.id, question: () => (current ? { n: current.n, label: labelOf(current) } : null),
     onSaved: r => { paper.thinking = [...(paper.thinking || []), r]; } });
   S.closers.add(() => rec.stop());
-  const bar = h('div', { class: 'exam-bar' }, exam ? examTimer(S, paper) : null, rec, nowOn);
+  const bar = h('div', { class: 'exam-bar' }, exam ? examTimer(S, paper) : null, rec, nowOn,
+    exam ? h('button', { type: 'button', class: 'linkish foot', onclick: () => switchMode(S, paper, 'write') }, 'Write on the paper instead') : null);
   const how = exam
     ? 'The paper is on the left (above on a phone). Write each answer in its box; it saves as you go. Tap how sure you were, then press Mark it at the end. Press Record any time to say your thinking out loud.'
     : 'Answer first, tap how sure you were, then open the mark scheme. Your answers save as you go. Press Record to say your thinking out loud.';
@@ -332,7 +416,7 @@ function paintMarking(S, paper) {
     marks[q.n] = { ticks: new Set(m && m.points ? m.points : []), awardedOnly: m && !m.points ? m.awarded : null, reason: m ? m.reason : null, note: m ? m.note || '' : '', touched: !!m, comment: m ? m.comment : null };
   }
   const dirty = new Set();
-  const schemeFor = n => ((paper.scheme || []).find(x => x.n === n) || {}).points || [];
+  const schemeFor = n => { const e = (paper.scheme || []).find(x => x.n === n) || {}; return e.levels && e.levels.length ? [] : e.points || []; };
   const save = debounced(S, async () => {
     // With mark-scheme points they tick points; without (a past paper with no scheme yet) they give whole marks.
     const list = [...dirty].map(n => ({ n, ...(schemeFor(n).length ? { points: [...marks[n].ticks].sort((a, b) => a - b) } : { awarded: marks[n].awardedOnly ?? 0 }),
@@ -346,7 +430,9 @@ function paintMarking(S, paper) {
 
   const cards = paper.questions.map(q => {
     const m = marks[q.n];
-    const pts = ((paper.scheme || []).find(x => x.n === q.n) || {}).points || [];
+    const entry = (paper.scheme || []).find(x => x.n === q.n) || {};
+    const levels = entry.levels || [];
+    const pts = levels.length ? [] : entry.points || [];   // a level-marked answer: whole marks, the levels to judge by
     const scoreEl = h('span', { class: 'status info' });
     const reasonBox = h('div', { class: 'stack', style: 'gap:8px' });
     const comment = h('p', { class: 'foot', 'aria-live': 'polite' }, m.comment ? `Claude: ${m.comment}` : '');
@@ -398,7 +484,10 @@ function paintMarking(S, paper) {
       h('div', null, h('div', { class: 'spread' }, h('span', { class: 't-micro' }, 'Your answer'), confBadge(q.confidence)),
         hasAnswer ? h('p', { style: 'white-space:pre-wrap;margin-top:6px;color:var(--ink-2)' }, q.answer) : h('p', { class: 'foot', style: 'margin-top:6px' }, 'You left this one blank.')),
       pts.length ? h('div', null, h('div', { class: 't-micro', style: 'margin-bottom:2px' }, 'Mark scheme: tick what you earned'), h('div', null, ticks.map(t => t.row)))
-        : h('div', null, h('div', { class: 't-micro', style: 'margin-bottom:6px' }, 'How many marks did you get? Check the mark scheme, or ask your Claude.'), steps),
+        : h('div', null, levels.length ? h('details', { class: 'thinking', style: 'margin-bottom:8px' }, h('summary', null, 'The levels'),
+          levels.map(l => h('p', { class: 'foot' }, h('b', null, `${l.marks} marks: `), l.text)),
+          (entry.points || []).length ? h('p', { class: 'foot' }, h('b', null, 'Could include: '), entry.points.join(' · ')) : null) : null,
+          h('div', { class: 't-micro', style: 'margin-bottom:6px' }, levels.length ? 'Pick the level that fits, then the mark within it.' : 'How many marks did you get? Check the mark scheme, or ask your Claude.'), steps),
       pts.length ? h('div', { class: 'row' }, ai, h('button', { type: 'button', class: 'btn btn-plain btn-sm', onclick: () => { ticks.forEach(t => { t.cb.checked = false; }); m.ticks.clear(); m.awardedOnly = null; m.touched = true; dirty.add(q.n); save(); redraw(); } }, 'No marks')) : null,
       comment, reasonBox, thinkingFor(paper, q.n));
     redraw();

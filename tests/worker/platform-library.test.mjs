@@ -101,14 +101,16 @@ const rpc = async (s, path, method, params) => {
 // ------------------------------------------------------------------ routes and the module gate
 
 test('routes: 2.5\'s handlers under /api/p/library with the same paths and methods as Mo\'s /api/library, minus objectives', () => {
-  const mine = ROUTES.map(([m, p]) => `${m} ${p}`).sort();
+  // The Study Hub's own additions: folders (0108) here, writing on a document in ink.js.
+  const OWN = ['POST /api/p/library/folders', 'GET /api/p/library/docs/:id/ink', 'GET /api/p/library/docs/:id/ink/:page', 'PUT /api/p/library/docs/:id/ink/:page'];
+  const mine = ROUTES.map(([m, p]) => `${m} ${p}`).filter(r => !OWN.includes(r)).sort();
   const theirs = MO_ROUTES.filter(([, p]) => !p.endsWith('/objectives')).map(([m, p]) => `${m} ${p.replace('/api/library', '/api/p/library')}`).sort();
   assert.deepEqual(mine, theirs);
   assert.ok(!mine.some(r => /objectives/.test(r)));
   assert.ok(mine.length >= 14);
   // They are mounted by the platform's route table, behind a session.
   const mounted = platformRoutes().filter(r => r.pattern.startsWith('/api/p/library'));
-  assert.deepEqual(mounted.map(r => `${r.method} ${r.pattern}`).sort(), mine);
+  assert.deepEqual(mounted.map(r => `${r.method} ${r.pattern}`).sort(), [...mine, ...OWN].sort());
   assert.ok(mounted.every(r => r.who === 'session'));
   assert.ok(features.routes().some(r => r[1] === '/api/p/library/docs/:id/pages'));
 });
@@ -120,7 +122,7 @@ test('the library is behind the module switch: every route and both tools say it
   assert.equal(up.pages.status, 200);
   assert.equal((await api(s, a, 'GET', L)).status, 200);
   const path = await askFor(s, a);
-  assert.deepEqual((await rpc(s, path, 'tools/list')).tools.map(t => t.name).filter(n => n.startsWith('library')), ['library_search', 'library_read', 'library_upload_link', 'library_add_link']);
+  assert.deepEqual((await rpc(s, path, 'tools/list')).tools.map(t => t.name).filter(n => n.startsWith('library')), ['library_search', 'library_read', 'library_folders', 'library_upload_link', 'library_add_link']);
   assert.equal((await api(s, a, 'PATCH', '/api/p/me', { modules: { library: false } })).status, 200);
   for (const [m, p, body] of [['GET', L], ['GET', `${L}/status`], ['GET', `${L}/search?q=osmosis`], ['POST', `${L}/run`, {}], ['POST', `${L}/docs`, { file_name: 'x.pdf', bytes: 5 }],
     ['GET', `${L}/docs/${up.id}`], ['DELETE', `${L}/docs/${up.id}`], ['PUT', `${L}/docs/${up.id}/parts/1`], ['POST', `${L}/docs/${up.id}/complete`, {}],
@@ -445,7 +447,7 @@ test('library_search: top 8, cited by title and page, text capped; through the p
     `- Diffusion in ${WORDS[i]} cells: particles move from a high concentration to a low concentration. ${Array.from({ length: 70 }, (_, k) => WORDS[(i * 7 + k * 3) % WORDS.length] + k).join(' ')}`]));
   const up = await upload(s, a, { title: 'Big book', pages: long });
   assert.ok(TOOLS.every(t => t.module === 'library'));
-  assert.deepEqual(TOOLS.map(t => t.name), ['library_search', 'library_read']);
+  assert.deepEqual(TOOLS.map(t => t.name), ['library_search', 'library_read', 'library_folders']);
   const path = await askFor(s, a);
   const call = await rpc(s, path, 'tools/call', { name: 'library_search', arguments: { query: 'diffusion high concentration to low concentration' } });
   assert.ok(!call.isError, JSON.stringify(call));

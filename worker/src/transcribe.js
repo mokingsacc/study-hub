@@ -58,7 +58,7 @@ export async function transcribe(request, env) {
   const release = await reserveSpend(env, estUsd, hardCap(env), { monthly: false });
 
   const body = toBase64(new Uint8Array(await audio.arrayBuffer()));
-  const r = await runModels(env, { body, contentType: audioType(audio), prompt, clip: clipN || 0 });
+  const r = await runModels(env, { body, contentType: audioType(audio), prompt, clip: clipN || 0, whisperFirst: blockId === UWORLD });
   // One Recent activity line a recording (clips less than 20 minutes apart), saying which model heard each clip.
   if (!micTest) await noteClip(env, blockId === UWORLD ? 'uworld' : blockId === ANKI ? 'anki' : 'exam', r);
   if (!r) {
@@ -83,29 +83,29 @@ export function audioType(audio) {
 }
 
 const NOVA_BASE = { language: 'en', punctuate: true, smart_format: true, utterances: true, utt_split: UTT_SPLIT_S };
-/** The attempts, best first: Nova-3 medical with keyterms, medical alone, plain Nova-3, then Whisper with the prompt. */
-export function attempts({ body, contentType, prompt, clip }) {
+export function attempts({ body, contentType, prompt, clip, whisperFirst = false }) {
   const audio = { body, contentType };
   const keyterm = keytermsFor(prompt, clip);
   const whisper = { audio: body, task: 'transcribe', language: 'en', vad_filter: true, ...(prompt ? { initial_prompt: prompt } : {}) };
-  return [
-    { model: NOVA_MODEL, usdPerMin: NOVA_USD_PER_MIN, inputs: { audio, ...NOVA_BASE, mode: 'medical', ...(keyterm.length ? { keyterm } : {}) } },
-    { model: NOVA_MODEL, usdPerMin: NOVA_USD_PER_MIN, inputs: { audio, ...NOVA_BASE, mode: 'medical' } },
-    { model: NOVA_MODEL, usdPerMin: NOVA_USD_PER_MIN, inputs: { audio, ...NOVA_BASE } },
-    { model: WHISPER_MODEL, usdPerMin: WHISPER_USD_PER_MIN, inputs: whisper },
+  const nova = [
+    { kind: 'nova', model: NOVA_MODEL, usdPerMin: NOVA_USD_PER_MIN, inputs: { audio, ...NOVA_BASE, mode: 'medical', ...(keyterm.length ? { keyterm } : {}) } },
+    { kind: 'plain', model: NOVA_MODEL, usdPerMin: NOVA_USD_PER_MIN, inputs: { audio, ...NOVA_BASE, mode: 'medical' } },
+    { kind: 'plain', model: NOVA_MODEL, usdPerMin: NOVA_USD_PER_MIN, inputs: { audio, ...NOVA_BASE } },
   ];
+  const whisperStep = { kind: 'whisper', model: WHISPER_MODEL, usdPerMin: WHISPER_USD_PER_MIN, inputs: whisper };
+  return whisperFirst ? [whisperStep, ...nova] : [...nova, whisperStep];
 }
 
-export const clipCounts = r => ({ clips: 1, nova: r && r.step === 0 ? 1 : 0, plain: r && (r.step === 1 || r.step === 2) ? 1 : 0, whisper: r && r.step === 3 ? 1 : 0, failed: r ? 0 : 1 });
-const noteClip = (env, ref, r, at = Date.now()) => noteJob(env, { job: 'transcribe', ref, key: `${ref}:${at}`, runMs: 20 * 60_000, add: true, at,
+export const clipCounts = r => ({ clips: 1, nova: r && r.kind === 'nova' ? 1 : 0, plain: r && r.kind === 'plain' ? 1 : 0, whisper: r && r.kind === 'whisper' ? 1 : 0, failed: r ? 0 : 1 });
+export const noteClip = (env, ref, r, at = Date.now()) => noteJob(env, { job: 'transcribe', ref, key: `${ref}:${at}`, runMs: 20 * 60_000, add: true, at,
   state: !r ? 'failed' : r.step === 0 ? 'ok' : 'fallback', counts: clipCounts(r) });
 
-async function runModels(env, clip) {
+export async function runModels(env, clip) {
   for (const [step, a] of attempts(clip).entries()) {
     try {
       const out = await env.AI.run(a.model, a.inputs);
       const r = a.model === NOVA_MODEL ? fromNova(out) : fromWhisper(out);
-      if (r) return { ...r, model: a.model, usdPerMin: a.usdPerMin, step };
+      if (r) return { ...r, model: a.model, usdPerMin: a.usdPerMin, step, kind: a.kind };
     } catch (e) {
       console.error('transcription failed', a.model, a.inputs.mode || '', e && e.message);
     }

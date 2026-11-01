@@ -1,3 +1,4 @@
+import { vivaBrief, lastVivaFor } from './viva.js';
 import { HttpError, json, readJson, londonDay, safeParse } from '../util.js';
 import { teachNext, parseTopic } from '../map/teach-brief.js';
 import { getCustom } from './custom.js';
@@ -19,10 +20,10 @@ import { TOOLS as CARD_TOOLS } from './cards.js';
 
 export const SCHOOL_METHOD_TEXT = [
   'Teach one idea so the student understands it, not just remembers it, in about lesson_minutes (around ten turns). They are 16 to 19 and at school or college in the UK: use plain words, their exam board and tier from topic.subject, and never talk down to them.',
-  '1. Probe, one short question at a time (one to three). If the brief has misconceptions, gaps or lost_marks, ask one new mini-question that puts their own words to work and makes them commit. Otherwise ask two or three across what it is, how it works and how to use it. A right answer moves you up a level; a wrong one gets one nearby question to tell a slip from a gap. A wrong belief that shows up goes in lesson_save misconceptions.add.',
+  '1. Viva first: when the brief has viva, open with viva.prompt word for word and follow viva.how (they talk freely, you mark it with viva_mark, and the plan it returns replaces the probe: teach only those headings). Without viva, probe one short question at a time (one to three). If the brief has misconceptions, gaps or lost_marks, ask one new mini-question that puts their own words to work and makes them commit. Otherwise ask two or three across what it is, how it works and how to use it. A right answer moves you up a level; a wrong one gets one nearby question to tell a slip from a gap. A wrong belief that shows up goes in lesson_save misconceptions.add.',
   '2. Plan: the goal and two or three steps in one sentence, then start. "I know that bit" drops a step.',
   '3. Steps: at most turn_words words before a check (by voice, three short sentences). Ask them to predict before you tell them anything they can work out. Each check uses a tiny new example; feedback in one sentence. Lead with tactics.try. A missed check: repair with a smaller step or another angle (an analogy, a picture, a mnemonic, a side-by-side contrast, a worked example), then check once more; if it fails twice, say so kindly, note it as weak_spot and move on. Count the questions they ask you.',
-  '4. The ending, in this order. (a) Final question: one new exam-style question in your own words, never copied from a past paper, mark scheme, textbook or revision site, with a command word (state, describe, explain, compare, calculate, evaluate, suggest) and marks that fit it (usually 2 to 6). Write your mark scheme first, one point per mark, and keep it hidden. Before marking they say how sure they are: sure, think so or guess. Then mark it with them point by point: each point got or not, and for each lost mark the reason (didn\'t know it, misread the question, calculation or unit slip, exam technique, knew it but couldn\'t apply it). Calculate questions earn method marks; evaluate needs both sides and a judgement. Show the points they missed. (b) Teach-back: "Explain it back to me in about 30 seconds, as if to a friend in the year below." Judge it complete, partial or wrong against the key points, name what is missing in one sentence, and keep their words. (c) "How do you feel about this topic now, 1 to 10?" Never argue with it; then one short "Why?". (d) "What made the most sense, or what did you like most?" Keep their words. (e) "Want a flashcard for this?" Draft one on the point that mattered most (usually a lost mark), show it, and only on yes send it as card {action: "added", front, back}. If cards already covers it, say so instead. No card when the only lost marks were misreads.',
+  '4. The ending, in this order. (a) Final question: one new exam-style question in your own words, never copied from a past paper, mark scheme, textbook or revision site, with a command word (state, describe, explain, compare, calculate, evaluate, suggest) and marks that fit it (usually 2 to 6). Write your mark scheme first, one point per mark, and keep it hidden. Before marking they say how sure they are: sure, think so or guess. Then mark it with them point by point: each point got or not, and for each lost mark the reason (didn\'t know it, misread the question, calculation or unit slip, exam technique, knew it but couldn\'t apply it). Calculate questions earn method marks; evaluate needs both sides and a judgement. Show the points they missed. (b) Teach-back: "Explain it back to me in about 30 seconds, as if to a friend in the year below." If the lesson opened with a viva, the teach-back is the same viva prompt again, marked with viva_mark {phase: "after"} on the same points. Judge it complete, partial or wrong against the key points, name what is missing in one sentence, and keep their words. (c) "How do you feel about this topic now, 1 to 10?" Never argue with it; then one short "Why?". (d) "What made the most sense, or what did you like most?" Keep their words. (e) "Want a flashcard for this?" Draft one on the point that mattered most (usually a lost mark), show it, and only on yes send it as card {action: "added", front, back}. If cards already covers it, say so instead. No card when the only lost marks were misreads.',
   '5. lesson_save once, also when they say "done" early, with everything: steps, final_question with each point marked, teach_back (judgement, missing, their words in text), rating and rating_why, what_clicked, claude_view, questions_asked, tactics_used, misconceptions (add new ones; worked: the ids you probed; closed: only those they beat in this teach-back or final question), card and a summary in your own words. Never send outcome or minutes: the hub works them out and never changes their rating. "Next" or "teach me" again: call teach_next again.',
   'Rules: never put past-paper, mark-scheme, textbook or question-bank text in any field or reply; write everything in your own words. A misread gets no card. By voice: one question at a time, no lists or symbols, numbers said aloud.',
 ].join('\n');
@@ -178,7 +179,7 @@ export async function schoolKnowledgeBrief(env, user, topicId) {
 
 // ------------------------------------------------------------------ teach_next
 
-const NEXT_KEYS = ['topic', 'skip', 'lesson_id', 'peek', 'voice'];
+const NEXT_KEYS = ['topic', 'group', 'skip', 'lesson_id', 'peek', 'voice'];
 
 function checkNext(a) {
   if (!isObj(a)) return 'teach_next takes an object.';
@@ -187,7 +188,31 @@ function checkNext(a) {
   if (a.lesson_id != null && (typeof a.lesson_id !== 'string' || !/^[\w-]{1,40}$/.test(a.lesson_id))) return 'lesson_id is the id teach_next gave.';
   if (a.skip != null && (!Array.isArray(a.skip) || a.skip.length > 10 || a.skip.some(x => typeof x !== 'string' || !x || x.length > 120))) return 'skip is a list of at most 10 topic ids.';
   for (const k of ['peek', 'voice']) if (a[k] != null && typeof a[k] !== 'boolean') return `${k} is true or false.`;
+  if (a.group != null && (!Array.isArray(a.group) || a.group.length < GROUP.min || a.group.length > GROUP.max || a.group.some(x => typeof x !== 'string' || !x.trim() || x.length > 120))) return `group is ${GROUP.min} to ${GROUP.max} of their topics (names or ids).`;
+  if (a.group != null && a.topic != null) return 'Give topic or group, not both.';
   return null;
+}
+
+export const GROUP = { min: 2, max: 6, weak_t: 0.6, suggest: 3 };   // weak: t 600 and over (scale.js BANDS)
+export const GROUP_HOW = 'A group lesson: teach the forest, not the trees. Viva first on the whole group (what they know about each, and how they connect). '
+  + 'Then the one idea, process or skill under all of them, taught first; then each member in a sentence or two as a case of it, and what tells look-alike members apart. '
+  + 'Check with one question that needs two members at once. lesson_save once for the lesson (its topic is the first member); viva_mark each member that the viva covered.';
+
+/** Sections where 2 or more topics are weak now, weakest first: [{section, subject, topics: [{id, name, band}]}]. */
+export async function weakGroups(env, user, { limit = GROUP.suggest } = {}) {
+  const { results } = await statement(env, `SELECT t.id, t.name, u.name AS section, s.name AS subject, sc.band, sc.t
+    FROM topics t JOIN subjects s ON s.user_id = t.user_id AND s.id = t.category_id AND s.status = 'active'
+    JOIN units u ON u.user_id = t.user_id AND u.id = t.unit_id
+    JOIN topic_scores sc ON sc.user_id = t.user_id AND sc.topic_id = t.id
+    WHERE t.user_id = ?1 AND t.status IN ${LIVE} AND sc.seen = 1 AND sc.t >= ?2
+    ORDER BY sc.t DESC LIMIT 200`, user, GROUP.weak_t).all().catch(() => ({ results: [] }));
+  const by = new Map();
+  for (const r of results || []) {
+    const k = `${r.subject}\u0000${r.section}`;
+    if (!by.has(k)) by.set(k, { section: r.section, subject: r.subject, topics: [] });
+    if (by.get(k).topics.length < GROUP.max) by.get(k).topics.push({ id: r.id, name: r.name, band: bandWord(bandOf(Math.round(Number(r.t) * 1000))) });
+  }
+  return [...by.values()].filter(g => g.topics.length >= GROUP.min).slice(0, limit);
 }
 
 const shapeCard = c => ({ id: c.id, front: cap(c.front, 160), back: cap(c.back, 200) });
@@ -228,7 +253,7 @@ function finalSpec(profile, t) {
   };
 }
 
-export function schoolBrief(r, { profile, mods, topic = null, extras = null, knowledge = null } = {}) {
+export function schoolBrief(r, { profile, mods, topic = null, extras = null, knowledge = null, lastViva = null } = {}) {
   if (!isObj(r)) return r;
   if (r.refused) return { refused: true, reason: forStudent(r.reason) };
   const base = { lesson_id: r.lesson_id ?? null, method: schoolMethod() };
@@ -269,6 +294,7 @@ export function schoolBrief(r, { profile, mods, topic = null, extras = null, kno
     final: finalSpec(profile, t),
     method: schoolMethod(),
     queue: (r.queue || []).map(x => ({ ...x, why: forStudent(x.why) })),
+    ...(r.lesson_id && r.topic && r.mode === 'lesson' && !r.carries_on ? { viva: vivaBrief(r.topic, lastViva) } : {}),
     ...(r.say ? { say: forStudent(r.say) } : {}),
     ...(r.answers && r.answers.ready && r.answers.ready.length ? { ready_questions: r.ready_questions, answers: r.answers } : {}),
   };
@@ -292,6 +318,17 @@ export async function teachNextFor(env, user, args = {}, ctx = {}) {
     topic = f.topic;
     call.topic = `${topic.name} (map: ${topic.id})`;
   }
+  let members = null;
+  if (args.group) {
+    members = [];
+    for (const g of args.group) {
+      const f = await findTopic(env, user, g);
+      if (!f.topic) return { lesson_id: null, not_found: true, asked: cap(g, 120), choices: f.choices || [], next_step: 'One of the group is not their topic: ask which they meant, then call teach_next with the group again.' };
+      if (!members.some(m => m.id === f.topic.id)) members.push(f.topic);
+    }
+    topic = members[0];
+    call.topic = `${topic.name} (map: ${topic.id})`;
+  }
   if (args.skip && args.skip.length) call.skip = args.skip;
   if (args.lesson_id) call.lesson_id = args.lesson_id;
   if (args.peek) call.peek = true;
@@ -300,12 +337,21 @@ export async function teachNextFor(env, user, args = {}, ctx = {}) {
   if (r && r.refused) throw new HttpError(400, forStudent(r.reason));
   const id = r && r.topic && r.topic.id;
   if (id && (!topic || topic.id !== id)) topic = await ownTopic(env, user, id);
-  const [extras, knowledge] = id ? await Promise.all([topicExtras(env, user, id).catch(e => { if (noTable(e)) return null; throw e; }),
-    schoolKnowledgeBrief(env, user, id).catch(() => null)]) : [null, null];
-  const brief = schoolBrief(r, { profile: info.profile, mods: info.mods, topic, extras, knowledge });
+  const [extras, knowledge, lastViva] = id ? await Promise.all([topicExtras(env, user, id).catch(e => { if (noTable(e)) return null; throw e; }),
+    schoolKnowledgeBrief(env, user, id).catch(() => null), lastVivaFor(env, user, id).catch(() => null)]) : [null, null, null];
+  const brief = schoolBrief(r, { profile: info.profile, mods: info.mods, topic, extras, knowledge, lastViva });
   // How they asked to be taught (Make it mine, custom.js teach.notes): Claude follows it within the school method.
   const notes = await getCustom(env, user).then(c => c && c.teach && c.teach.notes, () => null);
-  return notes && isObj(brief) && !brief.refused ? { ...brief, their_preferences: notes } : brief;
+  let out = notes && isObj(brief) && !brief.refused ? { ...brief, their_preferences: notes } : brief;
+  if (members && isObj(out) && !out.refused) {
+    out = { ...out, group: { members: members.map(m => ({ id: m.id, name: m.name, section: m.section ?? null, ...chip(m) })), how: GROUP_HOW },
+      ...(out.viva ? { viva: { ...out.viva, prompt: `${members.map(m => m.name).join(', ')}: tell me what you know about each, and how they connect.` } } : {}) };
+  } else if (!args.topic && isObj(out) && !out.refused && !args.peek) {
+    // Today's own pick, with the forest beside it: a section where several topics are weak.
+    const groups = await weakGroups(env, user, { limit: 1 }).catch(() => []);
+    if (groups.length) out = { ...out, forest_option: { ...groups[0], say: `${groups[0].topics.length} topics in ${groups[0].section} are weak. Offer to teach them together (teach_next {group}).` } };
+  }
+  return out;
 }
 
 // ------------------------------------------------------------------ lesson_save
@@ -582,8 +628,8 @@ const JUDGED = ['complete', 'partial', 'wrong'];
 export const TOOLS = [
   {
     name: 'teach_next', module: 'map',
-    description: 'For "teach me", "teach me X" or a Teach me tap (the prompt "Teach me X (map: id)"): call first, once. Picks the topic (or offers today\'s two) and holds the lesson: their gaps, lost marks, misconceptions, cards, past lessons, what they already know, the tactics to lead with and the school method. Teach with method, end with an exam-style question marked point by point, then lesson_save. "Next": call again with skip. peek writes nothing.',
-    inputSchema: obj({ topic: s(120), skip: arr(s(120), 10), lesson_id: s(40), peek: { type: 'boolean' }, voice: { type: 'boolean' } }),
+    description: 'For "teach me", "teach me X" or a Teach me tap (the prompt "Teach me X (map: id)"): call first, once. Picks the topic (or offers today\'s two) and holds the lesson: their gaps, lost marks, misconceptions, cards, past lessons, what they already know, the tactics to lead with and the school method. Teach with method, end with an exam-style question marked point by point, then lesson_save. group: 2 to 6 topics taught together (the big picture). "Next": call again with skip. peek writes nothing.',
+    inputSchema: obj({ topic: s(120), group: arr(s(120), 6), skip: arr(s(120), 10), lesson_id: s(40), peek: { type: 'boolean' }, voice: { type: 'boolean' } }),
     annotations: { readOnlyHint: false, destructiveHint: false },
     run: (env, user, args, ctx) => teachNextFor(env, user, args, ctx),
   },

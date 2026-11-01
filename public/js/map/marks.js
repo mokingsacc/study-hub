@@ -5,20 +5,23 @@
 export const TOPIC_FLAGS = Object.freeze({
   proposed: 1,          // a topic Claude or code suggested, not yet confirmed (dashed ring)
   taught_today: 2,      // a lesson on it ended today (thin outer ring)
-  retest_due: 4,        // a concept re-test on one of its misses is due (dot)
+  retest_due: 4,
   requested: 8,
   teaching_now: 16,     // a lesson on it is running (ring)
   sure_wrong: 32,       // a sure-and-wrong answer on it
   slow: 64,             // an answer over 120 s on it
   checklist: 128,
   gap: 256,
+  // Evidence strength (shared/evidence.js, wave 2 C.4): thin draws the star pale with an outline and no glow; solid is
+  // the most there is; neither bit is "some". Words only through the panel and the card's evidence line, never a mark.
+  thin: 512,
+  solid: 1024,
 });
 
 export const MARK_LINES = [
   ['teaching_now', 'Claude is teaching this now'],
   ['requested', 'You asked to be taught this'],
   ['gap', "You said you don't get this"],
-  ['retest_due', 'Re-test due'],
   ['taught_today', 'Taught today'],
   ['sure_wrong', 'Sure and wrong before'],
   ['slow', 'Slow before (over 2 minutes)'],
@@ -35,7 +38,6 @@ export function markLines(flags) {
 export const MAP_MARKS = Object.freeze([
   ['learn_next', 'Learn next'],
   ['high_priority', 'High-priority teaching'],
-  ['retest_due', 'Re-test due'],
 ]);
 // Where each mark sits, in screen px beyond the star's drawn radius: the ring's gap and width, the triangle's gap and
 // half width, the dot's gap and radius (both renderers read these).

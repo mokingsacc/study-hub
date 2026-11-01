@@ -1,13 +1,21 @@
 import { HttpError, json, readJson, int, now, safeParse } from './util.js';
 import { first, all, run, getBlock, getSitting, getQuestion, getSettings, cardsToday, reserveSpend, spendCap } from './db.js';
-import { callJson } from './claude.js';
+import { callJson, isPending } from './claude.js';
+import { AUDIT_SPECS, checkItem, recordAudit, auditCounts } from './ai-audit.js';
+import { noteJob } from './job-log.js';
 import { imageData } from './images.js';
 import { ankiCall } from './anki.js';
 import { confFor } from '../../public/js/conf-words.js';
 import {
-  JUDGE_SYSTEM, CHECKER_SYSTEM, MEHLMAN_SYSTEM, JUDGE_SCHEMA, CHECKER_SCHEMA, MEHLMAN_SCHEMA,
+  JUDGE_SYSTEM, CHECKER_SYSTEM, MEHLMAN_SYSTEM, JUDGE_SCHEMA, CHECKER_SCHEMA, MEHLMAN_SCHEMA, FIVE_STEPS,
   questionMessage, judgeTask, tieBreakTask, retryTask, mehlmanMessage,
 } from './prompts.js';
+import { tidyCause } from '../../public/js/shared/cause.js';
+import { tidyCore, causeAgreement, consideredNotConfused, FORM_VERSIONS } from './answer-core.js';
+import { nameOthers } from './map/name-map.js';
+import { gapStatement, hasMapCols, hasSignalCols, hasFormCols, mapGaps } from './gaps.js';
+import { releasable } from './map/ingest/map-fields.js';
+import { noteConcepts } from './map/concepts.js';
 import { buildLeakIndex, leakFailures, checkCard, tidyCard, normError, NO_CARD_ERRORS, HUB_CARDS, OUTGOING_FIELDS, cardTexts, leaks } from './checks.js';
 import { MO } from './users.js';
 import { ingestAnalysis, hook } from './map/ingest/hub.js';
@@ -133,13 +141,22 @@ export function resultFailures(r, ctx, index) {
   for (const l of leakFailures(index, r)) {
     f.push(`${l.field === 'card' ? `The card ${l.part}` : `The field ${l.field}`} copies "${l.run}" from the question; rewrite it in your own words.`);
   }
+  const a = auditRow(r, ctx);
+  for (const p of a.missing) if (p !== 'error_type') f.push(`A wrong or right_flawed verdict needs ${p}: it is empty.`);
+  for (const p of a.fake) f.push(`${p} must be Mo's own words copied exactly from his transcript (or empty when he said nothing usable).`);
   return f;
+}
+
+export function auditRow(r, ctx) {
+  const source = (ctx.segments || []).map(s => s.text).join(' ');
+  return checkItem(r || {}, { id: `Q${(ctx.qIndex ?? 0) + 1}`, ...AUDIT_SPECS.nbme_judge(r || {}), source });
 }
 
 // After the one retry: drop whatever still fails rather than let it through.
 export function dropFailing(r, ctx, index) {
   const out = { ...r };
   for (const k of OUTGOING_FIELDS) if (leaks(index, out[k])) out[k] = null;
+  for (const k of auditRow(out, ctx).fake) out[k] = k === 'cause_quote' ? '' : null;
   const et = normError(out.error_type);
   if (out.card) {
     const card = tidyCard(out.card);
@@ -200,7 +217,21 @@ async function judgeLike(env, ctx, index, firstUserText, label) {
 async function checker(env, ctx) {
   const messages = [{ role: 'user', content: [...questionContent(ctx), { type: 'text', text: 'Review this question by the rules and write the JSON.' }] }];
   const { data } = await callJson(env, { role: 'checker', system: CHECKER_SYSTEM, messages, schema: CHECKER_SCHEMA, effort: 'high' });
-  return fixVerdict(data, ctx);
+  const c = fixVerdict(data, ctx);
+  const row = checkItem(c, { id: `Q${(ctx.qIndex ?? 0) + 1} second judge`, ...AUDIT_SPECS.nbme_checker(c), source: (ctx.segments || []).map(x => x.text).join(' ') });
+  for (const k of row.fake) c[k] = '';
+  c.audit = row;
+  return c;
+}
+
+/**
+ * Who settles the cause (pure): the judge and the blind checker on one flagged verdict. 'agreed' when both name the
+ * same cause or either names none; 'cause' when they name different ones (the tie-break settles it before anything
+ * counts). A verdict disagreement already goes to the tie-break.
+ */
+export function causeQuestion(judge, check) {
+  if (!FLAGGED.includes(judge && judge.verdict) || !check || check.verdict !== judge.verdict) return 'agreed';
+  return causeAgreement(judge, check) === 'disputed' ? 'cause' : 'agreed';
 }
 
 function sourceLabel(p) {
@@ -226,6 +257,7 @@ async function mehlman(env, topic, rule) {
     if (!data.fits || !String(data.mehlman_note || '').trim()) return { note: NO_MEHLMAN, src: String(data.mehlman_src || '').trim() || sourceLabel(passages[0]) };
     return { note: String(data.mehlman_note).trim(), src: String(data.mehlman_src || '').trim() || sourceLabel(passages[0]) };
   } catch (e) {
+    if (isPending(e)) throw e;   // waiting for its Message Batch: the analysis waits with it
     // A note is a nice-to-have: whatever went wrong, the analysis still finishes.
     return { note: NO_MEHLMAN, src: sourceLabel(passages[0]), error: e.message };
   }
@@ -257,21 +289,46 @@ async function existingCard(env, r) {
 }
 
 const STORE_COLS = ['verdict', 'flaw_kind', 'error_type', 'paraphrase', 'gap', 'mo_quote', 'cleaned_transcript', 'spoken_answer', 'topic', 'system', 'rule',
-  'look_alike', 'mehlman_note', 'mehlman_src', 'card_json', 'card_decision', 'existing_card_json', 'agreement', 'checker_json', 'decided_by', 'error'];
+  'look_alike', 'mehlman_note', 'mehlman_src', 'card_json', 'card_decision', 'existing_card_json', 'agreement', 'checker_json', 'decided_by', 'error',
+  'cause', 'cause_quote', 'cause_inferred', 'cause_detail',
+  // The step that broke (wave 3, 0058): its facet places the miss on the topic's Diagnose or Manage part.
+  'step',
+  // The answer forms' core and the second judge on the cause (0067): written only by a check that gives them.
+  'heard', 'confidence', 'confidence_words', 'confidence_inferred', 'other_json', 'cause_check', 'form_version'];
+const FORM_STORE = ['heard', 'confidence', 'confidence_words', 'confidence_inferred', 'other_json', 'cause_check', 'form_version'];
 
 export async function saveDone(env, blockId, qIndex, row) {
-  const vals = STORE_COLS.map(k => (k === 'card_decision' ? row[k] || 'pending' : row[k] ?? null));
-  await run(env, `UPDATE analyses SET status = 'done', ${STORE_COLS.map(k => `${k} = ?`).join(', ')}, created_at = ?, attempts = 0 WHERE block_id = ? AND q_index = ?`,
+  const cols = STORE_COLS.filter(k => (k === 'cause_check' || FORM_STORE.includes(k) ? row.form_version != null
+    : k.startsWith('cause') ? row.cause != null : k === 'step' ? row.step != null : true));
+  const vals = cols.map(k => (k === 'card_decision' ? row[k] || 'pending' : row[k] ?? null));
+  await run(env, `UPDATE analyses SET status = 'done', ${cols.map(k => `${k} = ?`).join(', ')}, created_at = ?, attempts = 0 WHERE block_id = ? AND q_index = ?`,
     ...vals, now(), blockId, qIndex);
   // The map (held until the sitting ends); a failure there never fails the check.
   await hook('analysis', () => ingestAnalysis(env, MO, blockId, qIndex));
+}
+
+async function saveOthers(env, ctx, core, ref) {
+  const [map, signals, forms] = await Promise.all([hasMapCols(env), hasSignalCols(env), hasFormCols(env)]);
+  if (!map) return 0;
+  const hold = releasable(ctx.sitting) ? null : { sitting_id: ctx.sitting.id };
+  const made = core.other_conditions.filter(o => o.kind === 'gap').map((o, i) => gapStatement(env, { source: 'spoken_cue',
+    gap: `Unsure about ${o.topic}, shown while answering an exam question on ${ctx.q && ctx.q.num ? `item ${ctx.q.num}` : 'another topic'}.`.slice(0, 200),
+    said: o.quote, topic: o.topic, ref, verdict: 'shaky', ...(forms ? { heard: core.heard, form_version: FORM_VERSIONS.nbme_judge } : {}) },
+    { id: `hub:${ctx.block.id}:${ctx.qIndex}:o${i + 1}`, at: now(), hold, map, signals, forms }));
+  if (!made.length) return 0;
+  await env.DB.batch(made.map(m => m.statement));
+  await mapGaps(env, made.map(m => m.row));
+  return made.length;
 }
 
 async function readRow(env, blockId, qIndex) {
   return first(env, 'SELECT * FROM analyses WHERE block_id = ? AND q_index = ?', blockId, qIndex);
 }
 
-export async function analyze(env, blockId, qIndex, { force = false } = {}) {
+// The words on an analysis row waiting for its Message Batch (the sitting page shows them; sweepBatched looks for them).
+export const BATCH_WAIT = 'Waiting for its batch: checked within the hour.';
+
+export async function analyze(env, blockId, qIndex, { force = false, background = false } = {}) {
   const existing = await readRow(env, blockId, qIndex);
   if (existing && existing.status === 'done' && !force) return existing;
   if (existing && existing.status === 'running' && now() - (existing.created_at || 0) < STALE_MS) return existing;
@@ -308,14 +365,26 @@ export async function analyze(env, blockId, qIndex, { force = false } = {}) {
     const index = buildLeakIndex(ctx.q);
     const [j, c] = await Promise.all([judgeLike(env, ctx, index, judgeTask(), 'judge'), checker(env, ctx)]);
     let final = j.result;
-    let agreement = 'agreed', decidedBy = 'both';
-    const passes = { judge: { verdict: j.result.verdict, flaw_kind: j.result.flaw_kind, error_type: j.result.error_type, retried: j.retried }, checker: c };
-    if (c.verdict !== j.result.verdict) {
+    let agreement = 'agreed', decidedBy = 'both', causeCheck = null;
+    const { audit: checkRow, ...cPass } = c;
+    const passes = { judge: { verdict: j.result.verdict, flaw_kind: j.result.flaw_kind, error_type: j.result.error_type, cause: j.result.cause ?? null, step: j.result.step ?? null,
+      retried: j.retried }, checker: cPass, form_version: FORM_VERSIONS.nbme_judge, checker_form_version: FORM_VERSIONS.nbme_checker };
+    if (causeQuestion(j.result, c) === 'cause') {
+      decidedBy = 'tie-break';
+      const t = await judgeLike(env, ctx, index, tieBreakTask(j.result, c, 'cause'), 'tie-break');
+      passes.tie_break = { on: 'cause', verdict: t.result.verdict, cause: t.result.cause ?? null, step: t.result.step ?? null, retried: t.retried };
+      if (t.result.cause) {
+        final = { ...j.result, cause: t.result.cause, cause_quote: t.result.cause_quote, cause_inferred: t.result.cause_inferred, cause_detail: t.result.cause_detail,
+          ...(FIVE_STEPS.includes(t.result.step) ? { step: t.result.step } : {}) };
+        causeCheck = 'tie-break';
+      } else causeCheck = 'disputed';
+    } else if (c.verdict !== j.result.verdict) {
       agreement = 'disputed';
       decidedBy = 'tie-break';
       const t = await judgeLike(env, ctx, index, tieBreakTask(j.result, c), 'tie-break');
       final = t.result;
-      passes.tie_break = { verdict: t.result.verdict, flaw_kind: t.result.flaw_kind, error_type: t.result.error_type, retried: t.retried };
+      causeCheck = 'tie-break';   // the third look saw both causes too
+      passes.tie_break = { verdict: t.result.verdict, flaw_kind: t.result.flaw_kind, error_type: t.result.error_type, cause: t.result.cause ?? null, retried: t.retried };
       if (!FLAGGED.includes(final.verdict)) {
         const flagger = [j.result, c].find(p => FLAGGED.includes(p.verdict));
         if (flagger) {
@@ -325,10 +394,21 @@ export async function analyze(env, blockId, qIndex, { force = false } = {}) {
         }
       }
     }
+    // The completeness record of this question's check (ai-audit.js): the final answer, after the judge's one retry.
+    const check = await recordAudit(env, { job: 'nbme_judge', key: `${blockId}:${qIndex}`, ref: blockId, rows: [auditRow(final, ctx), checkRow].filter(Boolean), reasked: j.retried ? 1 : 0 });
     const errorType = FLAGGED.includes(final.verdict) ? normError(final.error_type) : null;
     if (NO_CARD_ERRORS.includes(errorType) || !FLAGGED.includes(final.verdict)) final.card = null;
 
     const flagged = FLAGGED.includes(final.verdict);
+    if (flagged && !causeCheck) causeCheck = 'agreed';
+    if (flagged && hasSpeech) {
+      const picked = ((ctx.q && ctx.q.opts) || []).find(o => o && o.l === ctx.finalLetter);
+      const chk = consideredNotConfused(final, { words: final.mo_quote || '', mixed: [final.look_alike], picked: picked ? picked.t : null, fallback: c.cause });
+      if (chk.changed) { final = chk.item; passes.considered = chk.why; }
+    }
+    const core = tidyCore({ ...final, ...(hasSpeech ? {} : { confidence_words: '', cause_quote: '', concept_quote: '', other_conditions: [] }) },
+      { flagged, sound: final.verdict === 'sound', own: [final.topic], safe: v => (v && !leaks(index, v) ? v : null) });
+    if (core.other_conditions.length) core.other_conditions = (await nameOthers(env, MO, core.other_conditions, { own: [final.topic] })).filter(o => !leaks(index, o.topic));
     const [hy, dup] = await Promise.all([
       flagged && final.topic ? mehlman(env, final.topic, final.rule) : Promise.resolve({ note: null, src: null }),
       flagged && final.card && HUB_CARDS ? existingCard(env, final) : Promise.resolve(null),
@@ -340,14 +420,36 @@ export async function analyze(env, blockId, qIndex, { force = false } = {}) {
       paraphrase: final.paraphrase, gap: final.gap, mo_quote: hasSpeech ? final.mo_quote : null,
       cleaned_transcript: hasSpeech ? final.cleaned_transcript : null,
       spoken_answer: letterOf(final.spoken_answer),
-      topic: final.topic, system: final.system, rule: final.rule, look_alike: final.look_alike,
+      topic: final.topic, system: final.system, rule: final.rule, look_alike: final.look_alike || null,
+      ...(flagged ? tidyCause({ ...final, cause_quote: hasSpeech ? final.cause_quote : null }) : {}),
+      ...(flagged && FIVE_STEPS.includes(final.step) ? { step: final.step } : {}),
+      heard: hasSpeech ? core.heard : 'not_said', confidence: core.confidence, confidence_words: core.confidence_words, confidence_inferred: core.confidence_inferred,
+      other_json: core.other_conditions.length ? JSON.stringify(core.other_conditions) : null, cause_check: causeCheck, form_version: FORM_VERSIONS.nbme_judge,
       mehlman_note: hy.note, mehlman_src: hy.src,
       card_json: final.card ? JSON.stringify(final.card) : null,
       existing_card_json: dup ? JSON.stringify(dup) : null,
       agreement, decided_by: decidedBy, checker_json: JSON.stringify(passes), error: null,
     });
+    // The foundation concept the miss rests on (concepts.js): a pending tag the hourly run places; never fails the check.
+    // A sound answer whose words showed the concept understood is a right tag (it waits for the sitting to end).
+    if (core.concept) {
+      const c = tidyCause({ ...final, cause_quote: null });
+      await noteConcepts(env, MO, [{ id: `hub:${blockId}:${qIndex}`, source: 'nbme_judge', block_id: blockId, q_index: qIndex, concept: core.concept,
+        concept_discipline: core.concept_discipline, concept_quote: hasSpeech ? core.concept_quote : null, cause: flagged ? c.cause : null, clinical_name: final.topic, at: now(),
+        polarity: core.concept_polarity, heard: core.heard }]);
+    }
+    if (core.other_conditions.length) await saveOthers(env, ctx, core, `exam ${blockId} Q${qIndex + 1} (other topic)`).catch(e => console.error('nbme other conditions', e && e.message));
+    // One line a block for the checks that came back from their batch, added up (never one a question).
+    if (background) await noteJob(env, { job: 'nbme_check', key: `${blockId}:ok`, ref: blockId, state: 'ok', add: true, counts: { checked: 1, ...auditCounts(check), chk_part: (check && check.part) || 'none' } });
     return readRow(env, blockId, qIndex);
   } catch (e) {
+    // Waiting for its Message Batch (claude.js): the row waits as pending, no try used; the minute cron finishes it
+    // (sweepBatched) and the sitting page shows it once it is done.
+    if (isPending(e)) {
+      await run(env, "UPDATE analyses SET status = 'pending', error = ?, attempts = max(0, attempts - 1) WHERE block_id = ? AND q_index = ?", BATCH_WAIT, blockId, qIndex);
+      if (!background) await noteJob(env, { job: 'nbme_check', key: `${blockId}:held`, ref: blockId, state: 'held', add: true, counts: { batch: 1, n: 1 } });
+      return readRow(env, blockId, qIndex);
+    }
     const msg = e instanceof HttpError ? e.message : 'The analysis failed. Try again.';
     if (!(e instanceof HttpError)) console.error('analysis failed', e && e.stack || e);
     await run(env, "UPDATE analyses SET status = 'error', error = ? WHERE block_id = ? AND q_index = ?", msg, blockId, qIndex);
@@ -373,6 +475,18 @@ async function claim(env, blockId, qIndex, existing) {
     const row = await readRow(env, blockId, qIndex);
     if (row && row.status === 'running' && row.created_at >= t - STALE_MS) throw new HttpError(409, 'This question is already being analysed.');
     throw new HttpError(503, 'The hub is checking other questions right now. This one will be tried again shortly.');
+  }
+}
+
+export async function sweepBatched(env) {
+  let rows;
+  try { rows = await all(env, "SELECT block_id, q_index FROM analyses WHERE status = 'pending' AND error = ? ORDER BY created_at LIMIT 4", BATCH_WAIT); } catch { return; }
+  for (const r of rows) {
+    try { await analyze(env, r.block_id, r.q_index, { background: true }); } catch (e) {
+      console.error('nbme batched check failed', r.block_id, r.q_index, e && e.message);
+      await noteJob(env, { job: 'nbme_check', key: `${r.block_id}:failed`, ref: r.block_id, state: 'failed', add: true, counts: { n: 1 }, detail: e });
+      if (e instanceof HttpError && e.status === 429) break;
+    }
   }
 }
 

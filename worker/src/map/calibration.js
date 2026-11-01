@@ -10,11 +10,33 @@ const OVERCONFIDENT_DAYS = 28;
 const noTable = e => /no such table|no such column/i.test(String(e && e.message));
 const pct = (a, n) => (n ? Math.round((100 * a) / n) : null);
 
-const ROWS_SQL = `SELECT e.category_id, c.name AS system, e.source, coalesce(e.confidence, 'unknown') AS confidence, e.result, e.day, count(*) AS n
+export const CONF_SOURCE_SQL = `CASE WHEN e.confidence IS NULL THEN 'none' WHEN m.confidence_source = 'reported' THEN 'reported'
+  WHEN m.confidence_source IN ('voice', 'assumed') OR (m.id IS NULL AND e.source = 'uworld') THEN 'inferred' ELSE 'unknown' END`;
+const ROWS_SQL = `SELECT e.category_id, c.name AS system, e.source, coalesce(e.confidence, 'unknown') AS confidence, e.result, e.day, ${CONF_SOURCE_SQL} AS conf_src, count(*) AS n
   FROM evidence e LEFT JOIN categories c ON c.user_id = e.user_id AND c.id = e.category_id
+  LEFT JOIN misses m ON m.user_id = e.user_id AND m.id = e.miss_id
   WHERE e.user_id = ?1 AND e.kind = 'question' AND e.slot = 0 AND e.held = 0 AND e.result IN ('right', 'flawed', 'wrong')
     AND (?2 IS NULL OR e.day >= ?2) AND (?3 IS NULL OR e.category_id = ?3)
-  GROUP BY e.category_id, e.source, coalesce(e.confidence, 'unknown'), e.result, e.day`;
+  GROUP BY e.category_id, e.source, coalesce(e.confidence, 'unknown'), e.result, e.day, conf_src`;
+const AGREE_SQL = `SELECT m.confidence AS reported, json_extract(j.value, '$.confidence') AS inferred, count(*) AS n
+  FROM misses m JOIN uworld_blocks b ON b.id = m.uworld_block_id, json_each(CASE WHEN json_valid(b.questions_json) THEN b.questions_json ELSE '[]' END) j
+  WHERE m.user_id = ?1 AND m.deleted_at IS NULL AND m.held = 0 AND m.confidence_source = 'reported' AND m.confidence IN ('sure', 'lean', 'guess')
+    AND json_extract(j.value, '$.q') = m.uworld_q AND json_extract(j.value, '$.confidence') IN ('sure', 'lean', 'guess') AND (?2 IS NULL OR m.day >= ?2)
+  GROUP BY 1, 2`;
+export const CONF_SOURCES = ['reported', 'inferred', 'unknown'];
+
+/** How often the inferred confidence agrees with the reported one (pure): rows [{reported, inferred, n}]. */
+export function agreementFrom(rows) {
+  let n = 0, agree = 0;
+  const pairs = {};
+  for (const r of rows || []) {
+    const k = Number(r.n) || 0;
+    n += k;
+    if (r.reported === r.inferred) agree += k;
+    (pairs[r.reported] ||= {})[r.inferred] = ((pairs[r.reported] || {})[r.inferred] || 0) + k;
+  }
+  return { n, agree, agree_pct: pct(agree, n), pairs };
+}
 
 /** The Monday of a day's week ('2026-10-29' -> '2026-10-26'). */
 export function weekOf(day) {
@@ -38,9 +60,10 @@ const sureWrongPct = cell => pct(cell.sure.wrong, cell.sure.n);
 
 /** The calibration from grouped evidence rows [{category_id, system, source, confidence, result, day, n}] (pure). */
 export function calibrationFrom(rows) {
-  const overall = empty(), bySystem = new Map(), byWeek = new Map(), bySource = new Map();
+  const overall = empty(), bySystem = new Map(), byWeek = new Map(), bySource = new Map(), byConf = new Map();
   for (const r of rows || []) {
     add(overall, r);
+    if (CONF_SOURCES.includes(r.conf_src)) { if (!byConf.has(r.conf_src)) byConf.set(r.conf_src, empty()); add(byConf.get(r.conf_src), r); }
     const sk = r.category_id || 'none';
     if (!bySystem.has(sk)) bySystem.set(sk, { system: r.system || (r.category_id ? r.category_id : 'not on the map'), cell: empty() });
     add(bySystem.get(sk).cell, r);
@@ -57,21 +80,27 @@ export function calibrationFrom(rows) {
   const worst = [...bySystem.values()].filter(s => s.cell.sure.n >= MIN_SURE && s.cell.sure.wrong > 0)
     .sort((a, b) => sureWrongPct(b.cell) - sureWrongPct(a.cell) || b.cell.sure.n - a.cell.sure.n)[0] || null;
   return {
-    overall: shown(overall), by_source: Object.fromEntries([...bySource].map(([k, cell]) => [k, shown(cell)])), by_system: systems, by_week: weeks,
+    overall: shown(overall), by_source: Object.fromEntries([...bySource].map(([k, cell]) => [k, shown(cell)])),
+    by_confidence_source: Object.fromEntries(CONF_SOURCES.filter(k => byConf.has(k)).map(k => [k, shown(byConf.get(k))])), by_system: systems, by_week: weeks,
     overconfident: worst ? { system: worst.system, sure: worst.cell.sure.n, sure_wrong: worst.cell.sure.wrong, sure_wrong_pct: sureWrongPct(worst.cell) } : null,
   };
 }
 
 /** board_tallies {kind: 'calibration', since_day?, category?}: overall, by source, by system (worst sure first), by week. */
 export async function calibration(env, user, { since_day = null, category_id = null } = {}) {
-  let rows = [];
+  let rows = [], agreeRows = [];
   try { rows = (await env.DB.prepare(ROWS_SQL).bind(user, since_day, category_id).all()).results || []; } catch (e) { if (!noTable(e)) throw e; }
+  try { agreeRows = (await env.DB.prepare(AGREE_SQL).bind(user, since_day).all()).results || []; } catch (e) { if (!noTable(e)) throw e; }
   const c = calibrationFrom(rows);
+  c.agreement = agreementFrom(agreeRows);
   const sure = c.overall.sure;
   const head = sure ? `Sure answers right ${sure.right_pct}% of ${sure.n}${c.overall.lean ? `, lean ${c.overall.lean.right_pct}%` : ''}${c.overall.guess ? `, guess ${c.overall.guess.right_pct}%` : ''}`
     : 'No answers with a sure confidence yet';
   const worst = c.overconfident ? `; most overconfident: ${c.overconfident.system} (${c.overconfident.sure_wrong} of ${c.overconfident.sure} sure answers wrong)` : '';
-  return { kind: 'calibration', ...(since_day ? { since_day } : {}), summary: `${head}${since_day ? ` since ${since_day}` : ''}${worst}.`, ...c };
+  const inf = c.by_confidence_source.inferred, rep = c.by_confidence_source.reported;
+  const split = rep && inf && rep.sure && inf.sure ? `; sure right ${rep.sure.right_pct}% when you said it, ${inf.sure.right_pct}% when inferred` : '';
+  const agree = c.agreement.n ? `; inferred agreed with yours on ${c.agreement.agree} of ${c.agreement.n}` : '';
+  return { kind: 'calibration', ...(since_day ? { since_day } : {}), summary: `${head}${since_day ? ` since ${since_day}` : ''}${worst}${split}${agree}.`, ...c };
 }
 
 export async function overconfident(env, user, { today = londonDay() } = {}) {

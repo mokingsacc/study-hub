@@ -202,6 +202,11 @@ export const PURGE_TABLES = [
   'source_fetches',
   'exam_topics', 'teach_offers', 'teach_skips', 'uworld_readings', 'uworld_adjust', 'uworld_block_kind',
   'card_rates', 'mehlman_summaries', 'uworld_judging', 'uworld_reviews', 'xq', 'xq_rank',
+  // added on main by 31 Oct (vivas, foundations, clusters, forecasts, shadow scoring, problem reports, the day plan)
+  'uworld_pages', 'anking_catalogue', 'anking_tables', 'anking_reviews', 'forecasts', 'model_versions', 'cause_judgements', 'score_snapshots',
+  'integrity_runs', 'uworld_review_talks', 'topic_facets', 'viva_rubrics', 'viva_results', 'topic_picture_checks', 'concept_tags', 'claude_usage',
+  'claude_calls', 'ai_audits', 'score_forecasts', 'score_forecast_checks', 'score_plan_log', 'shadow_tests', 'shadow_scores', 'clusters',
+  'debug_traces', 'bug_reports', 'score_plan_coefs', 'plan_days', 'plan_feedback', 'photo_inbox',
 ];
 
 /**

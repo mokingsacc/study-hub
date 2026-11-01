@@ -119,6 +119,9 @@ svg { display: block; }
   .side a svg { width: 22px; height: 22px; color: var(--accent-text); }
   .side a[aria-current] { background: var(--fill); font-weight: 600; }
   .side .more-only { display: none; }
+  .side-report { display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 0 12px; border: 0; border-radius: 12px; background: none; color: var(--ink-2); font: 500 14px/1 var(--font); cursor: pointer; }
+  .side-report svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+  .side-report:hover { background: var(--fill); }
 }
 .brand { display: flex; align-items: center; gap: 10px; padding: 0 12px 18px; font: 700 19px/1 var(--font-display); letter-spacing: -.02em; color: var(--ink); }
 .brand i { width: 13px; height: 13px; border-radius: 50%; background: radial-gradient(circle at 35% 35%, #ffe08a, #f9a005 45%, #e7410a 100%); box-shadow: 0 0 10px rgba(249, 160, 5, .5); }
@@ -810,3 +813,36 @@ button.tile { border: 0; text-align: left; font: inherit; color: inherit; cursor
 .wl-pick { display: flex; align-items: center; gap: 12px; width: 100%; padding: 16px; border: 0; text-align: left; font: inherit; color: var(--ink); cursor: pointer; }
 .wl-pick.on { box-shadow: 0 0 0 2px var(--accent), var(--e1); }
 .wl-pick .sub { display: block; color: var(--ink-2); font-size: 14px; margin-top: 3px; }
+
+/* Report a problem (report.js) */
+.rp-pre { max-height: 180px; overflow: auto; padding: 10px 12px; border-radius: 10px; background: var(--fill); font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; word-break: break-word; color: var(--ink-2); }
+.rv-sure { justify-content: center; align-items: center; }
+.rv-sure .chip { min-height: 36px; }
+/* Pictures: zoom and cover-and-recall (pictures.js) */
+.pic-big { overflow: auto; max-height: 72vh; -webkit-overflow-scrolling: touch; }
+.pic-frame { position: relative; display: inline-block; width: 100%; vertical-align: top; }
+.pic-big.zoomed .pic-frame { width: 220%; }
+.pic-frame .pic-img { width: 100%; height: auto; display: block; }
+.pic-covers { position: absolute; inset: 0; }
+.pic-covers.editing { cursor: crosshair; touch-action: none; }
+.pic-cover { position: absolute; border: 0; border-radius: 6px; background: var(--accent); box-shadow: 0 1px 4px rgba(0,0,0,.25); cursor: pointer; }
+.pic-cover.open { background: transparent; box-shadow: inset 0 0 0 2px var(--accent); }
+.pic-cover.edit { background: color-mix(in srgb, var(--accent) 55%, transparent); }
+.pic-bar { align-items: center; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
+.tp-check { display: grid; gap: 10px; margin: 4px 0 14px; }
+.tp-sure { align-items: center; }
+.tp-sure .chip { min-height: 34px; }
+.nw .li .btn { flex: none; }
+
+/* Writing on the exam with a pencil (ink.js) */
+.exam-pdf.exam-write, .exam-pdf-slot.exam-write { position: relative; top: auto; height: calc(100vh - 230px); height: calc(100dvh - 230px); min-height: 420px; }
+.exam-write .pdf-page { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+.ink-canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+.ink-bar { position: sticky; top: 56px; z-index: 3; margin-bottom: 8px; }
+.ink-tools { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 8px; border-radius: var(--r-xl); background: var(--surface); box-shadow: var(--e1); }
+.ink-tools .btn[aria-pressed="true"] { outline: 2px solid var(--accent); outline-offset: 1px; }
+.ink-jump { width: auto; max-width: 240px; }
+.ink-full { position: fixed; inset: 0; z-index: 60; display: flex; flex-direction: column; gap: 8px; padding: 10px 12px calc(10px + env(safe-area-inset-bottom)); background: var(--bg); }
+.ink-full .exam-pdf { flex: 1; height: auto; min-height: 0; }
+.ink-full .ink-bar { position: static; margin: 0; }
+.ink-head { display: flex; gap: 8px; align-items: center; }

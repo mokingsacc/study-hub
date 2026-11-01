@@ -1,15 +1,21 @@
 // D1 helpers: settings with defaults, today's usage, and small query wrappers.
 import { HttpError, londonDay, londonDayStart, safeParse } from './util.js';
 import { noteJob } from './job-log.js';
+import { PLAN_DEFAULTS } from '../../public/js/hub/plan-maths.js';
+import { DEFAULT_EXAM_DAY, examDayOf } from './exam-day.js';
 
 export const first = (env, sql, ...args) => env.DB.prepare(sql).bind(...args).first();
 export const all = async (env, sql, ...args) => (await env.DB.prepare(sql).bind(...args).all()).results || [];
 export const run = (env, sql, ...args) => env.DB.prepare(sql).bind(...args).run();
 
 export const CHECK_MODES = ['desktop', 'api'];
+export const BLOCK_JUDGES = ['chat', 'hub'];
 export const PUBLIC_SETTINGS = ['daily_cap_usd', 'monthly_cap_usd', 'default_voice_mode', 'onenote_section', 'cards_per_day_cap', 'deck', 'check_mode',
   'target_score', 'uworld_total_left', 'uworld_as_of', 'exam_date', 'rest_days', 'light_days', 'off_weekdays', 'plan_daily',
-  'plan_start', 'uworld_finish_date', 'phase2_end', 'cms_early_by', 'cms_weak_pct', 'cards_minutes'];
+  'plan_start', 'uworld_finish_date', 'phase2_end', 'cms_early_by', 'cms_weak_pct', 'cards_minutes', 'scoring_auto_switch',
+  // Bug reports (1 Nov 2026): request traces and the pages' capture; off means none of it is installed (debug/switch.js).
+  'debug_capture',
+  'block_judge'];
 
 export function defaultSettings(day = londonDay()) {
   return {
@@ -21,19 +27,11 @@ export function defaultSettings(day = londonDay()) {
     deck: 'Step 2 — My Cards',
     cards_minutes: 20,
     check_mode: 'desktop',
-    target_score: 250,
-    uworld_total_left: 2000,
-    uworld_as_of: '2027-04-29', // first-pass questions count down from this day
-    exam_date: '2027-06-30',
-    plan_start: '2027-04-29',
-    uworld_finish_date: '2027-05-29',
-    phase2_end: '2027-06-25',
-    cms_early_by: '2027-05-15',
-    cms_weak_pct: 75,
-    rest_days: ['2027-06-28', '2027-06-29'],
-    light_days: ['2027-06-26', '2027-06-27'],
-    off_weekdays: [6, 0],
-    plan_daily: { uworld: 100, cms: 37, incorrects: 40 },
+    ...structuredClone(PLAN_DEFAULTS),
+    exam_date: DEFAULT_EXAM_DAY,
+    scoring_auto_switch: false,
+    debug_capture: true,
+    block_judge: 'chat',
   };
 }
 
@@ -50,6 +48,8 @@ export async function getSettings(env) {
   const month = Number(out.monthly_cap_usd);
   out.monthly_cap_usd = Number.isFinite(month) && month >= 0 ? month : 190;
   if (!CHECK_MODES.includes(out.check_mode)) out.check_mode = 'desktop';
+  if (!BLOCK_JUDGES.includes(out.block_judge)) out.block_judge = 'chat';
+  out.exam_date = examDayOf(out.exam_date);
   return out;
 }
 
@@ -74,6 +74,27 @@ export function addUsage(env, { usd = 0, calls = 0, input = 0, output = 0, whisp
        input_tokens = input_tokens + excluded.input_tokens, output_tokens = output_tokens + excluded.output_tokens,
        whisper_seconds = whisper_seconds + excluded.whisper_seconds`,
     londonDay(), usd, calls, input, output, whisper);
+}
+
+/**
+ * One Claude call's cost: the day's usage row and its role's row (claude_usage, 0064) in one batch, so the spend sheet
+ * can show the cache hit ratio per role. Before 0064 is applied only the usage row is written.
+ */
+export async function addClaudeUsage(env, { usd = 0, role, mode = 'direct', input = 0, read = 0, write = 0, write1h = 0, output = 0 }) {
+  const day = londonDay();
+  const usage = env.DB.prepare(`INSERT INTO usage (day, usd, calls, input_tokens, output_tokens, whisper_seconds) VALUES (?, ?, 1, ?, ?, 0)
+     ON CONFLICT(day) DO UPDATE SET usd = usd + excluded.usd, calls = calls + 1,
+       input_tokens = input_tokens + excluded.input_tokens, output_tokens = output_tokens + excluded.output_tokens`).bind(day, usd, input + read + write, output);
+  const byRole = env.DB.prepare(`INSERT INTO claude_usage (day, role, mode, calls, input, cache_read, cache_write, cache_write_1h, output, usd) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(user_id, day, role, mode) DO UPDATE SET calls = calls + 1, input = input + excluded.input, cache_read = cache_read + excluded.cache_read,
+       cache_write = cache_write + excluded.cache_write, cache_write_1h = cache_write_1h + excluded.cache_write_1h, output = output + excluded.output, usd = usd + excluded.usd`)
+    .bind(day, String(role || 'unknown'), mode, input, read, write, write1h, output, usd);
+  try {
+    await env.DB.batch([usage, byRole]);
+  } catch (e) {
+    if (!/no such table|no such column/i.test(String(e && e.message))) throw e;
+    await addUsage(env, { usd, calls: 1, input: input + read + write, output });
+  }
 }
 
 export async function cardsToday(env, except = null) {

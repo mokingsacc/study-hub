@@ -14,12 +14,13 @@ export const UNDO = { 'queue.resolved': (...a) => unplace(...a) };
 export const EXPORT = {
   retests: {
     cols: ['user_id', 'id', 'kind', 'miss_id', 'lesson_id', 'topic_id', 'due', 'source', 'result', 'done_at', 'done_by', 'card_state', 'case_json', 'card_id',
-      'note_id', 'card_at', 'card_tries', 'card_error', 'created_at', 'updated_at'],
+      'note_id', 'card_at', 'card_tries', 'card_error', 'created_at', 'updated_at', 'card_deck', 'card_moved_at', 'covered'],
     required: ['user_id', 'id', 'kind', 'due', 'source', 'card_state', 'created_at', 'updated_at'],
     types: {
       user_id: 't', id: 't', kind: ['miss', 'lesson'], miss_id: 't', lesson_id: 't', topic_id: 't', due: 'd', source: ['hub', 'anki', 'lesson'],
       result: ['got_it', 'missed_again'], done_at: 'i', done_by: 't', card_state: ['pending', 'written', 'made', 'done', 'failed'], case_json: 'jo',
       card_id: 'i', note_id: 'i', card_at: 'i', card_tries: 'i', card_error: 't', created_at: 'i', updated_at: 'i',
+      card_deck: ['retests', 'mine'], card_moved_at: 'i', covered: ['own_card'],
     },
   },
   pattern_runs: {

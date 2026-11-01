@@ -1,7 +1,7 @@
 import { vocabulary, ftsPlan, fuse, contentWords } from '../library/search.js';
 import { embedQuery, dequantise, unit, EMBED_MODEL, EMBED_DIMS } from '../library/vectors.js';
 import { searchTopics } from '../map/resolve.js';
-import { KINDS, SOURCES, openAt } from './items.js';
+import { KINDS, SHOWN_KINDS, SOURCES, openAt, kindStored, kindShown } from './items.js';
 
 export const DEFAULT_K = 10, MAX_K = 25, FTS_N = 50, VEC_N = 50, SNIPPET = 200;
 // The cosine a hit found by meaning alone needs (bge-small: unrelated texts sit around 0.3 to 0.45).
@@ -83,8 +83,9 @@ async function nearest(env, user, head, vector, k) {
 export function readOptions(a = {}) {
   const problems = [];
   for (const k of ['since', 'until']) if (a[k] != null && !DAY.test(String(a[k]))) problems.push(`${k} must be a day, YYYY-MM-DD.`);
-  const kinds = Array.isArray(a.kinds) ? a.kinds : a.kinds != null ? [a.kinds] : [];
-  for (const k of kinds) if (!KINDS.includes(k)) problems.push(`kinds: ${k} is not one of ${KINDS.join(', ')}.`);
+  const asked = Array.isArray(a.kinds) ? a.kinds : a.kinds != null ? [a.kinds] : [];
+  for (const k of asked) if (!KINDS.includes(k) && !SHOWN_KINDS.includes(k)) problems.push(`kinds: ${k} is not one of ${SHOWN_KINDS.join(', ')}.`);
+  const kinds = [...new Set(asked.map(kindStored))];
   if (a.source != null && !SOURCES.includes(a.source)) problems.push(`source must be one of ${SOURCES.join(', ')}.`);
   if (problems.length) return { problems };
   return { q: String(a.query || '').trim().slice(0, 200), kinds, topic: a.topic ? String(a.topic).trim().slice(0, 120) : null, system: a.system ? String(a.system).trim().slice(0, 60) : null,
@@ -153,6 +154,6 @@ export async function searchHistory(env, user, args = {}) {
 }
 
 const shape = (r, terms, via) => ({
-  kind: r.kind, day: r.day, label: r.label, ...(r.topic ? { topic: r.topic } : {}), source: r.source, snippet: snippet(r.text, terms),
+  kind: kindShown(r.kind), day: r.day, label: r.label, ...(r.topic ? { topic: r.topic } : {}), source: r.source, snippet: snippet(r.text, terms),
   via: [...new Set(via.map(v => (v === 'meaning' ? 'meaning' : v === 'filters' ? 'filters' : 'words')))], open: openAt(r.open, r.day),
 });

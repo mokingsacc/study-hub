@@ -2,12 +2,20 @@ import { HttpError, json, londonDay } from '../util.js';
 import { MO } from '../users.js';
 import { PREFIX as NOTES_PREFIX, rowsOf, summarise, chipJob } from '../notes/import-summary.js';
 import { JOBS as RUN_JOBS } from '../job-log.js';
+import { auditWords } from '../ai-audit.js';
 
 const HOUR_MS = 3_600_000, DAY_MS = 86_400_000;
 export const RECENT_HOURS = [1, 24, 168];
 export const WHAT_MAX = 90, LINE_MAX = 160, ACTIVITY_MAX = 40, TOPICS_MAX = 800;
 export const QUIET = ['score.changed', 'scores.refreshed', 'evidence.added', 'evidence.removed', 'sync.status', 'map.resync', 'positions.changed',
-  'topic.sources_refreshed'];
+  'topic.sources_refreshed',
+  // A clean-up's row changes (hygiene.js): its job line says what it did, once, instead of a line per row.
+  'data.cleaned',
+  // Pictures the picture job added (auto-pictures.js): its job line counts them, one line a day, instead of a line a topic.
+  'media.found',
+  'self.rated',
+  // Claude's verdict on each card to fix (card-fix.js): the night's one "Cards reviewed by Claude" job line counts them.
+  'card.fixed'];
 const QUIET_SQL = `(${QUIET.map(k => `'${k}'`).join(', ')})`;
 const STATE_KINDS_SQL = `('card_new', 'card_young', 'card_mature', 'card_suspended')`;
 const UW_TRIES = 3, ANKI_TRIES = 8, OUTBOX_TRIES = 8;
@@ -40,10 +48,12 @@ export function evidenceWhat(r) {
     case 'card_check': return `spoken answer checked: ${r.verdict === 'sound' ? 'sound' : r.verdict === 'shaky' ? 'shaky' : 'gap'}`;
     case 'card_weak_part': return 'part of a card missed';
     case 'question': return `${src ? `${src} ` : ''}question ${r.result === 'right' ? 'right' : r.result === 'omitted' ? 'left blank' : 'missed'}`;
-    case 'confused_with': return 'picked by mistake for another topic';
-    case 'retest': return `re-test ${r.outcome === 'got_it' ? 'right' : 'missed'}`;
-    case 'lesson_probe': case 'lesson_final': case 'lesson_check': case 'pair_item': return 'lesson';
+    case 'confused_with': return 'mixed up with another topic';
+    case 'retest': return `card from a miss ${r.outcome === 'got_it' ? 'right' : 'missed'} the first time`;
+    case 'lesson_probe': case 'lesson_final': case 'lesson_check': case 'pair_item': case 'lesson_teachback': case 'lesson_misconception': return 'lesson';
     case 'gap_stated': return 'gap stated';
+    case 'recall_audit': return 'viva graded';
+    case 'review_option': return 'answer choice known in your UWorld review';
     case 'self_mastered': return 'checklist ticked';
     case 'self_rating': return 'self-rating';
     default: return String(r.kind || 'updated').replace(/_/g, ' ');
@@ -55,7 +65,7 @@ export function sourceOf(kind) {
   const k = String(kind || '');
   const pre = k.split('.')[0];
   if (pre === 'miss' || pre === 'sitting') return 'Mistake log';
-  if (pre === 'lesson' || pre === 'teach_memory' || pre === 'misconception') return 'Lessons';
+  if (pre === 'lesson' || pre === 'teach_memory' || pre === 'misconception' || pre === 'viva') return 'Lessons';
   if (pre === 'setting' || pre === 'pref') return 'Settings';
   if (pre === 'checklist') return 'Checklist';
   if (pre === 'gap') return 'Gaps';
@@ -163,10 +173,10 @@ const dayWord = day => {
 };
 const SPOKEN = `(words > 0 OR length(segments_json) > 2)`;
 const OUTBOX_TO = { debrief: 'the Anki mistake log', onenote: 'OneNote', anki_link_card: 'Anki', anki_retest: 'the Anki mistake log' };
-// An Anki session's device: the add-on on the Mac, or the hub's Cards page.
-const SESSION_WHERE = { mac: 'Anki on the Mac', phone: 'Cards page on your phone', hub: 'Cards page on your laptop' };
+// An Anki session's device: the add-on on the Mac, the hub's Cards page, or an Anki Voice review (sent by its server).
+const SESSION_WHERE = { mac: 'Anki on the Mac', phone: 'Cards page on your phone', hub: 'Cards page on your laptop', voice: 'Anki Voice' };
 // The map's sync sources (sync_state), in words.
-const SYNC_WORD = { anki: 'Anki mistake log sync', 'anki.new': 'Anki mistake log sync', 'anki.due': 'Anki re-tests due sync', 'anki.recent': 'Anki mistake log sync',
+const SYNC_WORD = { anki: 'Anki mistake log sync', 'anki.new': 'Anki mistake log sync', 'anki.due': 'Anki mistake log sync', 'anki.recent': 'Anki mistake log sync',
   'anki.full': 'Nightly Anki check', 'anki.reviews': 'Anki card reviews sync', card_reviews: 'Anki card reviews sync',
   'anki.fsrs': 'Anki memory data sync', gaps: 'Gaps sync', labeller: 'Exam question labelling', hub: 'Hub exams sync', uworld: 'UWorld sync',
   history: 'Search index' };
@@ -188,7 +198,7 @@ function jobStatements(env, now) {
     sessions: q(`SELECT id, device, status, attempts, last_error, started_at, ended_at, updated_at, ${SPOKEN} AS spoken FROM anki_sessions
        WHERE (status IN ('aligned', 'checking') OR (status = 'open' AND (${SPOKEN} OR updated_at >= ?)) OR (status = 'failed' AND updated_at >= ?))
        ORDER BY updated_at DESC LIMIT 10`, now - LIVE_SESSION_MS, from),
-    outbox: q(`SELECT kind, status, attempts, last_error, created_at FROM outbox
+    outbox: q(`SELECT kind, status, attempts, last_error, created_at, json_extract(result_json, '$.wait') AS wait FROM outbox
        WHERE status IN ('pending', 'sending', 'failed') AND created_at >= ? ORDER BY created_at DESC LIMIT 50`, now - 14 * DAY_MS),
     syncs: q(`SELECT source, last_ok_at, fails, last_error, next_at FROM sync_state WHERE user_id = ? AND fails >= ${SYNC_FAILS} AND last_error IS NOT NULL`, MO),
     spend: q(`SELECT (SELECT usd FROM usage WHERE day = ?) AS usd, (SELECT value FROM settings WHERE key = 'daily_cap_usd') AS cap`, londonDay(now)),
@@ -238,9 +248,10 @@ export function jobsOf(rows, now = Date.now()) {
   const groups = new Map();
   for (const o of outbox) {
     const gaveUp = o.status === 'failed' && Number(o.attempts) >= OUTBOX_TRIES;
+    const waitsForMiss = o.status === 'pending' && !!o.wait;
     const state = gaveUp ? 'failed' : o.status === 'sending' ? 'running' : 'waiting';
-    const k = `${o.kind}:${state}`;
-    const g = groups.get(k) || { kind: o.kind, state, n: 0, since: Number(o.created_at) || null, error: null, retrying: false };
+    const k = `${o.kind}:${waitsForMiss ? 'miss' : state}`;
+    const g = groups.get(k) || { kind: o.kind, state, n: 0, since: Number(o.created_at) || null, error: null, retrying: false, waitsForMiss };
     g.n++;
     g.since = Math.min(g.since || Infinity, Number(o.created_at) || Infinity);
     if (!g.error && o.last_error) g.error = o.last_error;
@@ -249,8 +260,10 @@ export function jobsOf(rows, now = Date.now()) {
   }
   for (const g of groups.values()) {
     const to = OUTBOX_TO[g.kind] || 'Anki';
-    const base = { key: `outbox:${g.kind}:${g.state}`, source: g.kind === 'onenote' ? 'OneNote' : 'Anki', since: Number.isFinite(g.since) ? g.since : null };
-    if (g.state === 'failed') out.push({ ...base, state: 'failed', what: `${plural(g.n, 'item')} could not be sent to ${to}`, detail: cap(g.error, 120) });
+    const base = { key: `outbox:${g.kind}:${g.waitsForMiss ? 'miss' : g.state}`, source: g.kind === 'onenote' ? 'OneNote' : 'Anki', since: Number.isFinite(g.since) ? g.since : null };
+    if (g.waitsForMiss) out.push({ ...base, state: 'waiting', what: `${plural(g.n, 'lesson card')} waiting for ${g.n === 1 ? 'its miss' : 'their misses'} to reach the Anki mistake log`,
+      detail: "Linked once the miss is logged, for an exam miss after that exam's finish review. Checked every hour." });
+    else if (g.state === 'failed') out.push({ ...base, state: 'failed', what: `${plural(g.n, 'item')} could not be sent to ${to}`, detail: cap(g.error, 120) });
     else if (g.state === 'running') out.push({ ...base, state: 'running', what: `Sending ${plural(g.n, 'item')} to ${to}` });
     else out.push({ ...base, state: 'waiting', what: `${plural(g.n, 'item')} waiting to send to ${to}`, detail: g.retrying ? `Retrying after: ${cap(g.error, 100) || 'an error'}` : null });
   }
@@ -315,14 +328,15 @@ export async function jobsNow(env, user, { now = Date.now() } = {}) {
 // ---------------------------------------------------------------- job lines (job_runs, job-log.js)
 
 const num = v => Number(v) || 0;
-const REC_WORD = { uworld: 'UWorld recorder', anki: 'Anki review', exam: 'practice exam' };
+const REC_WORD = { uworld: 'UWorld recorder', anki: 'Anki review', exam: 'practice exam', viva: 'topic panel viva' };
 // The minute and cron jobs by name, for a job that stopped with an error (sync.js RUN, cron.js JOBS).
-const JOB_WORD = { gaps: 'placing gaps on the map', retests: 're-test booking', retestCards: 're-test cards', labeller: 'exam question labelling',
+const JOB_WORD = { gaps: 'placing gaps on the map', retests: 'booking cards for your misses', retestCards: 'cards from your misses', labeller: 'exam question labelling',
   cardReviews: 'card reviews from the Mac', dirty: 'map colours', scores: 'map colours', repair: 'map colours', rebuild: 'map rebuild',
   release: 'finished sittings onto the map', library: 'reading the Library', morning: "this morning's topics", embed: 'map layout', hourly: 'hourly map upkeep',
   priors: 'map starting levels', lessonCards: 'lesson cards', learn: 'Learn', 'cards.due': 'due cards', 'orbits.daily': 'map orbits',
   flush: 'sending to Anki and OneNote', images: 'picture tidy', anki: 'Anki check', uworld: 'UWorld judge', exambank: 'exam bank search',
-  notes: 'Notes import', backfill: 'catch-up', minute: 'map jobs' };
+  notes: 'Notes import', backfill: 'catch-up', minute: 'map jobs', pictures: 'finding topic pictures', forecast: 'the score forecast', clusters: 'finding clusters of topics you mix up' };
+const FORM_WORD = { uworld_review_talks: 'a UWorld review', viva_results: 'a viva' };
 const SPELL_WORD = { limit: 'spelling check skipped: daily limit', error: 'spelling check skipped: it failed' };
 const spellOf = c => (c.spell === 'done' ? (num(c.fixes) ? `spelling check fixed ${plural(num(c.fixes), 'word')}` : 'spelling check: nothing to fix') : SPELL_WORD[c.spell] || null);
 const tries = c => (num(c.tries) >= num(c.max) && num(c.max) ? `gave up after ${num(c.max)} tries` : `will retry${num(c.tries) ? ` (try ${num(c.tries)} of ${num(c.max)})` : ''}`);
@@ -330,30 +344,55 @@ const VOICE_FAIL = { key: 'the hub refused its key (check PRACTICE_HUB_KEY on An
   down: 'it could not reach the hub, it will retry' };
 const parseCounts = t => { try { const o = JSON.parse(t || '{}'); return o && typeof o === 'object' ? o : {}; } catch { return {}; } };
 
+const BATCH_WORD = { uworld_judge: 'UWorld block', uworld_review_talk: 'UWorld review', anki_check: 'Anki check', rejudge: 'Look-alike re-judge',
+  viva: 'Viva', pictures: 'Pictures', catchup_signals: 'Catch-up', retest_cards: 'Cards from your misses', integrity: 'Data checks', honesty: 'Honesty check',
+  nbme_check: 'Exam answers check', pattern_review: 'Pattern review', labeller: 'Exam question labelling', clusters: 'Cluster names' };
+
 /**
  * One job_runs row in words: {source, what, who} (pure). Code-built from the job, its state and its counts only; the
- * detail (an error's first words) rides along separately.
+ * detail (an error's first words) rides along separately. A run checked for completeness (ai-audit.js) says so after
+ * its words ("checked: all parts present"), and a run waiting for its Message Batch says that instead of a limit.
  */
 export function jobLine(r) {
+  const c = parseCounts(r.counts_json);
+  if (r.state === 'held' && c.batch) {
+    const what = BATCH_WORD[r.job] || String(r.job || 'job').replace(/_/g, ' ');
+    return { source: jobLineCore(r).source, what: `${what}${c.day ? ` of ${dayWord(c.day)}` : ''}: waiting for its batch (half price; minutes to an hour)`, who: 'the hub, automatically' };
+  }
+  const line = jobLineCore(r);
+  const checked = r.state === 'ok' || r.state === 'fallback' ? auditWords(c) : null;
+  return checked ? { ...line, what: `${line.what} · ${checked}` } : line;
+}
+
+function jobLineCore(r) {
   const c = parseCounts(r.counts_json), st = r.state, ref = r.ref;
   const auto = 'the hub, automatically';
   switch (r.job) {
     case 'transcribe': {
       const clips = num(c.clips), bits = [];
+      const whisperFirst = ref === 'uworld';
       if (num(c.nova) === clips) bits.push('all Nova-3');
+      else if (num(c.whisper) === clips) bits.push('all Whisper');
       else {
-        if (num(c.nova)) bits.push(`${num(c.nova)} Nova-3`);
+        if (num(c.whisper) && whisperFirst) bits.push(`${num(c.whisper)} Whisper`);
+        if (num(c.nova)) bits.push(whisperFirst ? `${num(c.nova)} fell back to Nova-3` : `${num(c.nova)} Nova-3`);
         if (num(c.plain)) bits.push(`${num(c.plain)} Nova-3 without your word list`);
-        if (num(c.whisper)) bits.push(`${num(c.whisper)} fell back to Whisper`);
+        if (num(c.whisper) && !whisperFirst) bits.push(`${num(c.whisper)} fell back to Whisper`);
         if (num(c.failed)) bits.push(`${num(c.failed)} not heard (kept on the device and sent again)`);
       }
       return { source: 'Recording', what: `Transcription (${REC_WORD[ref] || 'recording'}): ${plural(clips, 'clip')}, ${bits.join(', ')}`, who: auto };
     }
     case 'anki_check': {
       const who = SESSION_WHERE[ref] || 'Anki';
+      // An Anki Voice review arriving from its server (spoken.js put), before its check.
+      if (c.received != null) {
+        return st === 'failed' ? { source: 'Anki', what: 'Anki Voice review could not be saved for its check', who }
+          : { source: 'Anki', what: `Anki Voice review received: ${plural(num(c.received), 'card')} with your words${num(c.to_check) ? `, ${num(c.to_check)} to check` : ''}`, who };
+      }
       if (st === 'failed') return { source: 'Anki', what: `Anki check failed, ${tries(c)}`, who };
       if (st === 'held' && !num(c.left)) return { source: 'Anki', what: "Anki check waits for Claude's daily limit", who };
       const bits = [`${plural(num(c.cards), 'card')} checked`];
+      if (num(c.tutor)) bits.push(`${plural(num(c.tutor), 'card')} already marked by the tutor`);
       if (num(c.gaps)) bits.push(plural(num(c.gaps), 'gap'));
       if (num(c.shaky)) bits.push(`${num(c.shaky)} shaky`);
       if (num(c.pairs)) bits.push(plural(num(c.pairs), 'look-alike'));
@@ -363,6 +402,16 @@ export function jobLine(r) {
     }
     case 'anki_echo':
       return { source: 'Anki', what: `Anki review not saved: the UWorld recorder was on (${num(c.share)}% of its words were the block's)`, who: SESSION_WHERE[ref] || 'Anki' };
+    case 'uworld_log': {
+      const block = `UWorld block${c.day ? ` of ${dayWord(c.day)}` : ''}`;
+      return { source: 'UWorld', what: `${block}: ${plural(num(c.logged), 'miss', 'misses')} logged for you${num(c.waiting) ? `, ${num(c.waiting)} wait for your say` : ''}`, who: auto };
+    }
+    case 'uworld_pages': {
+      const block = `UWorld block${c.day ? ` of ${dayWord(c.day)}` : ''}`;
+      if (st === 'failed') return { source: 'UWorld', what: `${block}: question pages not read`, who: 'the recorder page' };
+      if (st === 'held') return { source: 'UWorld', what: `${block}: question pages wait for Claude's daily limit`, who: 'the recorder page' };
+      return { source: 'UWorld', what: `${block}: ${plural(num(c.pages), 'question page')} read (${num(c.read)} results, ${num(c.wrong)} wrong), the judge reads them next`, who: 'the recorder page' };
+    }
     case 'uworld_judge': {
       const block = `UWorld block${c.day ? ` of ${dayWord(c.day)}` : ''}`;
       if (st === 'failed') return { source: 'UWorld', what: `${block}: judging failed, ${tries(c)}`, who: auto };
@@ -372,20 +421,47 @@ export function jobLine(r) {
       if (num(c.pairs)) bits.push(plural(num(c.pairs), 'look-alike'));
       if (num(c.steps)) bits.push(`step on ${num(c.steps)}`);
       if (num(c.sure) + num(c.lean) + num(c.guess)) bits.push(`${num(c.sure)} sure, ${num(c.lean)} lean, ${num(c.guess)} guess`);
+      if (num(c.seen)) bits.push(`${num(c.seen)} with the question in view`);
+      if (num(c.unclear)) bits.push(`${num(c.unclear)} heard unclearly (they count less)`);
+      if (num(c.others)) bits.push(plural(num(c.others), 'other condition'));
       const sp = spellOf(c);
+      if (c.by === 'chat') return { source: 'UWorld', what: `${block} judged in the chat: ${bits.join(', ')}`, who: 'Claude in the chat' };
+      if (c.fallback) return { source: 'UWorld', what: `${block} judged by the hub: the chat didn't finish it. ${bits.join(', ')}${sp ? ` · ${sp}` : ''}`, who: auto };
       return { source: 'UWorld', what: `${block} judged: ${bits.join(', ')}${sp ? ` · ${sp}` : ''}`, who: auto };
     }
+    case 'uworld_review_talk': {
+      const block = `UWorld review${c.day ? ` of ${dayWord(c.day)}` : ''}`;
+      // The catch-up after new analysis rules, and one review queued again ({reanalyse: true}).
+      if (c.requeued != null) return { source: 'UWorld', what: st === 'failed' ? 'UWorld reviews: queueing them to be analysed again failed' : num(c.requeued)
+        ? `UWorld reviews: ${plural(num(c.requeued), 'review')} queued to be analysed again with the newest rules` : 'UWorld reviews: none left to analyse again', who: auto };
+      if (c.queued) return { source: 'UWorld', what: `${block} queued to be analysed again`, who: auto };
+      if (st === 'failed') return { source: 'UWorld', what: `${block}: analysis failed, ${tries(c)}`, who: auto };
+      if (st === 'held') return { source: 'UWorld', what: `${block} waits for Claude's daily limit`, who: auto };
+      if (c.chat_skip) return { source: 'UWorld', what: `${block}: the recording was not analysed, you reviewed it in the chat`, who: auto };
+      const bits = [plural(num(c.questions), 'question'), plural(num(c.gaps), 'gap'), plural(num(c.mixups), 'mix-up'), plural(num(c.links), 'link'),
+        plural(num(c.misconceptions), 'misconception')];
+      if (num(c.causes)) bits.push(`${plural(num(c.causes), 'miss', 'misses')} re-read from your words`);
+      if (num(c.known)) bits.push(plural(num(c.known), 'answer choice you knew', 'answer choices you knew'));
+      if (num(c.versus)) bits.push(plural(num(c.versus), 'versus note'));
+      if (c.chat) return { source: 'UWorld', what: `${block} saved from the chat${c.done ? ', done' : ''}: ${bits.join(', ')}`, who: 'Claude in the chat' };
+      if (c.fallback) return { source: 'UWorld', what: `${block} analysed by the hub: the chat review didn't cover it. ${bits.join(', ')}`, who: auto };
+      return { source: 'UWorld', what: `${block} analysed${c.again ? ' again' : ''}: ${bits.join(', ')}`, who: auto };
+    }
     case 'retest_book':
-      return { source: 'Re-tests', what: `Re-tests booked: ${num(c.booked)} for ${plural(num(c.misses), 'miss', 'misses')}${num(c.imported) ? `, ${num(c.imported)} brought in from the Anki log` : ''}`, who: auto };
+      return { source: 'Cards', what: `${plural(num(c.misses), 'miss', 'misses')} will get a card in your deck${num(c.imported) ? ` (${num(c.imported)} from the Anki log)` : ''}`, who: auto };
     case 'retest_cards': {
-      if (st === 'failed') return { source: 'Re-tests', what: c.writing ? 'Re-test cards: a case could not be written, will retry' : `Re-test cards: Anki Voice did not answer, will retry${num(c.waiting) ? ` (${plural(num(c.waiting), 'card')} waiting)` : ''}`, who: auto };
-      if (st === 'held') return { source: 'Re-tests', what: c.limit ? `Re-test cards wait: today's $${num(c.limit)} for writing cases is used` : "Re-test cards wait for Claude's daily limit", who: auto };
+      if (st === 'failed') return { source: 'Cards', what: c.writing ? 'Cards from your misses: a card could not be written, will retry' : `Cards from your misses: Anki Voice did not answer, will retry${num(c.waiting) ? ` (${plural(num(c.waiting), 'card')} waiting)` : ''}`, who: auto };
+      if (st === 'held') return { source: 'Cards', what: c.limit ? `Cards from your misses wait: today's $${num(c.limit)} for writing them is used` : "Cards from your misses wait for Claude's daily limit", who: auto };
+      const added = num(c.made) + num(c.moved);
       const bits = [];
-      if (num(c.made)) bits.push(`${plural(num(c.made), 'card')} made in "Step 2 — Re-tests"`);
-      if (num(c.suspended)) bits.push(`${num(c.suspended)} closed ${num(c.suspended) === 1 ? 'one' : 'ones'} suspended`);
-      if (!num(c.made) && num(c.written)) bits.push(`${plural(num(c.written), 'case')} written, going to Anki next`);
-      if (num(c.unusable)) bits.push(`${plural(num(c.unusable), 'case')} could not be used`);
-      return { source: 'Re-tests', what: `Re-test cards: ${bits.join(', ') || 'nothing to do'}`, who: auto };
+      if (added) bits.push(`${plural(added, 'card')} from your misses added to your deck`);
+      if (num(c.hidden)) bits.push(`${plural(num(c.hidden), 'old card')} moved in suspended (already checked or your own card covers it)`);
+      if (!added && num(c.written)) bits.push(`${plural(num(c.written), 'card')} written, going to Anki next`);
+      if (num(c.unusable)) bits.push(`${plural(num(c.unusable), 'card')} could not be written`);
+      if (num(c.deck_removed)) bits.push('the old extra deck was empty and is gone');
+      if (num(c.expired)) bits.push(`${plural(num(c.expired), 'older miss', 'older misses')} not picked in 14 days let go (still on the map)`);
+      const head = bits.join(', ') || 'Cards from your misses: nothing to do';
+      return { source: 'Cards', what: head.charAt(0).toUpperCase() + head.slice(1), who: auto };
     }
     case 'catchup_signals': {
       const head = `Catch-up of older gaps and blocks${c.status === 'done' ? ' finished' : ''}`;
@@ -400,6 +476,27 @@ export function jobLine(r) {
         num(c.rejudge) && `${plural(num(c.rejudge), 'UWorld question')} to judge again`].filter(Boolean);
       return { source: 'Catch-up', what: `Clean-up of older data: ${bits.join(', ') || 'nothing left to change'}`, who: auto };
     }
+    case 'honesty': {
+      if (st === 'failed') return { source: 'Map check', what: 'Map honesty check failed, it tries again next minute', who: auto };
+      const nq = num(c.blue_nq) ? `; blue without a real question: ${plural(num(c.blue_nq), 'topic')}, right on ${num(c.blue_nq_right)} of ${num(c.blue_nq_n)} later` : '';
+      if (c.verdict) return { source: 'Map check', what: `Map honesty check: ${r.detail || c.verdict}${nq}${num(c.written) ? ` (${plural(num(c.written), 'answer')} scored today)` : ''}`, who: auto };
+      return { source: 'Map check', what: `Map honesty check: ${plural(num(c.written), 'answer')} scored against what happened, more to go`, who: auto };
+    }
+    case 'facets': {
+      // Wave 3: the hourly Diagnose / Manage recompute, and what a lesson's own failures did to its topic.
+      if (ref === 'lesson') {
+        const moved = num(c.before) >= 0 && num(c.after) >= 0 && num(c.before) !== num(c.after) ? `, colour ${num(c.before)} to ${num(c.after)}` : ', colour unchanged';
+        const part = c.facet === 'diagnose' || c.facet === 'manage' ? ` (${c.facet === 'diagnose' ? 'Diagnose' : 'Manage'})` : '';
+        return { source: 'Lessons', what: `Lesson evidence counted on ${r.detail || 'a topic'}${part}${moved}`, who: auto };
+      }
+      if (st === 'failed') return { source: 'Map', what: 'Diagnose / Manage parts: the recompute failed, it tries again next hour', who: auto };
+      const tail = c.weaker === 'diagnose' ? '; overall, diagnosis is the weaker part' : c.weaker === 'manage' ? '; overall, management is the weaker part' : '';
+      // 1 Nov 2026: what was updated straight away today as answers landed, folded into this one daily line.
+      const now = [num(c.instant_colours) && `${plural(num(c.instant_colours), 'topic')} recoloured`, num(c.instant_parts) && `parts of ${plural(num(c.instant_parts), 'topic')}`,
+        num(c.instant_reviews) && `${plural(num(c.instant_reviews), 'Anki Voice review')} sent at once`].filter(Boolean);
+      const instant = now.length ? `. Updated straight away today: ${now.join(', ')}` : '';
+      return { source: 'Map', what: `Diagnose / Manage parts worked out: ${plural(num(c.topics), 'topic')} (${num(c.enough)} with enough evidence), ${num(c.written)} changed, from ${plural(num(c.answers), 'tagged answer')}${tail}${instant}`, who: auto };
+    }
     case 'systems_tidy':
       return st === 'failed' ? { source: 'Catch-up', what: 'System labels tidy failed, it tries again next minute', who: auto }
         : { source: 'Catch-up', what: `System labels tidied to UWorld's names: ${plural(num(c.blocks), 'block')}, ${plural(num(c.labels), 'miss label')}`, who: auto };
@@ -408,6 +505,9 @@ export function jobLine(r) {
       return st === 'failed' ? { source: 'Sync', what: `${word} stopped working (3 tries in a row)`, who: auto } : { source: 'Sync', what: `${word} is working again`, who: auto };
     }
     case 'outbox':
+      // 1 Nov 2026: a lesson card's link waiting for its miss is not a failure (0079 restated the old failed lines).
+      if (c.waited) return { source: 'Anki', what: "A lesson card's link to its miss waited: the miss was not in the Anki mistake log yet. Not a failure, it is linked once the miss is there", who: auto };
+      if (num(c.skipped)) return { source: 'Anki', what: `${plural(num(c.skipped), 'lesson card link')} skipped: the miss never reached the Anki mistake log in 30 days`, who: auto };
       return { source: ref === 'onenote' ? 'OneNote' : 'Anki', what: `${plural(num(c.n), 'item')} could not be sent to ${OUTBOX_TO[ref] || 'Anki'}${num(c.gave_up) ? `, ${num(c.gave_up)} gave up after ${OUTBOX_TRIES} tries` : ', will retry'}`, who: auto };
     case 'anki_voice_gaps':
       return ref === 'off' ? { source: 'Anki Voice', what: 'Anki Voice is not sending missed cards to your map: it has no practice hub key', who: 'Anki Voice' }
@@ -417,6 +517,249 @@ export function jobLine(r) {
       return ref === 'monthly' ? { source: 'Claude', what: `The monthly limit ($${num(c.cap)}) is reached: AI work waits for the new month${times}`, who: auto }
         : { source: 'Claude', what: `Claude's daily limit ($${num(c.cap)}) reached: AI checks and judging wait until tomorrow${times}`, who: auto };
     }
+    case 'rejudge': {
+      const head = ref === 'dry' ? 'Look-alike re-judge, dry run (nothing changed yet)' : 'Look-alike re-judge';
+      if (st === 'failed') return { source: 'Map', what: `${head} failed${c.misses ? ` after ${plural(num(c.misses), 'miss', 'misses')}` : ''}`, who: auto };
+      if (st === 'held' && !num(c.judged) && !num(c.reused)) return { source: 'Map', what: `${head} waits for Claude's daily limit`, who: auto };
+      const bits = [`${plural(num(c.judged) + num(c.reused), 'miss', 'misses')} read from your words`, `${num(c.confusion)} real mix-ups`,
+        `${plural(num(c.removed), 'look-alike penalty', 'look-alike penalties')} ${ref === 'dry' ? 'would go' : 'removed'}`, `${num(c.kept)} kept`];
+      if (num(c.links_removed)) bits.push(`${plural(num(c.links_removed), 'look-alike link')} retired`);
+      if (num(c.left)) bits.push(`${num(c.left)} left to read`);
+      if (num(c.waiting)) bits.push(`${num(c.waiting)} waiting for their batch (run it again once it is back)`);
+      if (st === 'held') bits.push("the rest wait for Claude's daily limit");
+      return { source: 'Map', what: `${head}: ${bits.join(', ')}${ref === 'dry' ? '' : ' (undo puts it back)'}`, who: auto };
+    }
+    case 'overnight': {
+      if (st === 'failed') return { source: 'Map', what: 'Before-and-after snapshot of the colours failed', who: auto };
+      if (ref === 'snapshot') return { source: 'Map', what: `Colours kept before ${num(c.version) >= 9 ? "a lesson's closing viva counted at half weight" : num(c.version) >= 8 ? 'vivas and card days counted toward blue' : num(c.version) >= 7 ? 'the starting guess was learned' : 'the re-weighing by cause'}: ${plural(num(c.topics), 'topic')}`, who: auto };
+      if (num(c.version) >= 8) return { source: 'Map', what: `What changed overnight: ${plural(num(c.moved), 'topic')} moved, ${num(c.lifted)} allowed blue by your viva and spaced card answers`, who: auto };
+      if (num(c.version) >= 7) return { source: 'Map', what: `What changed overnight: ${plural(num(c.moved), 'topic')} moved, ${num(c.guess)} by the starting guess learned from your first answers`, who: auto };
+      return { source: 'Map', what: `What changed overnight: ${plural(num(c.moved), 'topic')} moved, ${num(c.penalties)} after a look-alike penalty came off${num(c.unseen) ? `, ${num(c.unseen)} back to unseen` : ''}`, who: auto };
+    }
+    case 'scores_version':
+      return st === 'failed' ? { source: 'Map', what: `Scores for the new rules (v${num(c.version) || ''}): the recompute failed, it tries again`, who: auto }
+        : { source: 'Map', what: `Scores recomputed for the new rules (v${num(c.version)}): ${plural(num(c.topics), 'topic')} so far`, who: auto };
+    case 'gap_retract':
+      return st === 'failed' ? { source: 'Anki Voice', what: 'A rating undone in Anki Voice could not be taken off the map', who: 'Anki Voice' }
+        : { source: 'Anki Voice', what: `${plural(num(c.ratings), 'rating')} undone in Anki Voice taken off the map (${plural(num(c.gaps), 'gap')}, ${plural(num(c.reviews), 'card review')})`, who: 'Anki Voice' };
+    case 'hygiene': {
+      const head = ref === 'dry' ? 'Data clean-up, dry run (nothing changed yet)' : ref === 'undo' ? 'Data clean-up undone' : 'Data clean-up';
+      if (st === 'failed') return { source: 'Map', what: `${head} failed`, who: auto };
+      if (ref === 'undo') return { source: 'Map', what: `${head}: ${plural(num(c.undone), 'batch', 'batches')} put back`, who: auto };
+      const bits = [num(c.misses) && `${plural(num(c.misses), 'duplicate miss', 'duplicate misses')} merged`, num(c.miscs) && `${plural(num(c.miscs), 'repeated misconception')} merged`,
+        num(c.retests) && `${plural(num(c.retests), 'duplicate booking')} removed`, num(c.said) && `${num(c.said)} "said" that were not your words cleared`,
+        num(c.gaps) && `${plural(num(c.gaps), 'duplicate gap')} merged`, num(c.answers) && `${plural(num(c.answers), 'UWorld answer')} put on the map`,
+        num(c.forms) && `${plural(num(c.forms), 'mixed-with or quote')} that did not fit cleared`].filter(Boolean);
+      const verb = ref === 'dry' ? (bits.length ? `would change: ${bits.join(', ').replace(/ (merged|removed|cleared|put on the map)/g, '')}` : 'nothing to change') : bits.join(', ') || 'nothing to change';
+      return { source: 'Map', what: `${head}: ${verb}${ref === 'run' && num(c.batches) ? ' (undo puts it back)' : ''}`, who: auto };
+    }
+    case 'integrity': {
+      // A run from the map's Tidy (ref 'tidy') says so, beside the nightly one.
+      const tidy = ref === 'tidy';
+      if (st === 'failed') return { source: 'Map check', what: tidy ? 'Data checks from Tidy failed (tap Tidy to try again; they also run tonight at 02:08)' : 'Data checks failed, they run again tonight (02:08)', who: auto };
+      const what = r.detail || (num(c.failing) ? `Data checks: ${num(c.failing)} of ${num(c.checks)} flag rows (${num(c.rows)})` : `Data checks: all ${num(c.checks)} pass`);
+      return { source: 'Map check', what: tidy ? what.replace(/^Data checks:/, 'Data checks (from Tidy):') : what, who: auto };
+    }
+    case 'provenance': {
+      if (st === 'failed') return { source: 'Map', what: 'Your words on each miss: reading them from the recordings failed, it tries again next hour', who: auto };
+      const bits = [`${plural(num(c.filled), 'miss', 'misses')} now show your own words with their time`];
+      if (num(c.none)) bits.push(`${num(c.none)} had no words that could be told apart (Claude's summary only)`);
+      if (num(c.left)) bits.push(`${num(c.left)} left to read`);
+      return { source: 'Map', what: `Your words on each miss: ${bits.join(', ')}`, who: auto };
+    }
+    case 'self_rating': {
+      if (st === 'failed') return { source: 'Map', what: `A self-rating could not be saved${r.detail ? ` (${r.detail})` : ''}`, who: 'you' };
+      const bits = [];
+      if (num(c.pairs)) bits.push(`${plural(num(c.pairs), 'look-alike or link pair')}`);
+      if (num(c.after)) bits.push(`${num(c.after)} after seeing the answers (half weight)`);
+      const head = `You rated ${plural(num(c.parts), 'topic part')} today${num(c.topics) ? `, on ${plural(num(c.topics), 'topic')}` : ''}`;
+      return { source: 'Map', what: `${head}${bits.length ? ` (${bits.join('; ')})` : ''}: each a light signal on the colour`, who: 'you' };
+    }
+    case 'viva': {
+      // The viva (viva.js, wave 4): a rubric built, a viva graded with its counts, the 5-minute audit's picks, failures.
+      const topic = r.detail ? `: ${r.detail}` : '';
+      if (c.kind === 'rubric') {
+        if (st === 'failed') return { source: 'Lessons', what: `Viva rubric could not be built${topic}, it tries again`, who: auto };
+        if (st === 'held') return { source: 'Lessons', what: "Viva rubrics wait for Claude's daily limit", who: auto };
+        return { source: 'Lessons', what: `Viva rubric ${c.rebuilt ? 'rebuilt (your sources changed)' : 'built'}${topic} (${plural(num(c.points), 'key point')}, ${num(c.high)} high-yield)`, who: auto };
+      }
+      if (c.kind === 'audit') {
+        if (st === 'failed') return { source: 'Lessons', what: 'Map audit: topics could not be picked', who: auto };
+        return { source: 'Lessons', what: `Map audit: ${plural(num(c.picked), 'topic')} picked${topic}`, who: auto };
+      }
+      // A lesson's "don't know it" (the viva-first lesson): every heading missing, nothing marked.
+      if (c.kind === 'skipped') return { source: 'Lessons', what: `${c.phase === 'after' ? 'Closing' : 'Opening'} lesson viva${topic}: "don't know it", every heading missing`, who: auto };
+      if (st === 'failed') return { source: 'Lessons', what: `Viva grading failed${topic}${c.final ? ', given up' : ', it tries again'}`, who: auto };
+      if (st === 'held') return { source: 'Lessons', what: "Viva grading waits for Claude's daily limit", who: auto };
+      const word = { matched: 'the map matched', too_red: 'the map was too red', too_green: 'the map was too green' }[c.surprise] || null;
+      const bits = [`${num(c.said)} of ${num(c.of)} key points said`, `${num(c.wrong)} wrong`, `${num(c.missing)} missing`];
+      if (num(c.misconceptions)) bits.push(plural(num(c.misconceptions), 'misconception'));
+      if (num(c.gaps)) bits.push(`${plural(num(c.gaps), 'gap')} on other topics`);
+      if (word) bits.push(word);
+      if (c.phase === 'after') bits.push('counted at half weight');
+      const what = c.audit ? 'Map audit graded' : c.panel ? 'Topic panel viva graded' : c.phase === 'before' ? 'Opening lesson viva marked'
+        : c.phase === 'after' ? 'Closing lesson viva marked' : 'Viva graded';
+      return { source: 'Lessons', what: `${what}${topic}: ${bits.join(', ')}`, who: auto };
+    }
+    case 'shadow': {
+      if (st === 'failed') return { source: 'Map check', what: 'Shadow test of a new scoring rule failed, it tries again next minute', who: auto };
+      const rule = c.challenger ? `rules ${c.challenger}` : 'the new rule';
+      if (num(c.replay)) return { source: 'Map check', what: `Shadow test of ${rule}: ${plural(num(c.scored), 'past answer')} replayed today, more to go`, who: auto };
+      const ll = num(c.ll_challenger) && num(c.ll_champion) ? ` (${(num(c.ll_challenger) / 1000).toFixed(2)} vs ${(num(c.ll_champion) / 1000).toFixed(2)})` : '';
+      const n = plural(num(c.n), 'answer');
+      if (c.verdict === 'better' && num(c.auto)) return { source: 'Map', what: `Shadow test: the new rule predicts your answers better on ${n}${ll}; switched to it automatically (Undo puts the old one back)`, who: auto };
+      if (c.verdict === 'better') return { source: 'Map check', what: `Shadow test: the new rule predicts your answers better on ${n}${ll}; tap Switch on the map's Tidy`, who: auto };
+      if (num(c.live) && c.verdict !== 'better') return { source: 'Map check', what: `Shadow test: the rule you switched to is no longer clearly better on ${n}${ll}; Switch back is on the map's Tidy`, who: auto };
+      if (c.verdict === 'not_better') return { source: 'Map check', what: `Shadow test: the new rule was not better on ${n}${ll}; kept the current one`, who: auto };
+      return { source: 'Map check', what: r.detail || `Shadow test of ${rule}: no verdict yet on ${n}`, who: auto };
+    }
+    case 'starting_guess': {
+      if (st === 'failed') return { source: 'Map check', what: 'Starting guess: learning it from your first answers failed, it tries again tonight', who: auto };
+      if (num(c.changed)) return { source: 'Map', what: `${r.detail || `Starting guess ${num(c.to) > num(c.from) ? 'raised' : 'lowered'} from ${num(c.from)}% to ${num(c.to)}% from your first answers`}${num(c.rescored) ? `; ${plural(num(c.rescored), 'colour')} re-read` : ''}`, who: auto };
+      return { source: 'Map check', what: `Starting guess checked: ${num(c.to)}% from ${plural(num(c.n), 'first answer')}, unchanged`, who: auto };
+    }
+    case 'habits_recount': {
+      // Look-alike swaps kept only for real confusions (patterns.js recountHabits).
+      if (st === 'failed') return { source: 'Map', what: 'Habits recount failed, it tries again at the next profile slot', who: auto };
+      if (!num(c.retired)) return { source: 'Map', what: `Habits recount: every "mixed up two look-alikes" (${num(c.after)}) is a real mix-up, nothing changed`, who: auto };
+      return { source: 'Map', what: `Habits recount: "mixed up two look-alikes" ${num(c.before)} to ${num(c.after)} (${plural(num(c.retired), 'miss', 'misses')} that were not mix-ups); profile rebuilt (undo puts it back)`, who: auto };
+    }
+    case 'card_tray': {
+      // Card ratings whose card no topic names go to the tray for Claude to place (anki-reviews.js).
+      if (st === 'failed') return { source: 'Cards', what: 'Card ratings with no topic could not be sent to the tray, it tries again', who: auto };
+      const bits = [];
+      if (num(c.queued)) bits.push(`${plural(num(c.queued), 'card rating')} sent to the tray (no topic names the card yet)`);
+      if (num(c.found)) bits.push(`${plural(num(c.found), 'missing Cards page rating')} read again from Anki`);
+      return { source: 'Cards', what: `${bits.join('; ') || 'No card ratings waiting'}: once Claude places a card, its earlier ratings count`, who: auto };
+    }
+    case 'pictures': {
+      // A picture on every topic (auto-pictures.js): a day's runs in one line, failures and the spend cap their own.
+      if (st === 'failed') return { source: 'Map', what: `Pictures: ${plural(num(c.n), 'topic')} could not be looked up (Anki or Claude failed), tried again in an hour`, who: auto };
+      if (st === 'held') return { source: 'Map', what: "Pictures: unclear matches wait for Claude's daily limit", who: auto };
+      const from = `AnKing tables ${num(c.anking)}, AnKing cards ${num(c.cards)}, NBME ${num(c.nbme)}`;
+      const bits = [`${plural(num(c.got), 'topic')} got a picture (${from})`, `${num(c.none)} had none that matched`];
+      if (num(c.ai)) bits.push(`${num(c.ai)} unclear checked by Claude`);
+      if (num(c.left)) bits.push(`${num(c.left)} left to look at`);
+      return { source: 'Map', what: `Pictures: ${bits.join(', ')}`, who: auto };
+    }
+    case 'concepts': {
+      if (ref === 'apply') {
+        if (st === 'failed') return { source: 'Map', what: 'Root causes: placing concepts under your misses failed, it tries again next hour', who: auto };
+        const bits = [`${plural(num(c.applied), 'miss', 'misses')} tied to the concept underneath`];
+        if (num(c.links)) bits.push(`${plural(num(c.links), 'new line')} from a concept to a topic (proposed)`);
+        if (num(c.queued)) bits.push(`${plural(num(c.queued), 'new concept')} for Claude to place`);
+        if (num(c.named)) bits.push(`${plural(num(c.named), 'waiting concept')} found on your map and taken off the queue`);
+        if (num(c.skipped)) bits.push(`${num(c.skipped)} already counted or gone`);
+        return { source: 'Map', what: `Root causes: ${bits.join(', ')}${num(c.batches) ? ' (undo puts it back)' : ''}`, who: auto };
+      }
+      const head = ref === 'dry' ? 'Root-cause back-fill, dry run (nothing changed yet)' : ref === 'undo' ? 'Root-cause back-fill undone' : 'Root-cause back-fill';
+      if (st === 'failed') return { source: 'Map', what: `${head} failed`, who: auto };
+      if (ref === 'undo') return { source: 'Map', what: `${head}: ${plural(num(c.undone), 'batch', 'batches')} put back`, who: auto };
+      if (st === 'held' && !num(c.judged) && !num(c.reused)) return { source: 'Map', what: `${head} waits for Claude's daily limit`, who: auto };
+      const bits = [`${plural(num(c.judged) + num(c.reused), 'miss or belief', 'misses and beliefs')} read`, `${num(c.concepts)} rest on a concept`];
+      if (ref !== 'dry') bits.push(`${num(c.applied)} tied to it now`, `${num(c.queued)} new concepts for Claude to place`);
+      if (num(c.left)) bits.push(`${num(c.left)} left to read`);
+      if (st === 'held') bits.push("the rest wait for Claude's daily limit");
+      return { source: 'Map', what: `${head}: ${bits.join(', ')}${ref === 'run' && num(c.batches) ? ' (undo puts it back)' : ''}`, who: auto };
+    }
+    case 'card_roots': {
+      // The one-off repair (card-roots.js): cards on root-cause topics (foundation concepts) moved to their clinical topics.
+      if (st === 'failed') return { source: 'Map', what: `Moving cards off root-cause topics failed${r.detail ? ` (${r.detail})` : ''}; it runs again on the next deploy`, who: auto };
+      const more = num(c.unplaced) ? ` ${plural(num(c.unplaced), 'card')} named no clinical topic, so only taken off.` : '';
+      return { source: 'Map', what: `Cards on root-cause topics moved to their clinical topics: ${num(c.moved)} (undo puts them back).${more}`, who: auto };
+    }
+    case 'clusters': {
+      if (ref === 'names') {
+        if (st === 'failed') return { source: 'Map', what: 'Clusters: naming the new ones failed; they keep a name from their root', who: auto };
+        return { source: 'Map', what: `Clusters named: ${r.detail || plural(num(c.named), 'cluster')}`, who: auto };
+      }
+      if (st === 'failed') return { source: 'Map', what: 'Clusters: finding the groups of topics you mix up failed, it tries again tomorrow night', who: auto };
+      if (!num(c.found)) return { source: 'Map', what: `Clusters: none found${num(c.gone) ? `, ${plural(num(c.gone), 'old one')} gone` : ''}; your mix-ups do not group yet`, who: auto };
+      const [fresh, top] = String(r.detail || '').split(' | ').map(x => x.trim());
+      const bits = [`${num(c.found)} found`];
+      if (num(c.fresh)) bits.push(`${num(c.fresh)} new: ${fresh || 'a new one'}${num(c.top_new) ? ', costing you most' : ''}`);
+      if (top && !num(c.top_new)) bits.push(`costing you most: ${top}`);
+      if (num(c.gone)) bits.push(`${plural(num(c.gone), 'old one')} gone`);
+      if (num(c.naming)) bits.push('names for the new ones on their way');
+      return { source: 'Map', what: `Clusters: ${bits.join(', ')}`, who: auto };
+    }
+    case 'ai_batch': {
+      // The Message Batches API (claude.js batchTick): a day's batches in one line, a batch that could not be sent its own.
+      if (ref === 'unsent') return { source: 'Claude', what: `${plural(num(c.n), 'batched call')} could not be sent as a batch: each job asked directly instead`, who: auto };
+      if (st === 'failed') return { source: 'Claude', what: 'Batches could not be read back, tried again each minute', who: auto };
+      const bits = [`${plural(num(c.sent), 'call')} sent`, `${num(c.done)} answered`];
+      if (num(c.failed)) bits.push(`${num(c.failed)} asked directly instead`);
+      if (num(c.cents)) bits.push(`$${(num(c.cents) / 100).toFixed(2)} at half price`);
+      return { source: 'Claude', what: `Batches: ${bits.join(', ')}`, who: auto };
+    }
+    case 'ai_cost': {
+      // The week's AI spend and cache use (ai-cost.js), from the usage rows.
+      if (st === 'failed') return { source: 'Claude', what: "The week's AI spend could not be added up", who: auto };
+      const bits = [`$${(num(c.cents) / 100).toFixed(2)} over ${plural(num(c.calls), 'call')}`, `${num(c.hit)}% of input read from the cache`];
+      if (num(c.batch)) bits.push(`${num(c.batch)} by batch (saved $${(num(c.saved_cents) / 100).toFixed(2)})`);
+      if (c.top && c.top !== 'none') bits.push(`most: ${c.top}`);
+      return { source: 'Claude', what: `AI last 7 days: ${bits.join(', ')}`, who: auto };
+    }
+    case 'nbme_check': {
+      // An exam block's answers checked from their batch (analyze.js sweepBatched): one line a block, added up.
+      if (st === 'failed') return { source: 'Exam', what: `Exam answers check failed on ${plural(num(c.n), 'question')}, will retry`, who: auto };
+      return { source: 'Exam', what: `Exam answers checked from their batch: ${plural(num(c.checked), 'question')}`, who: auto };
+    }
+    case 'fact_check': {
+      // The nightly fact check (map_rules fact_check): its own words, "Corrected 1 card: ..." or "4 cards and 2 lessons checked, nothing wrong".
+      const d = String(r.detail || 'done');
+      return { source: 'Claude', what: `Fact check: ${d.charAt(0).toUpperCase()}${d.slice(1)}`, who: 'Claude, the nightly session' };
+    }
+    case 'card_fix': {
+      if (ref === 'review') {
+        const sus = num(c.suspended);
+        const kinds = [['low_yield', 'low yield'], ['duplicate', 'duplicate'], ['wrong', 'wrong']].filter(([k]) => num(c[k]));
+        const why = !sus || !kinds.length ? '' : kinds.length === 1 ? ` (${kinds[0][1]})` : ` (${kinds.map(([k, w]) => `${num(c[k])} ${w}`).join(', ')})`;
+        const bits = [`${num(c.rewritten)} rewritten`, `${sus} suspended${why}`, `${num(c.kept)} kept`];
+        return { source: 'Cards', what: `Cards reviewed by Claude: ${bits.join(', ')}; "undo that" puts one back`, who: 'Claude, the nightly session' };
+      }
+      if (ref === 'queue') {
+        if (st === 'failed') return { source: 'Cards', what: 'Cards for Claude: leeches and slow cards could not be read from Anki Voice, it tries again in 10 minutes', who: auto };
+        if (st === 'held') return { source: 'Cards', what: `Cards for Claude: waiting (${r.detail || 'an update is needed'})`, who: auto };
+        const found = num(c.leeches) + num(c.slow);
+        const head = found ? `${plural(num(c.leeches), 'leech', 'leeches')} and ${plural(num(c.slow), 'slow card')} queued for Claude tonight` : 'No new leeches or slow cards tonight';
+        return { source: 'Cards', what: `${head} (${num(c.waiting)} waiting in all)`, who: auto };
+      }
+      if (st === 'failed') return { source: 'Cards', what: 'A skipped card could not be sent to Claude; it is still buried for today', who: auto };
+      if (st === 'held') return { source: 'Cards', what: `Skipped cards: ${r.detail || 'waiting for an update of the hub'}`, who: auto };
+      const bits = [`${plural(num(c.skipped), 'skipped card')} sent to Claude to look at tonight`];
+      if (num(c.not_now)) bits.push(`${num(c.not_now)} just not now`);
+      if (num(c.undone)) bits.push(`${num(c.undone)} undone`);
+      return { source: 'Cards', what: bits.join(', '), who: 'you, with Skip' };
+    }
+    case 'nightly_session':
+      // The nightly scheduled Claude session's summary (map_overview {note}), in its own words, symbols taken out.
+      return { source: 'Claude', what: `Nightly review: ${r.detail || 'done'}`, who: 'Claude, the nightly session' };
+    case 'forecast': {
+      if (ref === 'check') {
+        const so_far = num(c.n) ? `; ${num(c.in80)} of ${plural(num(c.n), 'form')} inside the 80% range, off by ${num(c.mae)} on average` : '';
+        const d = num(c.actual) - num(c.pred);
+        const how = d === 0 ? 'spot on' : `${Math.abs(d)} ${d > 0 ? 'higher' : 'lower'}`;
+        return { source: 'Forecast', what: c.kind === 'pct'
+          ? `${c.label || 'A form'}: forecast ${num(c.pred)}, your percent reads as ${num(c.actual)} (${how})${so_far}`
+          : `${c.label || 'A form'}: forecast ${num(c.pred)}, you scored ${num(c.actual)} (${how})${so_far}`, who: auto };
+      }
+      if (st === 'failed') return { source: 'Forecast', what: 'Score forecast could not be worked out, it tries again next hour', who: auto };
+      const ch = c.change == null ? '' : num(c.change) > 0 ? `, up ${num(c.change)} this week` : num(c.change) < 0 ? `, down ${-num(c.change)} this week` : ', same as last week';
+      return { source: 'Forecast', what: `Forecast ${num(c.mid)} (${num(c.low)} to ${num(c.high)})${ch}${c.rough ? ', rough' : ''}${r.detail ? `. Best next hour: ${r.detail.replace(/\.$/, '')}` : ''}`, who: auto };
+    }
+    case 'gap_dedupe':
+      return { source: 'Gaps', what: `${plural(num(c.gaps), 'gap')} on a question already on the map joined that answer instead of counting twice`, who: auto };
+    case 'bug': {
+      const said = r.detail || 'a screenshot, no words';
+      if (c.closed === 'dropped') return { source: 'Hub', what: `Problem report closed without a change: ${said}`, who: 'Claude Code' };
+      if (c.closed) return { source: 'Hub', what: `Problem fixed: ${said}${c.fix ? ` (${c.fix})` : ''}`, who: 'Claude Code' };
+      const from = c.source === 'voice' ? 'by voice in Anki Voice' : c.source === 'anki_voice' ? 'from Anki Voice' : 'from the hub';
+      return { source: 'Hub', what: `Problem reported: ${said}${c.shot ? ' (with a screenshot)' : ''}`, who: `you, ${from}` };
+    }
+    case 'form_stamp':
+      // A form_version stamp that did not save (job-log.js stampFailed): the catch-ups read it to know what to redo.
+      return { source: 'Hub', what: `Could not save which form made ${FORM_WORD[ref] || 'an analysis'}${num(c.n) > 1 ? ` (${num(c.n)} times)` : ''}`, who: auto };
     case 'minute': case 'cron':
       return { source: 'Hub', what: `Background job failed: ${JOB_WORD[ref] || ref}${num(c.n) > 1 ? ` (${num(c.n)} times)` : ''}`, who: auto };
     default:
@@ -500,7 +843,8 @@ export function activityOf({ batches = [], syncs = [], judged = [], checked = []
   }
   for (const g of voiceGaps) add(g.at, 'Anki Voice', `Anki Voice sent ${plural(num(g.n), 'missed card')} to your map`, 'Anki Voice');
   for (const r of retestsClosed) {
-    add(r.at, 'Re-tests', `${plural(num(r.n), 're-test')} closed by ${r.done_by === 'card' ? (num(r.n) === 1 ? 'its Anki card' : 'their Anki cards') : "a lesson's final case"} (${num(r.got)} right, ${num(r.n) - num(r.got)} missed again)`, 'the hub, automatically');
+    add(r.at, 'Cards', r.done_by === 'card' ? `First answer on ${plural(num(r.n), 'card')} from your misses: ${num(r.got)} right, ${num(r.n) - num(r.got)} missed`
+      : `${plural(num(r.n), 'miss', 'misses')} checked again in a lesson's final case: ${num(r.got)} right, ${num(r.n) - num(r.got)} missed`, 'the hub, automatically');
   }
   for (const o of sent) add(o.at, o.kind === 'onenote' ? 'OneNote' : 'Anki', `${plural(Number(o.n), 'item')} sent to ${OUTBOX_TO[o.kind] || 'Anki'}`, 'the hub, automatically');
   return collapseRepeats(out.filter(x => Number.isFinite(x.at) && x.at > 0).sort((a, b) => b.at - a.at)).slice(0, ACTIVITY_MAX);

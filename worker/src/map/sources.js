@@ -6,6 +6,7 @@ import { cardEvidence, mergeCardDay, parseSchedule, MAX_TOPICS_PER_CARD } from '
 import { mehlmanFor, resourceId, CACHE_MS as MEHLMAN_MS } from './mehlman.js';
 import { fnv1a, EVIDENCE_COLS } from './ingest/map-fields.js';
 import { norm, contentWords, spanQualified, contextWords, contextBars, namedIn } from '../../../public/js/shared/names.js';
+import { isRootCause, CLINICAL_SQL, notRootTopic } from './card-roots.js';
 
 export const MY_DECK = 'Step 2 — My Cards';
 export const CARDS_MS = 10 * 60_000;          // cards are stale after 10 minutes
@@ -91,10 +92,35 @@ export function noteOf(cardId, noteIds) {
 const nameOf = n => (isObj(n) ? { alias: n.alias, abbrev: n.kind === 'abbrev' } : { alias: n, abbrev: false });
 const capsWord = (raw, alias) => new RegExp(`(?:^|[^A-Za-z0-9])${String(alias).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:[^A-Za-z0-9]|$)`).test(raw);
 
+export const GENERIC_NAMES = new Set(['thyroid', 'antibody', 'autoantibody', 'receptor', 'hormone', 'enzyme', 'protein', 'gene', 'cell', 'blood', 'heart',
+  'lung', 'liver', 'kidney', 'brain', 'bone', 'skin', 'tumor', 'mass', 'infection', 'inflammation', 'immunology', 'physiology', 'pathology', 'pharmacology']);
+const genericName = n => { const k = norm(nameOf(n).alias); return !k.includes(' ') && GENERIC_NAMES.has(k); };
+/** A topic's names as card matching uses them: the one-word general ones left out (pure). */
+export const cardNames = names => (names || []).filter(n => n && !genericName(n));
+
+// Small words a name's content words may have between them in a card ("embolism of the lung" is not; "pulmonary
+// embolism, acute" keeps its two words side by side).
+const BETWEEN = new Set(['a', 'an', 'the', 'of', 'in', 'on', 'and', 'or', 'with', 'to', 'for', 'by', 'vs', 'versus', 'due', 'from']);
+// Every content word of a name, side by side in the text (any order, only small words between): "TSH receptor
+// antibodies" is not named by "the TSH, and acetylcholine receptor antibodies" (a word of its own comes between).
+function contentRun(tokens, cw) {
+  const want = new Set(cw);
+  for (let i = 0; i < tokens.length; i++) {
+    if (!want.has(tokens[i])) continue;
+    const got = new Set();
+    for (let j = i; j < tokens.length; j++) {
+      if (want.has(tokens[j])) { got.add(tokens[j]); if (got.size === want.size) return true; continue; }
+      if (!BETWEEN.has(tokens[j])) break;
+    }
+  }
+  return false;
+}
+
 /**
  * Does the card's text name the topic? A name or alias (3 or more characters) appears as whole words in the
- * case or answer, or every content word of a name of 2 or more content words does. Both sides through norm();
- * an abbreviation alias ({alias, kind: 'abbrev'}) only as written, in capitals ('LAST', never "last month").
+ * case or answer, or every content word of a name of 2 or more content words does, side by side (only small words
+ * between). Both sides through norm(); an abbreviation alias ({alias, kind: 'abbrev'}) only as written, in capitals
+ * ('LAST', never "last month"); a one-word general name ("thyroid", GENERIC_NAMES) never.
  */
 export function namesTopic(card, names) {
   return nameHits(`${card.question || ''} ${card.answer || ''}`, names).length > 0;
@@ -103,16 +129,16 @@ export function namesTopic(card, names) {
 // The keys of the names that the text names (see namesTopic).
 function nameHits(raw, names) {
   const text = ` ${norm(raw)} `;
-  const words = new Set(text.trim().split(' '));
+  const tokens = text.trim().split(' ');
   const out = [];
-  for (const x of names || []) {
+  for (const x of cardNames(names)) {
     const n = nameOf(x);
     const k = norm(n.alias);
     if (!k) continue;
     if (n.abbrev) { if (k.length >= 2 && capsWord(raw, String(n.alias).trim())) out.push(k); continue; }
     if (k.length >= 3 && text.includes(` ${k} `)) { out.push(k); continue; }
     const cw = contentWords(k);
-    if (cw.length >= 2 && cw.every(w => words.has(w))) out.push(k);
+    if (cw.length >= 2 && contentRun(tokens, cw)) out.push(k);
   }
   return out;
 }
@@ -294,8 +320,10 @@ async function readCards(env, user, cardIds, day) {
   const keys = JSON.stringify(cardIds.flatMap(id => [`cardstate:${id}`, `cardlapses:${id}`, `card:${id}:${day}`]));
   const [c, l, e] = await env.DB.batch([
     q(`SELECT card_id, note_id, question, answer, schedule, lapses, full FROM card_cache WHERE user_id = ? AND card_id IN (SELECT value FROM json_each(?))`, user, ids),
-    q(`SELECT card_id, topic_id, strong FROM card_topics WHERE user_id = ? AND card_id IN (SELECT value FROM json_each(?)) AND removed_at IS NULL
-       ORDER BY created_at, topic_id`, user, ids),
+    // Never a root-cause topic's link (card-roots.js): its card rows would colour a foundation concept.
+    q(`SELECT ct.card_id, ct.topic_id, ct.strong FROM card_topics ct JOIN topics t ON t.user_id = ct.user_id AND t.id = ct.topic_id
+       WHERE ct.user_id = ? AND ct.card_id IN (SELECT value FROM json_each(?)) AND ct.removed_at IS NULL AND ${CLINICAL_SQL('t')}
+       ORDER BY ct.created_at, ct.topic_id`, user, ids),
     q(`SELECT * FROM evidence WHERE user_id = ? AND obs_key IN (SELECT value FROM json_each(?))`, user, keys),
   ]);
   const cache = new Map((c.results || []).map(r => [Number(r.card_id), r]));
@@ -329,7 +357,7 @@ export function planCards(cards, src, held, { topicId, now, day, deck }) {
     // The Anki server's search matches inside words, in every field, and falls back to any one word ('ms' in
     // "symptoms", a look-alike in the notes): a keyword hit becomes a link only when the case or answer names the
     // topic strictly (namedIn).
-    const named = strongNow || namedIn(`${c.question || ''}\n${c.answer || ''}`, names);
+    const named = strongNow || namedIn(`${c.question || ''}\n${c.answer || ''}`, cardNames(names));
     if ((!link && named) || (link && ((!wasStrong && strongNow) || (link.match === 'search' && match !== 'search')))) {
       linkRows.push({ card_id: c.card_id, topic_id: topicId, match: link && link.match !== 'search' ? link.match : match, strong: isStrong ? 1 : 0, created_at: now });
     }
@@ -364,7 +392,7 @@ function linkStatements(env, user, rows) {
   if (!rows.length) return [];
   return [env.DB.prepare(`INSERT INTO card_topics (user_id, card_id, topic_id, match, strong, created_by, created_at)
     SELECT ?1, json_extract(value, '$.card_id'), json_extract(value, '$.topic_id'), json_extract(value, '$.match'), json_extract(value, '$.strong'),
-      'code', json_extract(value, '$.created_at') FROM json_each(?2) WHERE true
+      'code', json_extract(value, '$.created_at') FROM json_each(?2) WHERE ${notRootTopic('?1', "json_extract(value, '$.topic_id')")}
     ON CONFLICT (user_id, card_id, topic_id) DO UPDATE SET strong = max(card_topics.strong, excluded.strong),
       match = CASE WHEN card_topics.match = 'search' THEN excluded.match ELSE card_topics.match END
     WHERE card_topics.removed_at IS NULL`).bind(user, JSON.stringify(rows))];
@@ -398,8 +426,10 @@ async function runRefresh(env, user, topicId, opts) {
   if (!src.topic || src.topic.status === 'merged') return { cards: 'skipped', mehlman: 'skipped', changed: false };
   const due = opts.force ? kinds : staleKinds(src.fetches, now, kinds);
   const recent = k => { const f = src.fetches.find(x => x.kind === k); return opts.minAgeMs > 0 && f && now - f.fetched_at < opts.minAgeMs; };
-  const todo = due.filter(k => !recent(k));
-  const out = { cards: kinds.includes('cards') ? 'cached' : 'skipped', mehlman: kinds.includes('mehlman') ? 'cached' : 'skipped', changed: false };
+  // A root-cause topic (a foundation concept) has no cards of its own: cards sit on clinical topics (card-roots.js).
+  const rootTopic = isRootCause(src.topic);
+  const todo = due.filter(k => !recent(k) && !(rootTopic && k === 'cards'));
+  const out = { cards: kinds.includes('cards') && !rootTopic ? 'cached' : 'skipped', mehlman: kinds.includes('mehlman') ? 'cached' : 'skipped', changed: false };
   if (!todo.length) return out;
 
   const timeoutMs = opts.timeoutMs || TIMEOUT_MS;

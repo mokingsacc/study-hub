@@ -86,7 +86,7 @@ export function tidyCard(card) {
   return out;
 }
 
-export const OUTGOING_FIELDS = ['paraphrase', 'gap', 'rule', 'look_alike', 'topic'];
+export const OUTGOING_FIELDS = ['paraphrase', 'gap', 'rule', 'look_alike', 'topic', 'cause_detail', 'concept'];   // concept: foundations (concepts.js)
 
 // Leak failures for a whole result: [{field, run}].
 export function leakFailures(index, result) {

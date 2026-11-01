@@ -1,5 +1,6 @@
 import { json, readJson, HttpError } from '../util.js';
 import { writeBatch } from './events.js';
+import { isFoundationCategory, ringCentre } from '../../../public/js/shared/concept.js';
 
 export const R0 = 600;                       // the first-load circle of category centres
 export const GAP = 2.5;                      // world units between two discs
@@ -73,21 +74,27 @@ export function placeAll(news, { placed = [], categories = {}, order = [], neigh
   const at = new Map();
   const units = new Map(), members = new Map();
   const addTo = (m, k, x, y) => { if (!k) return; const s = m.get(k) || { x: 0, y: 0, n: 0 }; s.x += x; s.y += y; s.n++; m.set(k, s); };
-  const addUnit = (u, x, y) => addTo(units, u, x, y);
+  // a unit's middle among its topics of one system only: a checklist unit can hold topics of several systems (a unit
+  // from before the v2 split holds Neuro, Eye and ENT ones), and its middle over all of them sits in another galaxy
+  const unitKey = (u, cat) => (u ? `${u}|${cat || '_none'}` : null);
+  const addUnit = (u, cat, x, y) => addTo(units, unitKey(u, cat), x, y);
   for (const p of placed) {
     if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) continue;
     g.add(p.x, p.y, placeRadius(p));
     at.set(p.id, p);
-    addUnit(p.unit_id, p.x, p.y);
+    addUnit(p.unit_id, p.category_id, p.x, p.y);
     addTo(members, p.category_id || '_none', p.x, p.y);
   }
   const cats = { ...categories };
   const madeCats = [];
   const catOrder = order.slice();
+  // A foundation system (shared/concept.js) starts on the ring round everything placed, never in the donut's hole.
+  let reach = 0;
+  for (const p of placed) if (Number.isFinite(p.x) && Number.isFinite(p.y)) reach = Math.max(reach, Math.hypot(p.x, p.y) + placeRadius(p));
   const centreOf = cid => {
     if (cats[cid]) return cats[cid];
     if (!catOrder.includes(cid)) catOrder.push(cid);
-    const c = circleCentre(catOrder.indexOf(cid), catOrder.length);
+    const c = isFoundationCategory(cid) ? ringCentre(cid, reach) : circleCentre(catOrder.indexOf(cid), catOrder.length);
     cats[cid] = c;
     madeCats.push({ id: cid, ...c });
     return c;
@@ -103,7 +110,7 @@ export function placeAll(news, { placed = [], categories = {}, order = [], neigh
     const cat = t.category_id || '_none';
     const nb = (neighbours[t.id] || []).map(id => at.get(id)).filter(p => p && (p.category_id || '_none') === cat).slice(0, NEIGHBOURS);
     if (nb.length) anchor = { x: nb.reduce((a, p) => a + p.x, 0) / nb.length, y: nb.reduce((a, p) => a + p.y, 0) / nb.length };
-    else if (t.unit_id && units.get(t.unit_id)) { const u = units.get(t.unit_id); anchor = { x: u.x / u.n, y: u.y / u.n }; }
+    else if (t.unit_id && units.get(unitKey(t.unit_id, t.category_id))) { const u = units.get(unitKey(t.unit_id, t.category_id)); anchor = { x: u.x / u.n, y: u.y / u.n }; }
     else if (cats[cat] || !members.get(cat)) anchor = centreOf(cat);
     else { const s = members.get(cat); anchor = { x: s.x / s.n, y: s.y / s.n }; }
 
@@ -133,7 +140,7 @@ export function placeAll(news, { placed = [], categories = {}, order = [], neigh
     out.push(p);
     g.add(p.x, p.y, r);
     at.set(t.id, { ...p, yield: t.yield, lane: t.lane, unit_id: t.unit_id, category_id: t.category_id });
-    addUnit(t.unit_id, p.x, p.y);
+    addUnit(t.unit_id, t.category_id, p.x, p.y);
     addTo(members, cat, p.x, p.y);
   }
   return { topics: out, categories: madeCats.filter(c => c.id !== '_none') };

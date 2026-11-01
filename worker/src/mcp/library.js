@@ -1,4 +1,5 @@
 import { topicCount, topicCoverage, collectionsOf, spreadAcrossBooks } from '../library/search.js';
+import { tagOf } from '../map/fact-sources.js';
 
 const isObj = v => v !== null && typeof v === 'object' && !Array.isArray(v);
 export const LIBRARY_TRIM = ['library.passages:2'];
@@ -28,7 +29,7 @@ export function withLibrary(tool) {
         const passages = [];
         for (const d of cov.docs || []) for (const p of d.pages) for (const x of p.passages) passages.push({ cite: x.cite, doc_id: d.doc_id, page: p.page, passage_id: x.id, score: x.score, text: x.text });
         const coll = await collectionsOf(env, user, passages.map(x => x.doc_id));
-        const spread = spreadAcrossBooks(passages, x => coll.get(x.doc_id)).map(x => ({ ...x, source: coll.get(x.doc_id) || null }));
+        const spread = spreadAcrossBooks(passages, x => coll.get(x.doc_id)).map(x => ({ ...x, tag: tagOf(x.cite), source: coll.get(x.doc_id) || null }));
         const books = [...new Set((cov.docs || []).map(d => d.title))];
         return { ...r, library: { n: cov.n, docs: books.length, books, passages: spread.slice(0, LIBRARY_MAX), more: Math.max(0, spread.length - LIBRARY_MAX) } };
       } catch (e) {

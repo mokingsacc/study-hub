@@ -4,9 +4,12 @@ import { TRAPS, TRAP_KEYS, cleanTraps, recomputeHabits, refreshProfile, readProf
 import { stemSafe, questionSafe, gapSafe, leakIndexFor } from './guard.js';
 import { leaks } from '../checks.js';
 import { lookAlikeHead } from './links.js';
+import { causeOf, confusionShown, gapShowsConfusion } from '../../../public/js/shared/cause.js';
 import { addDays, daysLeft, NO_LESSON_ERRORS } from './teach-priority.js';
+import { readExamDay } from '../exam-day.js';
+import { AUDIT_SPECS, auditAndReask, checkItem, reaskText, recordAudit, auditWords, auditCounts } from '../ai-audit.js';
 
-export const PATTERN_DAILY_USD = 1.5, RESERVE_USD = 0.8;
+export const PATTERN_DAILY_USD = Infinity, RESERVE_USD = 0.8;
 export const ITEMS_PER_CALL = 40, HISTORY_MISSES = 40, HISTORY_GAPS = 20, MAX_TRIES = 3;
 export const MAX_MISCONCEPTIONS = 4, MAX_RECHECKS = 4, MAX_RETESTS = 3, CONTRADICTION_DAYS = 3;
 export const CATCHUP_DAYS = 60, DAILY_HOUR = 23, DAILY_MINUTE = 10, PROFILE_HOURS = [6, 13, 19], PROFILE_MINUTE = 37;
@@ -50,11 +53,11 @@ export const PATTERN_SYSTEM = `You review the newest mistakes of Mo, a learner p
 
 New items (refs n1, n2, ...) are misses (wrong, or right for a flawed reason) and gaps (a card or point he did not hold). History rows (h1, ...) are his other misses and gaps on the same topics. You also get his open misconceptions on these topics (ids mc_...), his current habits with counts, the traps already counted in each system, the profile written last time, and contradictions code found (sure and right, then sure and wrong on the same topic, or the reverse).
 
-1. items: for every new item, the reasoning traps behind it from the fixed list below, none to two, most telling first. A trap is how his thinking went wrong, not the topic and not the missing fact itself: a plain knowledge gap with no sign of a trap gets none. Judge from his words, the judge's trap label, the error type, the step that broke and the history. note: how it showed here, in at most 20 plain words, or null.
+1. items: for every new item, the reasoning traps behind it from the fixed list below, none to two, most telling first. A trap is how his thinking went wrong, not the topic and not the missing fact itself: a plain knowledge gap with no sign of a trap gets none. look_alike_swap only for an item whose cause is confusion (his words show he took one for the other or could not tell them apart); a look-alike line alone is a teaching contrast, not a swap. Judge from his words, the judge's trap label, the error type, the step that broke and the history. note: how it showed here, in at most 20 plain words, or null.
 2. habits: for each trap that recurs across topics or systems (new items and history together), one line on how it shows in him and the habit that would catch it ("goes for the trauma story first: read the drug list before the head CT"). Traps from the list only.
 3. misconceptions: wrong beliefs his words show he holds, new or seen again, at most 4: ref (the new item it showed in), topic as an AMBOSS article names it, belief in one line (in quotation marks when they are his own words). A real false belief ("metastases are never lytic"), not a missing fact.
 4. recheck: open misconceptions (by id) that his newer answers seem to contradict, such as a sure right answer on that point since, with why in one line. They are only marked for a re-check, never closed.
-5. retests: contradictions worth an early re-test, at most 3: the ref of the miss to re-test (n or h) and why in one line. Only where a sure answer flipped, never for a misread or test-taking slip.
+5. retests: contradictions worth an early check card, at most 3: the ref of the miss (n or h) and why in one line. Only where a sure answer flipped, never for a misread or test-taking slip.
 6. insight: one plain paragraph of at most 450 characters on how Mo reasons now, for whoever teaches him next: his strongest habits with an example ref ("UW 16048"), where he is overconfident, and what to watch for. Build on the last profile; change it only where the new items show something. No lists or symbols.
 7. headline: one line of at most 120 characters when a habit is new or clearly growing in these items ("Anchoring on the first clue again: 3 of 9 misses in this block"), else null.
 
@@ -80,10 +83,18 @@ export const PATTERN_SCHEMA = {
 
 const ERR_WORDS = { knowledge_gap: 'knowledge gap', premature_closure: 'premature closure', faulty_synthesis: 'faulty synthesis', misread: 'misread', test_taking: 'test-taking',
   threshold: 'threshold or number', calculation: 'calculation' };
-const GAP_WORDS = { chat: 'stated in chat', anki_voice: 'Anki Voice review', spoken_cue: 'said aloud while recording', anki_mac: 'Anki check', anki_hub: 'Anki check', anki_phone: 'Anki check' };
+const GAP_WORDS = { chat: 'stated in chat', anki_voice: 'Anki Voice review', spoken_cue: 'said aloud while recording', anki_mac: 'Anki check', anki_hub: 'Anki check', anki_phone: 'Anki check', anki_voice_check: 'Anki check' };
+
+export function swapAllowed(kind, row) {
+  if (!row) return false;
+  if (kind === 'miss') return confusionShown(causeOf(row), [lookAlikeHead(row.look_alikes)].filter(Boolean));
+  return gapShowsConfusion(row) || /\b(?:vs\.?|versus)\b|\btell\b.+\b(?:from|apart)\b/i.test(String(row.gap || ''));
+}
 
 export function missLine(ref, m, { history = false } = {}) {
-  const head = [m.result, m.confidence, m.error_type ? ERR_WORDS[m.error_type] || m.error_type : null, m.step ? `step ${m.step}` : null,
+  const cause = causeOf(m);
+  const head = [m.result, m.confidence, m.error_type ? ERR_WORDS[m.error_type] || m.error_type : null, cause ? `cause ${cause.cause.replace(/_/g, ' ')}${cause.judged ? '' : ' (from the error type)'}` : null,
+    m.step ? `step ${m.step}` : null,
     m.flaw_kind ? m.flaw_kind.replace(/_/g, ' ') : null, m.time_s ? `${m.time_s} s` : null].filter(Boolean).join(', ');
   const parts = [`${ref} miss ${m.label || ''}, ${shortDay(m.day) || m.day}, ${m.topic || 'no topic'}${m.system ? ` (${m.system})` : ''}: ${head}.`];
   if (m.rule) parts.push(`Rule: ${cap(m.rule, history ? 140 : 200)}`);
@@ -124,8 +135,10 @@ export function contradictions(newMisses, sure, rights, history) {
 }
 
 /** The user turn (pure). */
-export function reviewMessage({ what, today, newItems, history, miscs, habits, systems, contra, profile }) {
-  const lines = [`Batch: ${what} (${plural(newItems.length, 'new item')}). Today ${today}, ${daysLeft(today)} days to the exam.`];
+export function reviewMessage({ what, today, examDay = null, newItems, history, miscs, habits, systems, contra, profile }) {
+  // The countdown only while an exam is ahead (the exam_date setting; none set or past it: no countdown).
+  const d = daysLeft(today, examDay);
+  const lines = [`Batch: ${what} (${plural(newItems.length, 'new item')}). Today ${today}${d > 0 ? `, ${d} days to the exam` : ''}.`];
   if (profile) lines.push(`Last profile: ${cap(profile, 700)}`);
   if (habits.length) lines.push('Current habits:', ...habits.map(h => `- ${h.trap} (${trapLabel(h.trap)}): ${h.n} items on ${h.topics_n} topics, last ${shortDay(h.last_seen)}${h.status === 'active' ? '' : ', quiet'}${h.note ? `. ${h.note}` : ''}`));
   if (systems.length) lines.push(`Traps by system, last 60 days: ${systems.map(s => `${s.system}: ${s.traps.map(t => `${t.trap} ${t.n}`).join(', ')}`).join('; ')}.`);
@@ -140,7 +153,8 @@ export function reviewMessage({ what, today, newItems, history, miscs, habits, s
 
 const MISS_SELECT = `SELECT m.id, m.label, m.day, m.at, m.source, m.topic_id, coalesce(t.name, m.condition_raw, m.topic_raw) AS topic,
     coalesce(t.category_id, m.category_id) AS category_id, c.name AS system, m.result, m.confidence, m.error_type, m.step, m.flaw_kind, m.time_s,
-    m.rule, m.my_reasoning, m.look_alikes, m.block_id, m.uworld_block_id, m.sitting_id, json_extract(r.teach_json, '$.trap') AS judge_trap
+    m.rule, m.my_reasoning, m.look_alikes, m.block_id, m.uworld_block_id, m.sitting_id, m.cause, m.cause_quote, m.cause_inferred, m.cause_detail,
+    json_extract(r.teach_json, '$.trap') AS judge_trap
   FROM misses m LEFT JOIN topics t ON t.user_id = m.user_id AND t.id = m.topic_id
     LEFT JOIN categories c ON c.user_id = m.user_id AND c.id = coalesce(t.category_id, m.category_id)
     LEFT JOIN uworld_reviews r ON r.user_id = m.user_id AND r.block_id = m.uworld_block_id AND r.q = m.uworld_q`;
@@ -322,7 +336,8 @@ export async function applyReview(env, user, { run, refs, data, ctx, t, index = 
   for (const [ref, it] of refs) {
     if (!it.isNew) continue;
     const g = given.get(ref) || {};
-    const traps = cleanTraps(g.traps);
+    // A look-alike swap only where the item is a real confusion (wave 2: UW 3631 was a knowledge gap tagged as one).
+    const traps = cleanTraps(g.traps).filter(k => k !== 'look_alike_swap' || swapAllowed(it.kind, it.row));
     rows.push({ item_kind: it.kind, item_id: it.row.id, run_id: run.id, topic_id: it.row.topic_id || null, category_id: it.row.category_id || null,
       day: it.row.day || today, label: cap(itemLabel(it.kind, it.row), 60), traps_json: JSON.stringify(traps), note: safe(g.note, NOTE_MAX, it.row) });
     out.items++;
@@ -355,19 +370,19 @@ export async function applyReview(env, user, { run, refs, data, ctx, t, index = 
   return out;
 }
 
-/** Early re-tests for contradictions (retests.js): one CONTRADICTION_DAYS out, unless one is open within a week. */
+/** An early card for contradictions (retests.js): booked CONTRADICTION_DAYS out, only for a miss with nothing booked yet (one card per miss, 1 Nov 2026). */
 async function retestParts(env, user, items, { today, t }) {
   const { bookable, missRetestId, insertStatement, nextRetestStatement } = await import('./retests.js');
   const misses = [...new Map(items.map(it => [it.row.id, it.row])).values()].filter(m => bookable(m)).slice(0, MAX_RETESTS);
   if (!misses.length) return { statements: [], booked: 0 };
   let open = [];
   try {
-    open = (await env.DB.prepare(`SELECT miss_id, min(due) AS due FROM retests WHERE user_id = ? AND result IS NULL AND miss_id IN (SELECT value FROM json_each(?)) GROUP BY miss_id`)
+    open = (await env.DB.prepare(`SELECT miss_id, min(due) AS due FROM retests WHERE user_id = ? AND miss_id IN (SELECT value FROM json_each(?)) GROUP BY miss_id`)
       .bind(user, json1(misses.map(m => m.id))).all()).results || [];
   } catch (e) { if (noTable(e)) return { statements: [], booked: 0 }; throw e; }
   const soon = new Map(open.map(r => [r.miss_id, r.due]));
   const due = addDays(today, CONTRADICTION_DAYS);
-  const rows = misses.filter(m => !(soon.get(m.id) && soon.get(m.id) <= addDays(today, 7)))
+  const rows = misses.filter(m => !soon.has(m.id))
     .map(m => ({ id: missRetestId(m.id, due), miss_id: m.id, topic_id: m.topic_id || null, due, source: 'hub' }));
   if (!rows.length) return { statements: [], booked: 0 };
   return { statements: [insertStatement(env, user, rows, t), nextRetestStatement(env, user, rows.map(r => r.miss_id))].filter(Boolean), booked: rows.length };
@@ -379,7 +394,7 @@ export function runSummary(what, out) {
   if (out.newly && out.newly.length) parts.push(`new pattern: ${trapLabel(out.newly[0])}`);
   if (out.misconceptions) parts.push(plural(out.misconceptions, 'misconception'));
   if (out.rechecks) parts.push(`${out.rechecks} to re-check`);
-  if (out.retests) parts.push(`${plural(out.retests, 're-test')} booked`);
+  if (out.retests) parts.push(`${plural(out.retests, 'miss', 'misses')} to get a card sooner`);
   return `Pattern review: ${plural(out.habits, 'habit')} updated from ${what} (${parts.join(', ')})`;
 }
 
@@ -433,13 +448,35 @@ export async function reviewRun(env, user, run, { now = nowMs(), call = callRevi
     const list = kind => [...refs.entries()].filter(([, x]) => (kind === 'new') === x.isNew).map(([ref, x]) => ({ ref, ...x }));
     const contra = contradictions(list('new').filter(x => x.kind === 'miss'), ctx.sure, ctx.rights, list('old').filter(x => x.kind === 'miss'));
     const profile = await readProfile(env, user).catch(() => null);
-    const content = reviewMessage({ what, today: londonDay(t), newItems: list('new'), history: list('old'), miscs: ctx.miscs, habits: ctx.habits, systems: ctx.systems,
+    const examDay = await readExamDay(env).catch(() => null);
+    const content = reviewMessage({ what, today: londonDay(t), examDay, newItems: list('new'), history: list('old'), miscs: ctx.miscs, habits: ctx.habits, systems: ctx.systems,
       contra, profile: profile && (profile.insight || profile.text) });
-    let data, usd = 0;
+    let data, usd = 0, check = null;
     try {
       ({ data, usd } = await call(env, content));
+      // Every new item sent must come back with its entry (ai-audit.js); the missing ones are asked for again once.
+      const newRefs = list('new').map(x => x.ref);
+      const got = new Map((data && Array.isArray(data.items) ? data.items : []).filter(i => i && i.ref).map(i => [i.ref, i]));
+      const checkRef = x => checkItem(x, { id: x.ref, ...AUDIT_SPECS.patterns(x) });
+      const a = await auditAndReask(newRefs.map(ref => (got.has(ref) ? { ...got.get(ref), entry: true } : { ref })), { idOf: x => x.ref, check: checkRef,
+        reask: async rows => {
+          const r = await call(env, `${content}\n\n${reaskText(rows.map(x => ({ ...x, missing: ['an entry in items (its traps, or an empty list, and its note)'] })))}`);
+          usd += Number(r.usd) || 0;
+          return (r.data && Array.isArray(r.data.items) ? r.data.items : []).map(i => ({ ...i, entry: true }));
+        } });
+      data = { ...data, items: [...a.items.filter(x => x.entry).map(({ entry, ...x }) => x), ...[...got.values()].filter(i => !newRefs.includes(i.ref))] };
+      check = await recordAudit(env, { job: 'patterns', key: run.id, ref: run.kind, user, rows: a.rows, reasked: a.reasked, at: t });
     } catch (e) {
-      usd = Number(e && e.usd) || 0;
+      usd = Number(e && e.usd) || usd;
+      // Waiting for its Message Batch: no try used, the minute job reads it again shortly.
+      if (e && e.pending === true && e.batch === true) {
+        await runUpdate(env, user, run.id, `status = 'pending', error = ?, next_at = ?, usd = usd + ?, updated_at = ?`, [e.message, t + 60_000, usd, t]).run();
+        if (run.status === 'running' || !run.error) {
+          const { noteJob } = await import('../job-log.js');
+          await noteJob(env, { job: 'pattern_review', user, key: `${run.id}:held`, ref: run.kind, state: 'held', at: t, counts: { batch: 1 } });
+        }
+        return { waiting: 'batch' };
+      }
       const capped = e instanceof HttpError && e.status === 429;
       await runUpdate(env, user, run.id, `status = ?, attempts = attempts + ?, error = ?, next_at = ?, usd = usd + ?, updated_at = ?`,
         [capped ? 'capped' : 'failed', capped ? 0 : 1, String((e && e.message) || e).slice(0, 300), t + (capped ? CAPPED_WAIT_MS : RETRY_MS), usd, t]).run();
@@ -451,7 +488,8 @@ export async function reviewRun(env, user, run, { now = nowMs(), call = callRevi
       return { error: String((e && e.message) || e), capped };
     }
     const out = await applyReview(env, user, { run, refs, data, ctx, t, index, contra });
-    const summary = out.headline && out.newly.length ? `Pattern review: ${out.headline}` : runSummary(what, out);
+    const checked = auditWords(auditCounts(check));
+    const summary = `${out.headline && out.newly.length ? `Pattern review: ${out.headline}` : runSummary(what, out)}${checked ? ` · ${checked}` : ''}`;
     await line(env, user, 'pattern.reviewed', run, summary, [
       runUpdate(env, user, run.id, `status = ?, next_at = ?, done_at = ?, error = NULL, attempts = 0, items_n = items_n + ?, calls = calls + 1, usd = usd + ?, summary = ?, updated_at = ?`,
         [items.more ? 'pending' : 'done', t, items.more ? null : t, out.items, usd, cap(summary, 160), t]),
@@ -466,13 +504,91 @@ export async function reviewRun(env, user, run, { now = nowMs(), call = callRevi
   }
 }
 
+// ---------------------------------------------------------------- the recount (look-alike swaps from real confusions only)
+
+// Items tagged look_alike_swap before the gate above (and misses whose cause the re-judge later found was no confusion),
+// with the fields swapAllowed reads, leaving out any item already recounted once (so an undo stays undone).
+export const SWAP_ITEMS_SQL = `SELECT p.item_kind, p.item_id, p.topic_id, p.label, p.traps_json,
+    m.cause, m.cause_quote, m.cause_inferred, m.cause_detail, m.look_alikes, m.error_type, m.my_reasoning, m.flaw_kind, m.outcome,
+    g.source AS gap_source, g.mixed_with, g.gap, g.said
+  FROM pattern_items p
+    LEFT JOIN misses m ON p.item_kind = 'miss' AND m.user_id = p.user_id AND m.id = p.item_id
+    LEFT JOIN gaps g ON p.item_kind = 'gap' AND g.user_id = p.user_id AND g.id = p.item_id
+  WHERE p.user_id = ?1 AND EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(p.traps_json) THEN p.traps_json ELSE '[]' END) j WHERE j.value = 'look_alike_swap')
+    AND NOT EXISTS (SELECT 1 FROM map_events e WHERE e.user_id = p.user_id AND e.target_type = 'hygiene' AND e.target_id = 'pattern_items:' || p.item_kind || ':' || p.item_id)`;
+export const RECOUNT = { per_batch: 40, key: 'habits_recount_at' };
+
+/** The swap items to retire (pure): rows of SWAP_ITEMS_SQL whose item is not a real confusion (swapAllowed). */
+export function swapsToRetire(rows) {
+  return (rows || []).filter(r => {
+    const row = r.item_kind === 'gap' ? { source: r.gap_source, mixed_with: r.mixed_with, gap: r.gap, said: r.said } : r;
+    return !swapAllowed(r.item_kind, row);
+  });
+}
+
+const habitN = async (env, user, trap) => {
+  const r = await env.DB.prepare('SELECT n, status FROM habits WHERE user_id = ? AND trap = ?').bind(user, trap).first().catch(() => null);
+  return r ? Number(r.n) || 0 : 0;
+};
+
+export async function recountHabits(env, user, { now = nowMs(), first = false } = {}) {
+  try {
+    const rows = (await env.DB.prepare(SWAP_ITEMS_SQL).bind(user).all()).results || [];
+    const retire = swapsToRetire(rows);
+    const before = await habitN(env, user, 'look_alike_swap');
+    const batches = [];
+    if (retire.length) {
+      const [{ changeStatement, changeEvent }, { writeBatch }] = await Promise.all([import('./hygiene.js'), import('./events.js')]);
+      for (let i = 0; i < retire.length; i += RECOUNT.per_batch) {
+        const part = retire.slice(i, i + RECOUNT.per_batch);
+        const changes = part.map(r => {
+          const traps = cleanTraps(parse(r.traps_json, [])).filter(k => k !== 'look_alike_swap');
+          return { c: { table: 'pattern_items', key: { user_id: user, item_kind: r.item_kind, item_id: r.item_id }, before: { traps_json: r.traps_json },
+            after: { traps_json: JSON.stringify(traps) } }, r };
+        });
+        const w = await writeBatch(env, user, { actor: 'code', surface: 'cron', via: 'cron:patterns', undoable: true,
+          statements: changes.map(x => changeStatement(env.DB, x.c)),
+          events: changes.map(x => changeEvent(x.c, `${x.r.label || x.r.item_id}: "mixed up two look-alikes" taken off (no mix-up in your words)`, x.r.topic_id || null)) });
+        batches.push(w && w.batch_id);
+      }
+    }
+    await recomputeHabits(env, user, { now });
+    const after = await habitN(env, user, 'look_alike_swap');
+    const p = retire.length || first ? await refreshProfile(env, user, { now }).catch(e => { console.error('profile refresh failed', e && e.message); return null; }) : null;
+    if (retire.length || first) {
+      const { noteJob } = await import('../job-log.js');
+      await noteJob(env, { job: 'habits_recount', user, key: `${londonDay(now)}:${batches[0] || 'none'}`.slice(0, 120), at: now, state: 'ok',
+        counts: { before, after, retired: retire.length, batches: batches.length } });
+    }
+    return { before, after, retired: retire.length, batches, profile: !!(p && p.changed) };
+  } catch (e) {
+    if (noTable(e)) return { skipped: 'not ready' };
+    const { noteJob } = await import('../job-log.js');
+    await noteJob(env, { job: 'habits_recount', user, key: londonDay(now), at: now, state: 'failed', detail: e });
+    return { error: String((e && e.message) || e) };
+  }
+}
+
+/** The first recount after this release runs at once (no wait for a profile slot); later ones at the slots. */
+async function recountOnce(env, user, t) {
+  const key = `${RECOUNT.key}:${user}`;
+  const had = await env.DB.prepare('SELECT value FROM settings WHERE key = ?').bind(key).first().catch(() => null);
+  if (had) return null;
+  const r = await recountHabits(env, user, { now: t, first: true });
+  if (!r.error) await env.DB.prepare('INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = excluded.value')
+    .bind(key, JSON.stringify({ at: t, retired: r.retired || 0 })).run().catch(() => null);
+  return r;
+}
+
 // ---------------------------------------------------------------- the cron job
 
 /** The profile's refresh from code facts (three times a day): one line when it changed. */
 export async function profileJob(env, user, { now = nowMs() } = {}) {
   try {
+    // Swaps on items that turned out not to be confusions come off first, so the profile counts real mix-ups only.
+    await recountHabits(env, user, { now });
     const p = await refreshProfile(env, user, { now });
-    if (p && p.changed) await line(env, user, 'profile.refreshed', null, 'About-you profile refreshed from the map (habits, weak spots, calibration, re-tests)');
+    if (p && p.changed) await line(env, user, 'profile.refreshed', null, 'About-you profile refreshed from the map (habits, weak spots, calibration)');
     return p ? { changed: p.changed } : { skipped: 'not ready' };
   } catch (e) {
     await line(env, user, 'pattern.failed', null, `About-you profile refresh failed: ${cap(String((e && e.message) || e), 80)}; will retry at the next slot`).catch(() => null);
@@ -492,6 +608,8 @@ export async function patternJob(env, user = MO, { at = nowMs(), call = callRevi
         OR (status = 'running' AND updated_at < ?4)) ORDER BY kind = 'catchup', created_at LIMIT 1`).bind(user, t, MAX_TRIES, t - STALE_MS).first();
   } catch (e) { if (noTable(e)) return { skipped: 'not ready' }; throw e; }
   const profile = PROFILE_HOURS.includes(clock.hour) && clock.minute === PROFILE_MINUTE ? await profileJob(env, user, { now: t }) : null;
+  const recount = profile ? null : await recountOnce(env, user, t);
+  if (recount && !runRow) return { idle: true, recount };
   if (!runRow) return { idle: true, ...(profile ? { profile } : {}) };
   return { run: runRow.id, ...(await reviewRun(env, user, runRow, { now: t, call })), ...(profile ? { profile } : {}) };
 }

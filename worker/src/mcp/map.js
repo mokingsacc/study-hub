@@ -1,6 +1,7 @@
 import { applyChange } from '../map/change.js';
 import { overview, weakest, PURPOSES } from '../map/overview.js';
 import { rules, RULE_PARTS } from '../map/rules.js';
+import { readExamDay } from '../exam-day.js';
 import { listQueue, QUEUE_KINDS, MAX_ALIASES, retryTransient } from '../map/topics.js';
 import { searchTopics, liveTopic, requeueAfter } from '../map/resolve.js';
 import { neighbours, topPairs } from '../map/links-store.js';
@@ -8,8 +9,12 @@ import { LINK_TYPES, CAPS as LINK_CAPS } from '../map/links.js';
 import { TOPIC_KINDS, CATEGORY_IDS, NAME_MAX } from '../map/vocab.js';
 import { DISCIPLINE_KEYS } from '../map/systems.js';
 import { topicDetail } from '../map/topic.js';
+import { loadLive } from '../map/live.js';
 import { changeReply } from './reply.js';
+import { noteFixed, OUTCOMES } from '../card-fix.js';
+import { CAUSES } from '../../../public/js/shared/cause.js';
 import { readOnly, additive, destructive, ALWAYS_LOAD } from './annotations.js';
+import { factCheckRules } from '../map/fact-check.js';
 
 const isObj = v => v !== null && typeof v === 'object' && !Array.isArray(v);
 const noTable = e => /no such table|no such column/i.test(String(e && e.message));
@@ -42,6 +47,8 @@ export async function claudeChange(env, user, op, args, ctx, extra = {}) {
   if (r && r.ok && r.batch_id && REQUEUE_OPS.has(op)) {
     try { await requeueAfter(env, user, r.batch_id, ctx); } catch (e) { console.error('requeueAfter failed', e && e.message); }
   }
+  // Cards to fix settled (card-fix.js): the night's one "Cards reviewed by Claude" line on Recent activity grows with each.
+  if (r && r.ok && op === 'queue.resolve' && Array.isArray(r.results) && r.results.some(x => x && x.fixed)) await noteFixed(env, r.results);
   return changeReply(r, extra);
 }
 
@@ -75,12 +82,8 @@ async function mapTopic(env, user, args, ctx) {
 async function mapSearch(env, user, args) {
   const rows = await searchTopics(env, user, { q: args.q, category: args.category_id || null, kind: args.kind || null, status: args.status || null, limit: args.limit || 8 });
   if (!rows.length) return { rows: [], next_step: 'Nothing matches: map_add_topic if it is truly a new topic (check the naming rules in map_rules {part: "naming"}).' };
-  let scores = [];
-  try {
-    scores = (await env.DB.prepare(`SELECT topic_id, band, t, seen FROM topic_scores WHERE user_id = ? AND topic_id IN (SELECT value FROM json_each(?))`)
-      .bind(user, JSON.stringify(rows.map(r => r.id))).all()).results || [];
-  } catch (e) { if (!noTable(e)) throw e; }
-  const by = new Map(scores.map(s => [s.topic_id, s]));
+  // Each colour as of now (live.js: the stored row faded on read); an unseen topic has no row here.
+  const by = await loadLive(env, user, { ids: rows.map(r => r.id) });
   return { rows: rows.map(r => {
     const s = by.get(r.id) || {};
     return { id: r.id, name: r.name, kind: r.kind, category: r.category_id, status: r.status, band: s.band || 'unseen', t1000: s.seen && s.t != null ? Math.round(s.t * 1000) : null,
@@ -108,15 +111,20 @@ export const MAP_TOOLS = [
   {
     name: 'map_overview', title: 'Map overview', annotations: readOnly('Map overview'), _meta: ALWAYS_LOAD, cap: 6000,
     trim: ['since_last.lines:2', 'gaps_stated:2', 'next_up:3', 'requested:2', 'map.weakest_categories'],
-    description: 'First in any study chat but "teach me"; again only after 30 min or if asked; not in Anki Voice. Changes since last look, stated gaps, Teach me taps, 5 weakest topics, why, re-tests due, last lesson, items to place, totals, days left, new pattern, profile. voice: say line.',
-    inputSchema: { type: 'object', properties: { voice: { type: 'boolean' } }, additionalProperties: false },
-    run: (env, user, args, ctx) => overview(env, user, { voice: !!args.voice, ctx }),
+    description: 'First in study chats but "teach me"; again after 30 min or asked; not in Anki Voice. Changes since last look, stated gaps, Teach me taps, 5 weakest, why, last lesson, to place, totals, days left, new pattern, profile. voice: say line. note: nightly line',
+    // note: the nightly scheduled session's one-line summary, posted to Recent activity (job nightly_session).
+    inputSchema: { type: 'object', properties: { voice: { type: 'boolean' }, note: { type: 'string' } }, additionalProperties: false },
+    run: (env, user, args, ctx) => overview(env, user, { voice: !!args.voice, ctx, note: typeof args.note === 'string' ? args.note : null }),
   },
   {
-    name: 'map_rules', title: 'Map rules', annotations: readOnly('Map rules'), cap: 8000,
-    description: 'The map\'s rules from code: colours, scoring, how teach me picks, links, phases, hard rules, what asks Mo, error types, freshness, naming; teach_method: the step2-teach method without the skill.',
+    // cap: the longest part, the qbank method (METHOD_TEXT_MAX), with room; every other part is under 8,000 (tests).
+    name: 'map_rules', title: 'Map rules', annotations: readOnly('Map rules'), cap: 36000,
+    // The parts are the enum; tools/list is at its cap, so the description names only the ones 'all' leaves out.
+    // fact_check (1 Nov 2026) also carries today's lessons, cards and corrections to check (fact-check.js).
+    description: 'The map\'s rules from code, by part. By name only: teach_method, qbank_method (the two skills\' methods), exam_wording, fact_check, card_review.',
     inputSchema: { type: 'object', properties: { part: { type: 'string', enum: ['all', ...RULE_PARTS] } }, additionalProperties: false },
-    run: async (env, user, args) => rules(args.part || 'all'),
+    run: async (env, user, args) => (args.part === 'fact_check' ? factCheckRules(env, user)
+      : rules(args.part || 'all', !args.part || args.part === 'all' || args.part === 'phases' ? { examDay: await readExamDay(env) } : {})),
   },
   {
     name: 'map_topic', title: 'One topic', annotations: readOnly('One topic'), cap: 12000,
@@ -137,12 +145,13 @@ export const MAP_TOOLS = [
     run: (env, user, args) => mapSearch(env, user, args),
   },
   {
-    name: 'map_weakest', title: 'Weakest topics', annotations: readOnly('Weakest topics'), cap: 8000, trim: ['rows:3'],
-    description: 'Ranked lists. lesson: weakest topics to teach. cards ("make flashcards"): misses after since_anki_id (last carded) or since_day, lane then yield, repeats break ties, no slips, has_card; then mistake_sources. retest ("re-test me"; voice: 3): due re-tests. pairs: most mixed-up look-alikes. review: weakest units.',
+    name: 'map_weakest', title: 'Weakest topics', annotations: readOnly('Weakest topics'), cap: 16000, trim: ['rows:8'],
+    description: 'lesson: next to teach. weakest: by colour. cards ("make flashcards"): misses after since_anki_id (last carded) or since_day, no slips, has_card; then mistake_sources. miss_cards (voice: 3): misses whose card is not answered yet. pairs: most mixed-up look-alikes. review: weakest units.',
     inputSchema: { type: 'object', properties: {
       purpose: { type: 'string', enum: PURPOSES }, category_id: { type: 'string', maxLength: 40 }, lane: { type: 'string', enum: LANES },
       since_anki_id: { type: 'integer', minimum: 0 }, since_day: { type: 'string', pattern: '^\\d{4}-\\d{2}-\\d{2}$' }, limit: { type: 'integer', minimum: 1, maximum: 15 },
       voice: { type: 'boolean' } }, additionalProperties: false },
+    alias: a => (a.purpose === 'retest' ? { ...a, purpose: 'miss_cards' } : a),   // its old name (1 Nov 2026)
     run: (env, user, args) => weakest(env, user, args),
   },
   {
@@ -155,28 +164,36 @@ export const MAP_TOOLS = [
   },
   {
     name: 'map_queue', title: 'Items to place', annotations: readOnly('Items to place'), cap: 8000, trim: ['items:5'],
-    description: 'Items code could not place, most seen first, his words, ≤3 candidates. Settle with map_resolve, 25 at a time.',
+    description: 'Items code could not place, most seen first, his words, ≤3 candidates. Settle with map_resolve, 25 at a time. Cards to fix: kind card_fix.',
     inputSchema: { type: 'object', properties: {
       kind: { type: 'string', enum: QUEUE_KINDS }, category_id: { type: 'string', maxLength: 40 }, limit: { type: 'integer', minimum: 1, maximum: 25 } }, additionalProperties: false },
     run: (env, user, args) => listQueue(env, user, { kind: args.kind || null, category: args.category_id || null, limit: args.limit || 10 }),
   },
   {
     name: 'map_resolve', title: 'Place queued items', annotations: additive('Place queued items'), cap: 3000, trim: ['problems:5', 'new_topics:5'],
-    description: 'Settle up to 25 map_queue items (50 in an import): {queue_id, topic_id}, {queue_id, new_topic} (map_rules naming) or {queue_id, reject: why}. Unit and versus items: the fields map_queue shows.',
+    description: 'Settle up to 25 map_queue items (50 in an import): {queue_id, topic_id}, {queue_id, new_topic} (map_rules naming) or {queue_id, reject: why}; unit, versus: as map_queue shows; card_fix: {queue_id, action, note}.',
     inputSchema: { type: 'object', properties: {
       items: { type: 'array', minItems: 1, maxItems: 50, items: { type: 'object', properties: {
         queue_id: { type: 'string', minLength: 1, maxLength: 200 }, topic_id: { type: 'string', maxLength: 120 }, new_topic: NEW_TOPIC, reject: { type: 'string', maxLength: 120 },
         topics: { type: 'array', maxItems: 12 }, skip_conditions: { type: 'array', maxItems: 20 }, names: { type: 'array', maxItems: 12 }, links: { type: 'array', maxItems: 12 },
-        skip_pairs: { type: 'array', maxItems: 20 } }, required: ['queue_id'], additionalProperties: false } },
+        skip_pairs: { type: 'array', maxItems: 20 }, action: { type: 'string', enum: OUTCOMES }, note: { type: 'string', maxLength: 200 } }, required: ['queue_id'], additionalProperties: false } },
       run_id: RUN_ID, reason: REASON, mo_said: MO_SAID, confirm_token: CONFIRM }, required: ['items'], additionalProperties: false },
     run: (env, user, args, ctx) => claudeChange(env, user, 'queue.resolve', args, ctx),
   },
   {
-    name: 'map_move_miss', title: 'Move a miss', annotations: additive('Move a miss'), cap: 1000,
-    description: 'Move a misplaced miss to its topic (id: map_topic).',
-    inputSchema: { type: 'object', properties: { miss_id: { type: 'string', minLength: 1, maxLength: 120 }, to: { type: 'string', minLength: 1, maxLength: 120 },
-      mo_said: MO_SAID }, required: ['miss_id', 'to'], additionalProperties: false },
-    run: (env, user, args, ctx) => claudeChange(env, user, 'miss.move', args, ctx),
+    name: 'map_move_miss', title: 'Move or correct a miss', annotations: additive('Move or correct a miss'), cap: 1000,
+    description: 'Move a miss to its topic (to), or fix a miss or gap Mo says is wrong, as his correction. Ids: map_topic.',
+    inputSchema: { type: 'object', properties: { miss_id: { type: 'string', minLength: 1, maxLength: 120 }, gap_id: { type: 'string', maxLength: 160 },
+      to: { type: 'string', minLength: 1, maxLength: 120 },
+      fix: { type: 'object', properties: { cause: { type: 'string', enum: CAUSES }, confidence: { type: 'string', enum: ['sure', 'lean', 'guess'] },
+        his_words: { type: 'string', maxLength: 300 } }, additionalProperties: false },
+      mo_said: MO_SAID }, additionalProperties: false },
+    run: (env, user, args, ctx) => {
+      const { fix, to, ...rest } = args || {};
+      if (fix) return claudeChange(env, user, 'miss.correct', { ...rest, ...fix }, ctx);
+      if (!rest.miss_id || !to) return { refused: true, reason: 'Send miss_id and to (a move), or fix (a correction).' };
+      return claudeChange(env, user, 'miss.move', { ...rest, to }, ctx);
+    },
   },
   {
     name: 'map_add_topic', title: 'Add topics', annotations: additive('Add topics'), cap: 1500, trim: ['created:5', 'existing:3'],

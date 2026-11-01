@@ -1,6 +1,6 @@
 import { json, readJson, londonDay } from '../util.js';
 import { applyChange, changeResponse } from './change.js';
-import { rankTopicsFor, choose, laneOf, yieldOf, tablesPresent, phaseFor, daysLeft } from './teach-priority.js';
+import { nextUpFor, nextUp, itemName, choose, laneOf, yieldOf, tablesPresent, phaseFor, daysLeft } from './teach-priority.js';
 import { planLessonRequest } from './teach-brief.js';
 import { rankJoin, RANK_COLS, examRankText } from '../exam-ranks.js';
 
@@ -29,7 +29,7 @@ const TIMES = ['no times', 'once', 'twice', 'three times', 'four times', 'five t
 export const times = n => TIMES[n] || `${n} times`;
 const waitUntilOf = ctx => (ctx && typeof ctx.waitUntil === 'function' ? ctx.waitUntil.bind(ctx)
   : ctx && ctx.executionCtx && typeof ctx.executionCtx.waitUntil === 'function' ? ctx.executionCtx.waitUntil.bind(ctx.executionCtx) : null);
-export const promptFor = t => `Teach me ${t.name} (map: ${t.id})`;
+export const promptFor = t => (t.partner_id ? `Test me on ${t.name} (map: ${t.id}, ${t.partner_id})` : `Teach me ${t.name} (map: ${t.id})`);
 
 // The one writer (events.js), loaded when used; the tests swap it.
 const io = { writeBatch: async (...a) => (await import('./events.js')).writeBatch(...a) };
@@ -140,7 +140,7 @@ export function topReason(row, servedBy = 'pick', { lanes = true } = {}) {
   bits.push(row.seen && row.t != null ? `weakness ${Math.round(Number(row.t) * 100)}` : 'never seen');
   if (row.misses_60d) bits.push(`${row.misses_60d} miss${row.misses_60d === 1 ? '' : 'es'}/60 d`);
   if (row.sure_wrong_60d) bits.push(`${row.sure_wrong_60d} sure-wrong`);
-  if (row.overdue) bits.push('re-test due');
+  if (row.overdue) bits.push('a miss to check again');
   if (servedBy === 'request') bits.push('tapped');
   if (servedBy === 'gap') bits.push('gap logged');
   if (lanes && !(row.seen && row.t != null)) bits.push(`yield ${round2(yieldOf(row)).toFixed(2)}`);   // a number even for an unseen topic
@@ -190,6 +190,14 @@ const offerRow = (slot, pick, t, reason, why) => ({ slot, pick, topic_id: t.id, 
 export function pickOffer(data, { cands = [], avoid = new Map(), now = Date.now(), skip = new Set() } = {}) {
   if (!data || !data.ok) return { none: true };
   if (data.phase && data.phase.rest) return { rest: true };
+  // One list (1 Nov 2026): the planner's top two, a lesson or a pair test each.
+  if (data.planner) {
+    const items = nextUp(data, { limit: 2, skip });
+    if (!items.length) return { none: true };
+    return { options: items.map((it, i) => offerRow(i ? 'b' : 'a', i ? 'runner_up' : 'top', { id: it.topic_id, name: itemName(it), category_id: it.row.category_id || null },
+      topReason(it.row), { served_by: 'pick', kind: it.kind, ...(it.partner_id ? { partner_id: it.partner_id } : {}), lane: it.row.lane || lane(it.row),
+        mehlman_rank: it.row.mehlman_rank || null, t100: it.row.seen && it.row.t != null ? Math.round(it.row.t * 100) : null })) };
+  }
   const chosen = choose(data, { now, skip });
   if (chosen.rest) return { rest: true };
   const top = chosen.topic_id && skip.has(chosen.topic_id) ? {} : chosen;
@@ -253,7 +261,7 @@ async function offerReads(env, user, { now, today }) {
 /** Today's offer worked out (no write): {day, rest?, none?, options?, avoid}. */
 export async function buildOffer(env, user, { now = Date.now(), skip = new Set() } = {}) {
   const today = londonDay(now);
-  const [data, reads] = await Promise.all([rankTopicsFor(env, user, { now, today }), offerReads(env, user, { now, today })]);
+  const [data, reads] = await Promise.all([nextUpFor(env, user, { now, today }).then(r => r.data), offerReads(env, user, { now, today })]);
   return { day: today, ...pickOffer(data, { cands: reads.cands, avoid: reads.avoid, now, skip }), avoid: reads.avoid, existing: reads.offers };
 }
 
@@ -282,8 +290,9 @@ export function shapeToday(rows, { day, avoid = new Map(), now = Date.now(), res
   const chosen = list.find(r => r.state === 'chosen') || null;
   const options = list.map(r => {
     const av = avoid.get(r.topic_id) || null;
+    const partner = parse(r.why_json, {}).partner_id || null;
     return { slot: r.slot, pick: r.pick, topic: { id: r.topic_id, name: r.topic_name, category_id: r.category_id }, reason: r.reason, state: r.state,
-      prompt: promptFor({ id: r.topic_id, name: r.topic_name }), ...(av ? { avoidance: { score: av.score, rules: av.rules, line: av.line } } : {}),
+      prompt: promptFor({ id: r.topic_id, name: r.topic_name, partner_id: partner }), ...(partner ? { kind: 'pair_test', partner_id: partner } : {}), ...(av ? { avoidance: { score: av.score, rules: av.rules, line: av.line } } : {}),
       ...(r.lesson_id ? { lesson_id: r.lesson_id } : {}) };
   });
   const line = (options.find(o => o.avoidance) || {}).avoidance?.line || null;
@@ -308,6 +317,15 @@ export async function todayOffer(env, user, { now = Date.now(), build = true, re
     if (!has.has('teach_offers') || !has.has('teach_skips')) return { ready: false, day, note: 'The morning choice arrives with migration 0015.' };
     let rows = (await env.DB.prepare(`SELECT ${OFFER_COLS} FROM teach_offers WHERE user_id = ? AND day = ? ORDER BY slot`).bind(user, day).all()).results || [];
     const chosen = rows.some(r => r.state !== 'open');
+    if (rows.length && build && !replace && !chosen && !rows.some(r => parse(r.why_json, {}).again)) {
+      const b = await buildOffer(env, user, { now });
+      const same = b.options && b.options.length === rows.length && b.options.every((o, i) => o.topic_id === rows[i].topic_id && o.topic_name === rows[i].topic_name);
+      if (!b.rest && b.options && b.options.length && !same) {
+        await bookkeeping(env, user, offerStatements(env, user, day, b.options, { now, replace: true }), via);
+        rows = (await env.DB.prepare(`SELECT ${OFFER_COLS} FROM teach_offers WHERE user_id = ? AND day = ? ORDER BY slot`).bind(user, day).all()).results || [];
+        return { ready: true, ...shapeToday(rows, { day, avoid: b.avoid, now }) };
+      }
+    }
     if ((!rows.length && build) || (replace && !chosen)) {
       // "Pick again" passes over the two on screen; with nothing else to offer they stay (changed: false)
       const skip = new Set(replace ? rows.map(r => r.topic_id) : []);
@@ -317,7 +335,8 @@ export async function todayOffer(env, user, { now = Date.now(), build = true, re
         return { ready: true, changed: false, ...shapeToday(rows, { day, avoid: await avoidanceFor(env, user, { now }), now }) };
       }
       if (b.options && b.options.length) {
-        await bookkeeping(env, user, offerStatements(env, user, day, b.options, { now, replace }), via);
+        const opts = replace ? b.options.map(o => ({ ...o, why: { ...(o.why || {}), again: true } })) : b.options;
+        await bookkeeping(env, user, offerStatements(env, user, day, opts, { now, replace }), via);
         rows = (await env.DB.prepare(`SELECT ${OFFER_COLS} FROM teach_offers WHERE user_id = ? AND day = ? ORDER BY slot`).bind(user, day).all()).results || [];
         const shaped = { ready: true, ...(replace ? { changed: true } : {}), ...shapeToday(rows, { day, avoid: b.avoid, now }) };
         await offerWritten(env, user, shaped).catch(() => null);
@@ -360,7 +379,9 @@ export async function planTodayPick(env, user, args, ctx) {
   if (!rows.length) return { refuse: 'There is no offer for today yet.', field: 'topic_id' };
   const pick = rows.find(r => r.topic_id === args.topic_id);
   if (!pick) return { refuse: "That topic is not one of today's two.", field: 'topic_id' };
-  const req = await planLessonRequest(env, user, { topic_id: pick.topic_id, from: 'map', ...(args.device ? { device: args.device } : {}) }, ctx);
+  const pairWith = parse(pick.why_json, {}).partner_id || null;   // a pair test from the one list
+  const req = await planLessonRequest(env, user, { topic_id: pick.topic_id, from: 'map', ...(pairWith ? { pair_topic_id: pairWith, kind: 'pair_test' } : {}),
+    ...(args.device ? { device: args.device } : {}) }, ctx);
   if (req.refuse) return req;
   const lessonId = req.reply && req.reply.lesson_id;
   const out = (req.rows || []).map(r => (r.table === 'lessons' && r.op === 'insert' ? { ...r, after: { ...r.after, request_from: 'today', requested_by: 'today' } }
@@ -408,10 +429,12 @@ export async function todayMoreRoute(request, env, ctx, params, url, user) {
   catch (e) { if (!noTable(e)) throw e; }
   const skip = new Set(rows.map(r => r.topic_id));
   let data = null;
-  try { data = await rankTopicsFor(env, user, { now, today }); } catch (e) { if (!noTable(e)) throw e; }
+  try { data = (await nextUpFor(env, user, { now, today })).data; } catch (e) { if (!noTable(e)) throw e; }
   if (!data || !data.ok || (data.phase && data.phase.rest)) return json({ day: today, more: [] });
-  const more = (data.ranked || []).filter(r => r.topic_id && !skip.has(r.topic_id)).slice(0, n)
-    .map(r => ({ topic: { id: r.topic_id, name: r.name, category_id: r.category_id }, reason: topReason(r), prompt: promptFor({ id: r.topic_id, name: r.name }) }));
+  // The one list after today's two (nextUp), so the scroll goes on in the same order.
+  const more = nextUp(data, { limit: n, skip })
+    .map(it => ({ topic: { id: it.topic_id, name: itemName(it), category_id: it.row.category_id }, reason: topReason(it.row),
+      prompt: promptFor({ id: it.topic_id, name: itemName(it), partner_id: it.partner_id || null }), ...(it.partner_id ? { kind: 'pair_test', partner_id: it.partner_id } : {}) }));
   return json({ day: today, more });
 }
 
@@ -423,10 +446,10 @@ export async function todayRefreshRoute(request, env, ctx, params, url, user) {
 // ================================================================ teach_next's hooks
 
 /**
- * For a plain "teach me" (teach_next's own pick): today's offer while it is open and no lesson has started since
- * it was made, as {day, options: [{topic, reason, prompt, line?}], line}; else null. One query, never a write.
+ * For a plain "teach me" (teach_next's own pick): today's offer while it is open, no lesson has started since it was made
+ * and its first is still the pick (top), as {day, options: [{topic, reason, prompt, line?}], line}; else null. Never a write.
  */
-export async function offerForTeachNext(env, user, { now = Date.now() } = {}) {
+export async function offerForTeachNext(env, user, { now = Date.now(), top = null } = {}) {
   const day = londonDay(now);
   const has = await tablesPresent(env, user, ['teach_offers', 'teach_skips']);
   if (!has.has('teach_offers') || !has.has('teach_skips')) return null;
@@ -436,6 +459,9 @@ export async function offerForTeachNext(env, user, { now = Date.now() } = {}) {
   ]);
   const rows = o.results || [];
   if (rows.length < 2 || rows.some(r => r.state !== 'open')) return null;
+  // One list (1 Nov 2026): an offer whose first is no longer the list's top (made before a change nobody opened Home for)
+  // is not offered; the plain pick, the list's top, is served instead.
+  if (top && rows[0].topic_id !== top) return null;
   const startedAt = ((started.results || [])[0] || {}).at;
   if (startedAt && startedAt >= rows[0].offered_at) return null;
   const avoid = await avoidanceFor(env, user, { now });

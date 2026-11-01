@@ -63,6 +63,7 @@ async function send(method, path, body, opts = {}) {
 
 function fail(status, data, path) {
   const msg = (data && typeof data.error === 'string' && data.error) || plain(status);
+  (globalThis.shTrail ||= []).push([Date.now(), status, path, msg]);   // for Report a problem (report.js)
   if (status === 401 && !path.startsWith('/api/auth/') && !uploadToken) { clearSession(); onSignedOut(); }
   return new ApiError(status, msg, data);
 }

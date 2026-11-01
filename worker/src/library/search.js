@@ -1,3 +1,4 @@
+import { factRank, tagOf } from '../map/fact-sources.js';
 import { tokensOf, cut, shingles, overlapRatio } from './text.js';
 import { embedQuery, nearest, rerank, dequantise, EMBED_MODEL } from './vectors.js';
 import { expandAbbrev } from '../map/vocab.js';
@@ -434,14 +435,14 @@ export async function topicCount(env, user, topicId) {
 
 // ------------------------------------------------------------------ the teach brief's part
 
-export const BRIEF_TOKENS = 1200;
+export const BRIEF_TOKENS = 1400;
 
 /**
  * The teach brief's `library`: the best 3-5 passages on the topic within BRIEF_TOKENS (citations included),
  * distinct notes only. {status: 'ok'|'empty'|'off', n, passages: [{cite, doc_id, page, heading, text}], more}.
  * Uses the cached coverage when it is fresh; otherwise searches within the time left (no rebuild past it).
  */
-export const SHORTLIST = 8, FULL = 2, FULL_CHARS = 1100, LINE_CHARS = 150;
+export const SHORTLIST = 8, FULL = 3, FULL_CHARS = 900, LINE_CHARS = 150;
 
 export async function collectionsOf(env, user, docIds) {
   const ids = [...new Set(docIds)];
@@ -457,7 +458,7 @@ export function spreadAcrossBooks(list, collOf) {
   const sorted = list.slice().sort((a, b) => b.score - a.score);
   const firsts = [], seen = new Set();
   for (const x of sorted) { const c = collOf(x) || x.doc_id; if (!seen.has(c)) { seen.add(c); firsts.push(x); } }
-  firsts.sort((a, b) => (collOf(b) === 'mehlman') - (collOf(a) === 'mehlman') || b.score - a.score);
+  firsts.sort((a, b) => factRank(collOf(a)) - factRank(collOf(b)) || b.score - a.score);
   const perDoc = new Map(), out = [];
   const take = x => { perDoc.set(x.doc_id, (perDoc.get(x.doc_id) || 0) + 1); out.push(x); };
   for (const x of firsts) take(x);
@@ -466,7 +467,11 @@ export function spreadAcrossBooks(list, collOf) {
   for (const x of sorted) if (!out.includes(x)) out.push(x);
   return out;
 }
-export const BRIEF_USE = 'A shortlist from all of Mo\'s books: two passages in full (Mehlman\'s first) and candidates with their opening line. Choose what will help Mo most for this lesson, wherever it is, and always use Mehlman; read any candidate in full with map_topic {include: ["library"]} (same passages, same order). Name the book you teach from (Mehlman, First Aid, UWorld, Divine Intervention). If any two sources disagree (a number, a cut-off, a first-line drug or test), say so at the very start of the lesson, naming both sources and pages, then teach the US-guideline answer.';
+export const BRIEF_USE = 'A shortlist from all of Mo\'s books, in the source order for facts: UWorld (UW Objectives, UW Tables & Images) first, then First Aid, then Mehlman, each in full with its tag; candidates follow with their opening line. '
+  + 'Decide every fact in that order: UWorld, then First Aid; Mehlman for what the NBME tests and its traps; then AnKing cards (in Claude in Chrome, AMBOSS first: topic.amboss_check). '
+  + 'Tag every deciding line with its source, such as (UW Tables p. 74) or (FA p. 678); no source: say "from memory, not checked". '
+  + 'If two sources disagree (a number, a cut-off, a first-line drug or test), say so at the start, naming both with pages, then teach the US-guideline answer (usually UWorld). '
+  + 'Read any candidate in full with map_topic {include: ["library"]} (same passages, same order). Paraphrase UWorld passages; never question stems or options.';
 
 export async function libraryBrief(env, user, topicId, { budget = BRIEF_TOKENS, max = 5, ai, build = true } = {}) {
   const t0 = Date.now();
@@ -484,7 +489,7 @@ export async function libraryBrief(env, user, topicId, { budget = BRIEF_TOKENS, 
   const out = [], candidates = [];
   const size = () => tokensOf(JSON.stringify(out)) + tokensOf(JSON.stringify(candidates));
   for (const x of flat.slice(0, SHORTLIST)) {
-    const base = { cite: x.cite, source: coll.get(x.doc_id) || null, passage_id: x.id };
+    const base = { cite: x.cite, tag: tagOf(x.cite), source: coll.get(x.doc_id) || null, passage_id: x.id };
     if (out.length < FULL) {
       const item = { ...base, doc_id: x.doc_id, page: x.page, ...(x.page_to && x.page_to !== x.page ? { page_to: x.page_to } : {}), heading: x.heading ? cut(x.heading, 120) : null,
         text: cut(x.text, FULL_CHARS) };

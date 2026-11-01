@@ -73,7 +73,7 @@ async function readOnce(env, user, after, { presence = false, now = Date.now() }
       FROM map_events WHERE user_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3`).bind(user, after, PAGE_MAX + 1),
     env.DB.prepare(`SELECT (SELECT max(seq) FROM map_events WHERE user_id = ?1) AS max_seq,
       (SELECT count(*) FROM topic_dirty WHERE user_id = ?1) AS dirty,
-      (SELECT count(*) FROM topic_queue WHERE user_id = ?1 AND status = 'open') AS queue`).bind(user),
+      (SELECT count(*) FROM topic_queue WHERE user_id = ?1 AND status = 'open' AND kind != 'card_fix') AS queue`).bind(user),
     env.DB.prepare(`SELECT source, cursor, last_ok_at, next_at, fails, last_error FROM sync_state WHERE user_id = ?1
       AND (source LIKE 'anki%' OR source = ?2)`).bind(user, PRUNED),
   ];
@@ -93,7 +93,7 @@ async function readOnce(env, user, after, { presence = false, now = Date.now() }
 export async function readSync(env, user) {
   const res = await env.DB.batch([
     env.DB.prepare(`SELECT (SELECT count(*) FROM topic_dirty WHERE user_id = ?1) AS dirty,
-      (SELECT count(*) FROM topic_queue WHERE user_id = ?1 AND status = 'open') AS queue`).bind(user),
+      (SELECT count(*) FROM topic_queue WHERE user_id = ?1 AND status = 'open' AND kind != 'card_fix') AS queue`).bind(user),
     env.DB.prepare("SELECT source, last_ok_at, next_at, fails, last_error FROM sync_state WHERE user_id = ? AND source LIKE 'anki%'").bind(user),
   ]);
   const c = res[0].results[0] || {};

@@ -5,16 +5,23 @@ import { restoreRow } from './undo.js';
 import { applyPairTest, planAdd } from './links-store.js';
 import { slugId, norm } from '../../../public/js/shared/names.js';
 import { namingProblem } from './vocab.js';
-import { NO_LESSON_ERRORS, PHASES, phaseOf, fnv1a, rankTopicsFor, choose, whyLine, tablesPresent } from './teach-priority.js';
+import { NO_LESSON_ERRORS, PHASES, phaseOf, daysLeft, phaseFor, fnv1a, rankTopicsFor, choose, whyLine, tablesPresent } from './teach-priority.js';
+import { readExamDay } from '../exam-day.js';
 import {
   checkNote, newNoteRows, noteMerges, similar, scoreOf, TACTIC_VOCAB, CONTENT_TYPES, JUDGEMENTS, clickedTactics, lessonDeltas, stickDeltas,
   subtractDeltas, sumDeltas, tacticRows, checkBelief, lessonMisconceptions, autoCloseRows, stickLine, PASS_SQL, FAIL_SQL,
+  checkCorrection, correctionNote, CORRECTIONS_PER_SAVE,
 } from './teach-memory.js';
 import { METHOD_VERSION } from './teach-method.js';
 import { flushOutbox } from '../outbox.js';
 import { looksLikeStem } from './guard.js';
 import { getPrefs, userRow, profileFor } from '../users.js';
 import { lessonRetests, lessonParts } from './retests.js';
+import { facetOfSteps, facetOfQuestion } from './facets.js';
+import { noteJob } from '../job-log.js';
+import { vivaReceive, lessonViva, lessonVivaCall, lessonVivaStates, vivaOutcome, withPairItems, VIVA } from './viva.js';
+import { readCluster, memberOfText } from './clusters.js';
+import { isFoundationCategory } from '../../../public/js/shared/concept.js';
 
 export const FIVE_STEPS = ['recognise', 'distinguish', 'test', 'treat', 'trap'];
 export const PROBE_RESULTS = ['right', 'wrong', 'partial', 'skipped'];
@@ -34,8 +41,9 @@ export const STALE_IN_PROGRESS_MS = 3 * 3600_000, STALE_REQUESTED_MS = 72 * 3600
 export const OUTBOX_KINDS = ['anki_link_card', 'anki_retest'];
 export const MISSING_MAX = 4, MISSING_LEN = 80, TACTICS_MAX = 4;
 export const TEACH_BACK_TEXT_MAX = 600;
-// The blend's parts and weights (missing parts drop out and the rest are scaled up), and the outcome bands.
 export const BLEND_WEIGHTS = { final_case: 0.30, explanation: 0.15, teach_back: 0.20, mo_rating: 0.20, speed: 0.10, questions: 0.05 };
+export const VIVA_BLEND_WEIGHTS = { viva: 0.45, viva_gain: 0.25 };
+const BLEND_W = { ...BLEND_WEIGHTS, ...VIVA_BLEND_WEIGHTS };
 export const OUTCOME_AT = { landed: 0.70, partial: 0.45 };
 export const STICK_MIN_ITEMS = 2, STICK_AFTER_MS = 2 * 86_400_000, STICK_WITHIN_MS = 60 * 86_400_000;
 export const STICK_DELAY_MS = 86_400_000;
@@ -52,11 +60,13 @@ const round3 = x => Math.round(x * 1000) / 1000;
 
 // ---------------------------------------------------------------- validation (pure)
 
-// A checkpoint holds only what the lesson has so far; the rest waits for the final save.
-export const CHECKPOINT_KEYS = ['lesson_id', 'status', 'probe', 'steps', 'misconceptions', 'surface', 'kind'];
+export const CHECKPOINT_KEYS = ['lesson_id', 'status', 'probe', 'steps', 'misconceptions', 'surface', 'kind', 'viva', 'phase', 'skip_viva', 'corrections'];
+export const CORRECTIONS_KEPT = 6;
+// final_case, teach_back, mo_rating, mo_rating_why, what_clicked and claude_view belong to the old ending (before 1 Nov):
+// still taken, so an older skill's save still works and old lessons read as they were, but no longer asked for.
 const KEYS = ['lesson_id', 'status', 'kind', 'goal', 'five_step', 'probe', 'steps', 'final_case', 'teach_back', 'mo_rating', 'mo_rating_why', 'what_clicked',
   'claude_view', 'questions_asked', 'tactics_used', 'content_type', 'link_id', 'items', 'weak_spot', 'misconceptions', 'card', 'miss_ids', 'media_shown',
-  'summary', 'links', 'memory', 'mo_feedback', 'new_topic', 'surface'];
+  'summary', 'links', 'memory', 'mo_feedback', 'new_topic', 'surface', 'viva', 'phase', 'skip_viva', 'corrections'];
 // Keys from before the redesign, refused with what to do instead.
 const GONE = {
   warmup: 'There are no warm-ups any more (Anki does the spacing): leave warmup out.',
@@ -109,6 +119,8 @@ export function checkSave(a) {
     text(a.mo_feedback, 200, 'mo_feedback'), oneOf(a.surface, ['voice', 'chat', 'code'], 'surface'),
     intIn(a.mo_rating, 1, 10, 'mo_rating'), text(a.mo_rating_why, 200, 'mo_rating_why'), text(a.what_clicked, 200, 'what_clicked'),
     intIn(a.questions_asked, 0, 50, 'questions_asked'), list(a.tactics_used, TACTICS_MAX, 'tactics_used'), oneOf(a.content_type, CONTENT_TYPES, 'content_type'),
+    text(a.viva, VIVA.transcript_max, 'viva'), oneOf(a.phase, ['before', 'after'], 'phase'),
+    a.skip_viva == null || typeof a.skip_viva === 'boolean' ? null : fix('skip_viva is true or false.', 'skip_viva'),
   ];
   for (const c of checks) if (c) return c;
   for (const s of a.five_step || []) if (!FIVE_STEPS.includes(s)) return fix(`five_step entries are ${FIVE_STEPS.join(', ')}.`, 'five_step');
@@ -178,6 +190,15 @@ export function checkSave(a) {
       || text(l.a_vs_b, 240, `${w}.a_vs_b`) || text(l.how, 40, `${w}.how`) || text(l.note, 200, `${w}.note`);
     if (c) return c;
   }
+  if (a.corrections != null) {
+    const c = list(a.corrections, CORRECTIONS_PER_SAVE, 'corrections');
+    if (c) return c;
+    for (const [i, x] of a.corrections.entries()) {
+      const e = checkCorrection(x, `corrections[${i}]`);
+      if (e) return fix(e.fix, `corrections[${i}]`);
+      if (looksLikeStem(x.wrong) || looksLikeStem(x.right)) return fix(`corrections[${i}] reads like question text: say the fact in your own words.`, `corrections[${i}]`);
+    }
+  }
   if (a.memory != null) {
     const c = only(a.memory, ['used', 'new'], 'memory') || list(a.memory.used, 6, 'memory.used') || list(a.memory.new, 2, 'memory.new');
     if (c) return c;
@@ -228,11 +249,20 @@ export function factsOf(a, minutes) {
 const FINAL_VALUE = { right: { sure: 1, lean: 0.9, guess: 0.75, null: 0.9 }, partial: 0.5, wrong: 0, skipped: 0 };
 const JUDGED = { complete: 1, partial: 0.5, wrong: 0 };
 
-export function blendOf(a, facts, { capMinutes = 10 } = {}) {
+export function blendOf(a, facts, { capMinutes = 10, viva = null } = {}) {
   const f = a.final_case || null;
   const fr = f ? f.result : null;
   const parts = {};
-  parts.final_case = fr === 'right' ? FINAL_VALUE.right[f.confidence ?? 'null'] ?? 0.9 : fr ? FINAL_VALUE[fr] : 0;
+  // The viva-first lesson: with a closing viva marked and no final case, the two vivas decide (vivaOutcome), and the
+  // final case's part and gate drop out.
+  const vAfter = viva && viva.after != null && Number.isFinite(Number(viva.after)) ? Number(viva.after) : null;
+  const vBefore = viva && viva.before != null && Number.isFinite(Number(viva.before)) ? Number(viva.before) : null;
+  const byViva = vAfter != null && !fr;
+  if (vAfter != null) {
+    parts.viva = round3(vAfter);
+    if (vBefore != null) parts.viva_gain = round3(Math.max(0, Math.min(1, (vAfter - vBefore) / Math.max(0.2, 1 - vBefore))));
+  }
+  if (!byViva) parts.final_case = fr === 'right' ? FINAL_VALUE.right[f.confidence ?? 'null'] ?? 0.9 : fr ? FINAL_VALUE[fr] : 0;
   const ej = f && f.explanation_judgement && f.explanation_judgement.verdict;
   if (ej && ej !== 'none') parts.explanation = JUDGED[ej];
   const tb = a.teach_back && a.teach_back.judgement;
@@ -243,11 +273,12 @@ export function blendOf(a, facts, { capMinutes = 10 } = {}) {
   if (firstTime != null || pace != null) parts.speed = round3(firstTime != null && pace != null ? 0.6 * firstTime + 0.4 * pace : firstTime ?? pace);
   if (Number.isInteger(a.questions_asked)) parts.questions = round3(1 / (1 + a.questions_asked / 3));
   const used = Object.keys(parts);
-  const total = used.reduce((s, k) => s + BLEND_WEIGHTS[k], 0);
-  const weights = Object.fromEntries(used.map(k => [k, round3(BLEND_WEIGHTS[k] / total)]));
-  const blend = round3(used.reduce((s, k) => s + parts[k] * BLEND_WEIGHTS[k], 0) / total);
+  const total = used.reduce((s, k) => s + BLEND_W[k], 0);
+  const weights = Object.fromEntries(used.map(k => [k, round3(BLEND_W[k] / total)]));
+  const blend = round3(used.reduce((s, k) => s + parts[k] * BLEND_W[k], 0) / total);
   let outcome = blend >= OUTCOME_AT.landed ? 'landed' : blend >= OUTCOME_AT.partial ? 'partial' : 'not_landed';
   const gates = [];
+  if (byViva) return { blend, outcome: vivaOutcome(vBefore, vAfter), parts, weights, gates, by: 'viva' };
   if (fr !== 'right' && fr !== 'partial') { if (outcome !== 'not_landed') gates.push('final case not right'); outcome = 'not_landed'; }
   const capPartial = why => { if (outcome === 'landed') { outcome = 'partial'; gates.push(why); } };
   if (fr === 'partial') capPartial('final case partly right');
@@ -260,12 +291,12 @@ export function blendOf(a, facts, { capMinutes = 10 } = {}) {
   if (Number.isInteger(a.mo_rating) && a.mo_rating <= 4) capPartial(`Mo rated it ${a.mo_rating}`);
   return { blend, outcome, parts, weights, gates };
 }
-const REWARD_PARTS = ['final_case', 'explanation', 'teach_back', 'mo_rating', 'items'];
+const REWARD_PARTS = ['final_case', 'explanation', 'teach_back', 'mo_rating', 'items', 'viva', 'viva_gain'];
 export function tacticReward(b) {
   if (!b || b.blend == null) return null;
   const used = Object.keys(b.parts || {}).filter(k => REWARD_PARTS.includes(k));
   if (!used.length) return b.blend;
-  const w = k => BLEND_WEIGHTS[k] ?? 1;
+  const w = k => BLEND_W[k] ?? 1;
   return round3(used.reduce((s, k) => s + b.parts[k] * w(k), 0) / used.reduce((s, k) => s + w(k), 0));
 }
 /** The outcome alone (pure), as blendOf gives it. */
@@ -328,7 +359,18 @@ export function withCheckpoint(a, lesson) {
   if (add.length || worked.length || a.misconceptions !== undefined) {
     v.misconceptions = { ...m, ...(add.length ? { add: add.slice(0, 2) } : {}), ...(worked.length ? { worked: worked.slice(0, 3) } : {}) };
   }
+  const corr = mergeCorrections(checkpointOf(lesson).corrections, a.corrections);
+  if (corr.length) v.corrections = corr;
   return v;
+}
+
+// The corrections a checkpoint kept and this call's, each correct line once (pure).
+export function mergeCorrections(kept, given) {
+  const out = [];
+  for (const c of [...(Array.isArray(kept) ? kept : []), ...(Array.isArray(given) ? given : [])]) {
+    if (isObj(c) && typeof c.right === 'string' && !out.some(x => norm(x.right) === norm(c.right))) out.push({ wrong: c.wrong, right: c.right, ...(c.source ? { source: c.source } : {}) });
+  }
+  return out.slice(0, CORRECTIONS_KEPT);
 }
 
 /** What a lesson's checkpoints kept, in words ('probe and 2 checks'), or null when they kept nothing (pure). */
@@ -435,13 +477,17 @@ function planCheckpoint(lesson, args, now) {
   const A = withCheckpoint(args, lesson);
   const cp = checkpointOf(lesson);
   const mc = A.misconceptions ? Object.fromEntries(['add', 'worked'].filter(k => A.misconceptions[k]).map(k => [k, A.misconceptions[k]])) : cp.misconceptions || null;
+  const viva = !!(typeof args.viva === 'string' || args.phase || cp.viva);
+  const corrections = mergeCorrections(cp.corrections, args.corrections);
   // Without migration 0042's column the probe and steps are still kept; the misconceptions wait for the final save.
   const after = { probe_json: JSON.stringify(A.probe), steps_json: JSON.stringify(A.steps),
-    ...('checkpoint_json' in lesson ? { checkpoint_json: JSON.stringify({ at: now, n: (Number(cp.n) || 0) + 1, ...(mc ? { misconceptions: mc } : {}) }) } : {}), updated_at: now };
+    ...('checkpoint_json' in lesson ? { checkpoint_json: JSON.stringify({ at: now, n: (Number(cp.n) || 0) + 1, ...(mc ? { misconceptions: mc } : {}), ...(viva ? { viva: 1 } : {}),
+      ...(corrections.length ? { corrections } : {}) }) } : {}), updated_at: now };
   const row = { table: 'lessons', op: 'update', key: { id: lesson.id }, before: Object.fromEntries(Object.keys(after).map(k => [k, lesson[k] ?? null])), after };
   const summary = `Lesson on ${lesson.topic_name || 'a topic'}: progress saved`.slice(0, 160);
   return { rows: [row], events: [pin({ kind: 'lesson.saved', target_type: 'lesson', target_id: lesson.id, topic_id: lesson.topic_id || null, undoable: false, summary }, row)],
-    count: 1, summary, reply: { checkpoint: { probe: A.probe.length, steps: A.steps.length, misconceptions: ((mc && mc.add) || []).length } } };
+    count: 1, summary, reply: { checkpoint: { probe: A.probe.length, steps: A.steps.length, misconceptions: ((mc && mc.add) || []).length, ...(viva ? { viva: true } : {}),
+      ...(corrections.length ? { corrections: corrections.length } : {}) } } };
 }
 
 export async function planLessonSave(env, user, args, ctx) {
@@ -500,8 +546,15 @@ export async function planLessonSave(env, user, args, ctx) {
 
   const kind = lesson.kind;
   const finalGiven = !!(A.final_case && A.final_case.result && A.final_case.result !== 'skipped');
-  const stopped = !closing && (args.status || 'done') === 'done' && kind !== 'pair_test' && !finalGiven;
-  const status = stopped || closing ? 'abandoned' : args.status || 'done';
+  const vivas = kind === 'lesson' || kind === 'pair' ? await lessonVivaStates(env, user, lesson.id) : { before: null, after: null };
+  const closingIn = !!(vivas.after && ['pending', 'graded'].includes(vivas.after.status));
+  const closingPending = !!(vivas.after && vivas.after.status === 'pending');
+  const vivaScores = { before: vivas.before && vivas.before.status === 'graded' ? vivas.before.coverage : null,
+    after: vivas.after && vivas.after.status === 'graded' ? vivas.after.coverage : null };
+  const stopped = !closing && (args.status || 'done') === 'done' && kind !== 'pair_test' && !finalGiven && !closingIn;
+  // The 3-hour close of a lesson whose closing viva was marked (the final save never came): it ended, so it is done.
+  const closedByViva = closing && !!(vivas.after && vivas.after.status === 'graded');
+  const status = closedByViva ? 'done' : stopped || closing ? 'abandoned' : args.status || 'done';
   const done = status === 'done';
   const kept = done || stopped || closing;
   const misses = data.misses;
@@ -512,8 +565,9 @@ export async function planLessonSave(env, user, args, ctx) {
   const minutes = activeMinutes(lesson.started_at, endedAt, data.activeAt);
   const urow = kind === 'pair_test' || closing ? null : await userRow(env, user).catch(() => null);
   const minutesPref = kind === 'pair_test' || closing ? 0 : Number(((await getPrefs(env, user, urow || undefined).catch(() => ({}))).teach || {}).lesson_minutes);
+  const own = urow ? phaseOf(await profileFor(env, user, urow), lesson.day || today) : null;
   const capMinutes = kind === 'pair_test' ? 3 : minutesPref > 0 ? minutesPref
-    : phaseOf(urow ? await profileFor(env, user, urow) : null, lesson.day || today).phase.lesson_minutes;
+    : own && own.laneless ? own.phase.lesson_minutes : phaseFor(daysLeft(lesson.day || today, await readExamDay(env).catch(() => null))).lesson_minutes;
   const facts = factsOf(A, minutes);
 
   // The outcome by code, from both views (pair tests from the marked items, through links-store).
@@ -527,11 +581,20 @@ export async function planLessonSave(env, user, args, ctx) {
       if (pairPart.error) return { refuse: pairPart.error, field: 'items' };
       ({ outcome, marks, link } = pairPart);
       blend = { blend: round3((pairPart.right_n ?? 0) / 4), outcome, parts: { items: round3((pairPart.right_n ?? 0) / 4) }, weights: { items: 1 }, gates: [] };
+    } else if (closingPending && !finalGiven) {
+      blend = null; outcome = null;   // the mark comes in a minute: op viva.grade writes the outcome then
+      // A pair lesson's minimal pairs are kept (items_json), so that outcome still counts them (viva.js withPairItems).
+      if (kind === 'pair') marks = args.items && args.items.length ? markFree(args.items) : null;
     } else {
-      blend = blendOf(A, facts, { capMinutes });
+      blend = blendOf(A, facts, { capMinutes, viva: vivaScores });
       outcome = blend.outcome;
       if (kind === 'pair') {
         marks = args.items && args.items.length ? markFree(args.items) : null;
+        // A viva-first pair lesson: the vivas decide, then its minimal pairs (under two in three right caps it at partial).
+        if (blend.by === 'viva' && marks) {
+          const capped = withPairItems(outcome, marks);
+          if (capped !== outcome) { blend.gates.push(capped === 'not_landed' ? 'no minimal pair right' : 'minimal pairs under two in three right'); outcome = blend.outcome = capped; }
+        }
         const linkId = lesson.link_id || args.link_id;
         if (linkId) {
           pairPart = await applyPairTest(env, user, { lesson_id: lesson.id, link_id: linkId, kind: 'pair', outcome, at: now }, { ...ctx, now });
@@ -545,21 +608,41 @@ export async function planLessonSave(env, user, args, ctx) {
 
   // Raw evidence (status done, or stopped before the final case; a placed topic): probe, checks, final, pair items.
   // Weakness sets the masses.
+  // The part each row is about (wave 3, facets.js): its own words (a step check's title, a probe's summary) when they say,
+  // else the lesson's five_step when those name one part; no facet otherwise.
+  const lessonFacet = facetOfSteps(A.five_step || parse(lesson.five_step, []));
+  // A cluster lesson (0071, clusters.js): each step check counts on the member it names (else the root), and its vivas on
+  // every member (viva.js clusterVivaEvidence), so the lesson is saved against the whole group.
+  const cluster = lesson.cluster_id ? await readCluster(env, user, lesson.cluster_id).catch(() => null) : null;
+  const stepTopic = title => (cluster && topicId ? memberOfText(cluster.members, title, topicId) : topicId);
+  const withFacet = (d, words) => { const f = facetOfQuestion(words) || lessonFacet; return JSON.stringify(f ? { ...d, facet: f } : d); };
+  const counted = [];   // what this lesson counted against the topic (the reply and Recent activity say it)
   if (kept && topicId) {
     (A.probe || []).forEach((p, i) => {
       if (p.result === 'skipped') return;
       const gap = p.from === 'gap' && p.ref ? String(p.ref).replace(/^gap:/, '') : null;
       evidence.push({ ...base, obs_key: `lesson:${lesson.id}:probe:${i + 1}`, slot: 0, kind: 'lesson_probe', result: p.result, gap_id: gap,
-        detail_json: JSON.stringify({ label: `lesson probe ${i + 1}`, from: p.from || null }) });
+        detail_json: withFacet({ label: `lesson probe ${i + 1}`, from: p.from || null }, p.summary) });
+      if (p.from === 'new' && p.result === 'wrong') counted.push('probe');
     });
-    (A.steps || []).forEach((s, i) => evidence.push({ ...base, obs_key: `lesson:${lesson.id}:check:${i + 1}`, slot: 0, kind: 'lesson_check',
-      result: s.check === 'right' ? 'right' : s.check === 'wrong_then_right' ? 'partial' : 'wrong', detail_json: JSON.stringify({ label: `lesson check ${i + 1}` }) }));
+    (A.steps || []).forEach((s, i) => {
+      evidence.push({ ...base, topic_id: stepTopic(s.title), obs_key: `lesson:${lesson.id}:check:${i + 1}`, slot: 0, kind: 'lesson_check',
+        result: s.check === 'right' ? 'right' : s.check === 'wrong_then_right' ? 'partial' : 'wrong', detail_json: withFacet({ label: `lesson check ${i + 1}` }, s.title) });
+      if (s.check === 'wrong_twice') counted.push('check');
+    });
     if (args.final_case && args.final_case.result !== 'skipped' && kind !== 'pair_test') {
       // A right answer explained wrong counts as partial on the map, never as a pass.
       const why = args.final_case.explanation_judgement && args.final_case.explanation_judgement.verdict;
       evidence.push({ ...base, obs_key: `lesson:${lesson.id}:final`, slot: 0, kind: 'lesson_final',
         result: args.final_case.result === 'right' && why === 'wrong' ? 'partial' : args.final_case.result,
-        confidence: args.final_case.confidence || null, detail_json: JSON.stringify({ label: 'lesson final case' }) });
+        confidence: args.final_case.confidence || null, detail_json: withFacet({ label: 'lesson final case' }, null) });
+    }
+    // The teach-back (wave 3): judged wrong counts as a miss after the teaching (partial: half); complete earns nothing.
+    const tb = A.teach_back && A.teach_back.judgement;
+    if (tb && tb !== 'none' && kind !== 'pair_test') {
+      evidence.push({ ...base, obs_key: `lesson:${lesson.id}:teachback`, slot: 0, kind: 'lesson_teachback',
+        result: tb === 'complete' ? 'right' : tb, detail_json: withFacet({ label: 'lesson teach-back' }, (A.teach_back.missing || []).join('; ')) });
+      if (tb === 'wrong' || tb === 'partial') counted.push(tb === 'wrong' ? 'teachback' : 'teachback_partial');
     }
     if (marks && link) {
       // A pair test's four cases are its evidence (pair_item). A pair lesson's practice pairs are checks inside the
@@ -589,7 +672,9 @@ export async function planLessonSave(env, user, args, ctx) {
     }
     const closed = part.rows.filter(r => r.table === 'retests' && r.op === 'update').length;
     const booked = part.rows.filter(r => r.table === 'retests' && r.op === 'insert').map(r => r.after.due);
-    if (closed || booked.length) retestReply = { closed, ...(booked.length ? { booked } : {}) };
+    // What Claude reads says "card from a miss", never "re-test" (1 Nov 2026).
+    if (closed || booked.length) retestReply = { closed, ...(booked.length ? { booked } : {}),
+      line: `The final case checked ${closed === 1 ? '1 earlier miss' : `${closed} earlier misses`} on this topic again.` };
   }
 
   // The card: card_topics (Claude's match, strong) and the outbox link to each non-slip miss.
@@ -599,7 +684,9 @@ export async function planLessonSave(env, user, args, ctx) {
   const cardCols = args.card !== undefined
     ? { card_note_id: (card && card.note_id) || null, card_id: (card && card.card_id) || null, card_action: card ? card.action : null }
     : { card_note_id: lesson.card_note_id ?? null, card_id: lesson.card_id ?? null, card_action: lesson.card_action ?? null };
-  if (card && card.card_id && topicId && data.has.has('card_topics') && ['added', 'edited_existing'].includes(card.action)) {
+  // Never onto a root-cause topic (a lesson on a foundation concept): the card's own words place it (card-roots.js).
+  const cardTopic = data.topics.get(topicId) || (args.new_topic && data.newTopicId === topicId ? { category_id: args.new_topic.category_id } : null);
+  if (card && card.card_id && topicId && data.has.has('card_topics') && ['added', 'edited_existing'].includes(card.action) && !isFoundationCategory(cardTopic && cardTopic.category_id)) {
     const ct = data.cardTopics.find(c => c.topic_id === topicId);
     if (!ct) rows.push({ table: 'card_topics', op: 'insert', key: { card_id: card.card_id, topic_id: topicId }, after: { match: 'claude', strong: 1, created_by: 'claude', created_at: now } });
     else if (ct.removed_at != null || !ct.strong) rows.push({ table: 'card_topics', op: 'update', key: { card_id: card.card_id, topic_id: topicId },
@@ -647,6 +734,18 @@ export async function planLessonSave(env, user, args, ctx) {
     lesson, args: A, topicId, topicName, now, done: kept }) : { rows: [], events: [], added: [], closed: [], kept: [] };
   rows.push(...miscPart.rows);
   events.push(...miscPart.events);
+  // A misconception newly found in this lesson counts against its part (wave 3), unless it is the belief behind the
+  // miss that brought the lesson on (its ref is that miss), which the miss already counts.
+  if (kept && topicId) {
+    const triggers = new Set(missIds.flatMap(id => { const m = misses.find(x => x.id === id); return m ? [m.label, m.id].filter(Boolean).map(v => String(v).toLowerCase()) : []; }));
+    for (const r of miscPart.rows) {
+      if (r.table !== 'misconceptions' || r.op !== 'insert' || !r.after) continue;
+      if (r.after.ref && triggers.has(String(r.after.ref).toLowerCase())) continue;
+      evidence.push({ ...base, obs_key: `lesson:${lesson.id}:misc:${r.key.id}`, slot: 0, kind: 'lesson_misconception', result: 'wrong',
+        detail_json: withFacet({ label: 'misconception found in a lesson' }, r.after.belief) });
+      counted.push('misconception');
+    }
+  }
   const touchedMisc = new Set(miscPart.rows.map(r => r.key.id));
   const autoClose = closing ? { rows: [], events: [], closed: [] } : autoCloseRows(data.targeted.filter(m => !touchedMisc.has(m.id)), { now });
   rows.push(...autoClose.rows);
@@ -657,7 +756,7 @@ export async function planLessonSave(env, user, args, ctx) {
   const contentType = A.content_type || lesson.content_type || null;
   const used = A.tactics_used || [];
   const clicked = clickedTactics(A.what_clicked);
-  const mine = done ? lessonDeltas({ contentType, used, clicked, blend: tacticReward(blend) }) : [];
+  const mine = done && blend ? lessonDeltas({ contentType, used, clicked, blend: tacticReward(blend) }) : [];
   const net = subtractDeltas(mine, parse(lesson.tactic_delta_json, []));
   const stuck = [];
   for (const s of closing ? [] : data.stuck) {
@@ -723,6 +822,21 @@ export async function planLessonSave(env, user, args, ctx) {
       { kind: 'teach_memory.saved', target_type: useOnly ? 'note_use' : 'teach_memory', target_id: cur.id, summary: a2.status === 'retired' ? 'Merged a repeated teaching note' : 'Teaching note used' });
   }
 
+  // Corrections (1 Nov 2026): each line Claude took back becomes a correction note on the topic (teach-memory.js), so later
+  // briefs on it and its look-alikes say "Do not repeat"; the lesson's card, if any, goes with it for the nightly fact check.
+  const corrSaved = [];
+  for (const c of A.corrections || []) {
+    const note = correctionNote(c);
+    const scope = topicId ? 'topic' : 'global', ref = topicId || null;
+    if (live.some(x => x.scope === scope && (x.scope_ref ?? null) === ref && similar(x.note, note))) continue;
+    const id = 'tm_' + crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+    const card = cardCols.card_id || cardCols.card_note_id ? { card_id: cardCols.card_id || null, note_id: cardCols.card_note_id || null } : {};
+    add({ table: 'teach_memory', op: 'insert', key: { id }, after: { scope, scope_ref: ref, tactic: 'other', note, status: 'active', uses: 0, wins: 0, losses: 0,
+      evidence_json: JSON.stringify([{ at: now, lesson_id: lesson.id, by: 'claude', ...card }]), source: 'correction', source_ref: `lesson:${lesson.id}`, created_by: 'claude', created_at: now, updated_at: now } },
+    { kind: 'teach_memory.saved', target_type: 'teach_memory', target_id: id, topic_id: topicId || null, summary: `Logged a correction: ${String(c.right).trim().slice(0, 120)}` });
+    corrSaved.push({ id, right: c.right, ...(card.card_id || card.note_id ? { card_queued: true } : {}) });
+  }
+
   // The lesson_summary note.
   if (args.summary && topicId && data.has.has('topic_notes')) {
     const body = args.summary.trim();
@@ -766,9 +880,9 @@ export async function planLessonSave(env, user, args, ctx) {
   const mins = after.minutes != null ? ` (${Math.round(after.minutes)} min)` : '';
   const rated = after.mo_rating != null ? `, Mo ${after.mo_rating}/10` : '';
   const keptWords = keptLine(A.probe, A.steps, miscPart.added.length);
-  const summary = done ? `Lesson: ${topicName || 'a topic'}, ${outcome.replace('_', ' ')}${rated}${mins}`
+  const summary = done ? `Lesson: ${topicName || 'a topic'}, ${outcome ? outcome.replace('_', ' ') : 'closing viva being marked'}${rated}${mins}`
     : closing ? `Lesson on ${topicName || 'a topic'} stopped (no save for 3 h): ${keptWords || 'nothing'} kept`
-      : `Lesson on ${topicName || 'a topic'} stopped${stopped ? ' before the final case' : ''}`;
+      : `Lesson on ${topicName || 'a topic'} stopped${stopped ? (kind === 'lesson' || kind === 'pair' ? ' before the closing viva' : ' before the final case') : ''}`;
   rows.unshift({ table: 'lessons', op: 'update', key: { id: lesson.id }, before, after });
   events.unshift(pin({ kind: 'lesson.saved', target_type: 'lesson', target_id: lesson.id, topic_id: topicId || null, summary: summary.slice(0, 160) }, rows[0]));
 
@@ -791,10 +905,16 @@ export async function planLessonSave(env, user, args, ctx) {
         stuck: stuck.map(s => ({ lesson_id: s.lesson_id, topic: s.topic, line: s.line })) },
       ...(links.length ? { links } : {}), ...(linksSkipped.length ? { links_skipped: linksSkipped } : {}),
       ...(outbox.some(o => o.kind === 'anki_link_card') ? { card_link: 'queued' } : {}),
-      ...(retestReply ? { retests: retestReply } : {}),
+      ...(retestReply ? { miss_cards: retestReply } : {}),
       ...(reviewedNow.length ? { misses_reviewed: reviewedNow } : {}),
       ...(memoryMissing.length ? { memory_missing: { ids: memoryMissing, next_step: 'Call lesson_save again with memory.used for these pinned notes (effect helped, neutral or hurt).' } } : {}),
       ...(!topicId && done ? { note: 'No topic on the map, so no evidence was written; pass new_topic to place it.' } : {}),
+      ...(counted.length ? { lesson_evidence: { counted: countedWords(counted), facet: lessonFacet, n: counted.length } } : {}),
+      ...(checkpointOf(lesson).viva ? { viva_kept: true } : {}),
+      ...(corrSaved.length ? { corrections: { saved: corrSaved.length, ids: corrSaved.map(c => c.id),
+        ...(corrSaved.some(c => c.card_queued) ? { card: 'The lesson card goes on tonight\'s fact check list (map_rules fact_check).' } : {}) } } : {}),
+      ...(cluster ? { cluster: { id: cluster.id, name: cluster.name, members: cluster.members.length,
+        counted_on: [...new Set(evidence.map(e => e.topic_id))].map(id => (cluster.members.find(m => m.id === id) || {}).name || id) } } : {}),
     },
   };
 }
@@ -804,16 +924,51 @@ export async function planLessonSave(env, user, args, ctx) {
 const waitUntilOf = ctx => (ctx && typeof ctx.waitUntil === 'function' ? ctx.waitUntil.bind(ctx)
   : ctx && ctx.executionCtx && typeof ctx.executionCtx.waitUntil === 'function' ? ctx.executionCtx.waitUntil.bind(ctx.executionCtx) : null);
 
-const REPLY_KEYS = ['kind', 'stopped_early', 'blend', 'views', 'facts', 'gates', 'items', 'misconceptions', 'tactics', 'tidy', 'links', 'links_skipped', 'card_link', 'retests', 'misses_reviewed', 'memory_missing', 'note'];
+const REPLY_KEYS = ['kind', 'stopped_early', 'blend', 'views', 'facts', 'gates', 'items', 'misconceptions', 'tactics', 'tidy', 'links', 'links_skipped', 'card_link', 'miss_cards', 'misses_reviewed', 'memory_missing', 'note',
+  'lesson_evidence', 'cluster', 'corrections'];
+
+// What a lesson counted against its topic, in words (pure): "a step check missed twice, a wrong teach-back".
+const COUNTED_WORDS = { check: ['a step check missed twice', 'step checks missed twice'], probe: ['a probe missed on a new strand', 'probes missed on new strands'],
+  teachback: ['a wrong teach-back'], teachback_partial: ['a partly right teach-back'], misconception: ['a new misconception', 'new misconceptions'] };
+export function countedWords(list) {
+  const n = {};
+  for (const k of list || []) n[k] = (n[k] || 0) + 1;
+  return Object.entries(n).map(([k, c]) => (c === 1 ? COUNTED_WORDS[k][0] : `${c} ${COUNTED_WORDS[k][1] || COUNTED_WORDS[k][0]}`)).join(', ');
+}
 
 export async function lessonSave(env, user, args = {}, ctx = {}) {
   const surface = (isObj(args) && args.surface) || ctx.surface || 'chat';
+  let viva = null;
+  if (isObj(args) && (args.phase != null || args.skip_viva != null)) {
+    const bad = checkSave(args);
+    if (bad) return { refused: true, reason: bad.fix, field: bad.field };
+    const wu = waitUntilOf(ctx);
+    const grade = typeof ctx.gradeViva === 'function' ? (u, id) => { const p = Promise.resolve(ctx.gradeViva(u, id)); if (wu) wu(p.catch(() => null)); return p; } : null;
+    const v = await lessonVivaCall(env, user, { lessonId: args.lesson_id, phase: args.phase || 'before', text: args.viva, skip: args.skip_viva === true, surface,
+      grade, ...(ctx.vivaWait || {}) });
+    if (v.refused) return v;
+    // The call is also a checkpoint (it marks the lesson as holding a viva, so the 3-hour close keeps it and a marked
+    // closing viva closes it as done), unless it is the final save itself.
+    const { skip_viva, viva: words, ...rest } = args;
+    viva = v;
+    args = { ...rest, ...(rest.status ? {} : { status: 'in_progress' }) };
+  } else if (isObj(args) && args.viva != null) {
+    const bad = checkSave(args);
+    if (bad) return { refused: true, reason: bad.fix, field: bad.field };
+    const v = await vivaReceive(env, user, { id: args.lesson_id, text: args.viva, surface });
+    if (v.refused) return v;
+    viva = v.viva;
+    if (v.audit) return { saved: true, viva };
+    if (!args.status) args = { ...args, status: 'in_progress' };
+  }
   const r = await applyChange(env, user, { actor: ctx.actor || 'claude', surface, op: 'lesson.save', args, mo_said: ctx.mo_said,
     request_id: ctx.request_id, via: ctx.via || 'mcp:lesson_save' });
   if (!r.ok) return r;
   // A checkpoint answers at once: no outbox flush, no score read, no next pick.
   if (isObj(args) && args.status === 'in_progress') {
-    return r.nothing ? { saved: false, note: r.summary } : { saved: true, seq: r.seq, checkpoint: r.checkpoint };
+    // The viva's grade, once the minute job has it: what to teach first comes back on a later checkpoint.
+    const v = viva || (r.checkpoint && r.checkpoint.viva ? await lessonViva(env, user, args.lesson_id).catch(() => null) : null);
+    return r.nothing ? { saved: false, note: r.summary, ...(v ? { viva: v } : {}) } : { saved: true, seq: r.seq, checkpoint: r.checkpoint, ...(v ? { viva: v } : {}) };
   }
   const wu = waitUntilOf(ctx);
   const flush = flushOutbox(env, { kinds: OUTBOX_KINDS, limit: 12 }).catch(e => console.error('lesson outbox flush failed', e && e.message));
@@ -836,6 +991,15 @@ export async function lessonSave(env, user, args = {}, ctx = {}) {
     console.error('lesson_save next pick failed', e && e.message);
     if (r.topic) out.topic = r.topic;
   }
+  // Recent activity (wave 3): what the lesson's own failures did to the topic's colour, one line a lesson.
+  if (r.lesson_evidence && out.topic && out.topic.id) {
+    const le = r.lesson_evidence, tp = out.topic;
+    await noteJob(env, { job: 'facets', user, ref: 'lesson', key: `lesson:${args.lesson_id}`, state: 'ok',
+      counts: { n: le.n, facet: le.facet || 'both', before: tp.t1000_before ?? -1, after: tp.t1000_after ?? -1, band: tp.band_after || 'unseen' },
+      detail: `${tp.name || 'a topic'}: ${le.counted}` });
+  }
+  const v = viva || (r.viva_kept ? await lessonViva(env, user, args.lesson_id).catch(() => null) : null);
+  if (v) out.viva = v;
   out.undo = { batch_id: r.batch_id, say: "Say 'undo that' to reverse it." };
   return out;
 }

@@ -135,9 +135,19 @@ export class FakeD1 {
  *   vars        extra env fields (HUB_KEY and the like).
  * Returns {env, DB, db (the raw DatabaseSync), stats, run(sql, ...params) for fixtures, close()}.
  */
+// The migrations' text, read once per test process and kept (1 Nov 2026). Every createD1 used to list the folder and
+// read every file again, many times a file: slower, and a test run open while the checkout changed (a pull, a branch
+// switch, a worktree being set up) could list a file and then not find it ("ENOENT ... worker/migrations/...").
+const migrationSql = new Map();
+function migrationsText(upTo) {
+  const key = upTo || '';
+  if (!migrationSql.has(key)) migrationSql.set(key, migrationFiles(upTo).map(f => fs.readFileSync(f, 'utf8')));
+  return migrationSql.get(key);
+}
+
 export function createD1({ migrations = true, upTo = null, sql = '', limit = 0, vars = {} } = {}) {
   const db = new DatabaseSync(':memory:');
-  if (migrations) for (const f of migrationFiles(upTo)) db.exec(fs.readFileSync(f, 'utf8'));
+  if (migrations) for (const text of migrationsText(upTo)) db.exec(text);
   if (sql) db.exec(sql);
   const stats = {
     queries: 0, batches: 0, statements: 0, limit,

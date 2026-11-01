@@ -13,12 +13,16 @@ import * as galaxies from './galaxies.js';
 import * as guide from './guide.js';
 import * as recent from './recent.js';
 import * as pictures from './pictures.js';
+import * as ink from './ink.js';
 import * as mnemonics from './mnemonics.js';
 import * as chats from './chats.js';
 import * as activity from './activity.js';
 import * as move from './move.js';
+import * as viva from './viva.js';
+import * as correct from './correct.js';
+import * as nowSteps from './now.js';
 
-const MODULES = [subjects, results, library, cards, me, papers, sharing, teach, map, custom, exams, galaxies, guide, recent, pictures, mnemonics, chats, activity, move];
+const MODULES = [subjects, results, library, cards, me, papers, sharing, teach, map, custom, exams, galaxies, guide, recent, pictures, ink, mnemonics, chats, activity, move, viva, correct, nowSteps];
 
 export function routes() {
   return MODULES.flatMap(m => m.ROUTES || []);

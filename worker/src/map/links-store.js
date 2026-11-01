@@ -28,6 +28,7 @@ const ids = list => JSON.stringify([...new Set((list || []).filter(x => x != nul
 const short = s => { const t = String(s || '').trim(); return t.length > 60 ? t.slice(0, 59).trimEnd() + '…' : t; };
 const parse = v => { if (v == null) return null; if (typeof v !== 'string') return v; try { return JSON.parse(v); } catch { return null; } };
 const VIS_SQL = "('active','proposed')";
+export const CODE_REMOVED = ['undo', 'rejudge'];
 
 // ------------------------------------------------------------------ reads
 
@@ -71,7 +72,7 @@ function summaryFor(topics, before, after, label) {
   const pair = pairName(topics, after);
   const from = label ? ` (${short(label)})` : '';
   let what;
-  if (!before || before.status === 'held' || (before.status === 'removed' && before.removed_by === 'undo')) what = after.type === 'versus' ? (isMixedUp(after.confusion) ? 'mixed up' : 'look-alikes') : LINK_TYPES[after.type].label.toLowerCase();
+  if (!before || before.status === 'held' || (before.status === 'removed' && CODE_REMOVED.includes(before.removed_by))) what = after.type === 'versus' ? (isMixedUp(after.confusion) ? 'mixed up' : 'look-alikes') : LINK_TYPES[after.type].label.toLowerCase();
   else if (after.status === 'removed') what = 'link removed';
   else if (before.status === 'removed') what = 'link restored';
   else if (isMixedUp(before.confusion || 0) && !isMixedUp(after.confusion || 0)) what = 'no longer mixed up';
@@ -157,11 +158,17 @@ export async function planLinks(env, user, proposals, ctx = {}) {
     const changed = w.isNew || touched.length || EDITABLE.concat('removed_by').some(k => (w.link[k] ?? null) !== (next[k] ?? null));
     if (!changed) { links.push({ link_id: next.id, op: 'unchanged', link: next, before: w.link }); continue; }
     if (w.isNew || touched.length) Object.assign(next, aggregate(all, now, hl, next.type));
-    // An undone add is not a tombstone: new support brings the link back as code would have made it.
-    if (next.status === 'removed' && next.removed_by === 'undo' && touched.some(t => t.row.w > 0 || t.row.cw)) {
+    // An undone add is not a tombstone, nor is a link code retired when the misses behind it were judged again (no
+    // confusion left): new support brings the link back as code would have made it.
+    if (next.status === 'removed' && CODE_REMOVED.includes(next.removed_by) && touched.some(t => t.row.w > 0 || t.row.cw)) {
       Object.assign(next, { status: 'held', removed_at: null, removed_by: null, removed_reason: null });
     }
     next.status = nextStatus(next.status, all);
+    // ctx.retire: a link code made whose support is now all zero (each miss behind it re-judged as no confusion) goes,
+    // marked removed_by 'rejudge' so a later real confusion brings it back and undo restores it.
+    if (ctx.retire && !w.isNew && next.status !== 'removed' && next.created_by === 'code' && touched.length && !all.some(r => r.w > 0 || r.cw)) {
+      Object.assign(next, { status: 'removed', removed_at: now, removed_by: ctx.retire, removed_reason: 'no confusion behind it' });
+    }
     next.updated_at = now;
     if (w.isNew) rows.push({ table: 'links', op: 'insert', key: { user_id: user, id: next.id }, before: null, after: withoutKey(next, ['user_id', 'id']) });
     else {
@@ -178,14 +185,14 @@ export async function planLinks(env, user, proposals, ctx = {}) {
       }
     }
     const visibleBefore = w.link && VISIBLE.includes(w.link.status);
-    const undone = w.link && w.link.status === 'removed' && w.link.removed_by === 'undo';
+    const undone = w.link && w.link.status === 'removed' && CODE_REMOVED.includes(w.link.removed_by);
     const op = w.isNew || undone || (w.link && w.link.status === 'held') ? 'created' : w.link.status === 'removed' && next.status !== 'removed' ? 'restored' : 'supported';
     links.push({ link_id: next.id, op, link: next, before: w.link });
     const show = VISIBLE.includes(next.status) || (visibleBefore && next.status === 'removed');
     if (show && (!visibleBefore || drawnChanged(w.link, next) || ctx.undoable)) {
       // A held or undone link keeps its earlier row as before, so undoing this puts it back as it was.
       const before = w.link || null;
-      const wasShown = visibleBefore || (w.link && w.link.status === 'removed' && w.link.removed_by !== 'undo');
+      const wasShown = visibleBefore || (w.link && w.link.status === 'removed' && !CODE_REMOVED.includes(w.link.removed_by));
       events.push({
         kind: !wasShown ? 'link.added' : next.status === 'removed' ? 'link.removed' : 'link.updated',
         target_type: 'link', target_id: next.id, topic_id: next.from_id,
@@ -212,6 +219,7 @@ function addSupport(w, s, now, user, link_id) {
     at: Number.isFinite(s.at) ? s.at : now, created_at: now };
   const have = w.support.get(row.obs_key);
   if (!have) {
+    if (s.only_existing) return;   // zeroing a miss's old support never makes a new row
     w.support.set(row.obs_key, row);
     w.touched.set(row.obs_key, { row, isNew: true, before: null });
     return;
@@ -299,7 +307,7 @@ export async function applyRetest(env, user, { miss_id, mistake_id, due, result,
   const proposals = [];
   for (const s of sup) {
     const row = retestSupport({ missId: miss_id, mistakeId: mistake_id, due, result, at: Number.isFinite(at) ? at : Date.now(), truthId: s.truth_id });
-    if (row) proposals.push({ link_id: s.link_id, support: row, label: 're-test' });
+    if (row) proposals.push({ link_id: s.link_id, support: row, label: 'card from a miss' });
   }
   if (!proposals.length) return { rows: [], events: [] };
   const r = await planLinks(env, user, proposals, ctx);
@@ -348,7 +356,7 @@ export function sourceLabel(s) {
   if (/^hub:/.test(k)) return 'NBME';
   if (/^gap:/.test(k)) return `gap ${new Date(s.at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', timeZone: 'Europe/London' })}`;
   if (/^lesson:/.test(k)) return 'lesson';
-  if (/^retest:/.test(k)) return 're-test';
+  if (/^retest:/.test(k)) return 'card from a miss';
   return { claude: 'Claude', mo: 'Mo', seed: 'seed', onenote: 'OneNote', mehlman: 'Mehlman', card: 'card', extractor: 'suggested' }[s.src] || s.src;
 }
 
@@ -575,7 +583,7 @@ export const LINK_WRITES = {
 const PICTURE = /^[a-z0-9_]{3,60}$/;
 const rand = () => crypto.randomUUID().replace(/-/g, '').slice(0, 12);
 const whoRemoved = l => `${l.removed_by === 'mo' ? 'Mo' : l.removed_by === 'claude' ? 'Claude' : 'The hub'} removed this link${l.removed_at ? ` on ${new Date(l.removed_at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', timeZone: 'Europe/London' })}` : ''}`;
-const tombstone = l => l && l.status === 'removed' && l.removed_by !== 'undo';
+const tombstone = l => l && l.status === 'removed' && !CODE_REMOVED.includes(l.removed_by);
 
 function unknownKeys(args, allowed) {
   const bad = Object.keys(args || {}).filter(k => !allowed.includes(k));
@@ -591,7 +599,7 @@ export async function resolveEndpoint(env, user, text, field) {
     row = await env.DB.prepare('SELECT id, name, status, merged_into FROM topics WHERE user_id = ? AND id = ?').bind(user, row.merged_into).first();
   }
   if (row) return row.status === 'retired' ? { error: `${row.name} is retired, so nothing links to it.` } : { id: row.id, name: row.name };
-  const r = await deps.resolveTopic(env, user, { texts: [s], source: 'link', source_ref: field });
+  const r = await deps.resolveTopic(env, user, { texts: [s], source: 'link', source_ref: field, roots: true });
   if (r && r.topic_id && (r.confidence ?? 0) >= 0.9) {
     const t = await env.DB.prepare('SELECT id, name, status FROM topics WHERE user_id = ? AND id = ?').bind(user, r.topic_id).first();
     if (t && t.status !== 'retired' && t.status !== 'merged') return { id: t.id, name: t.name };
